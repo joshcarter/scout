@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ct": {
+      "args": [
+        "mcp-serve"
+      ],
+      "command": "ct"
+    },
+    "scout": {
+      "command": "${CLAUDE_PLUGIN_DATA}/bin/scout",
+      "args": ["mcp"]
+    }
+  }
+}

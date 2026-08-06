@@ -1,0 +1,5 @@
+#!/bin/sh
+# PATH shim: the plugin's bin/ dir is added to the Bash tool's PATH, so
+# scripts (e.g. claude-review's horde) can call `scout` without knowing
+# where the real binary lives.
+exec "${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout" "$@"
