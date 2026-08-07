@@ -162,6 +162,67 @@ fn a_short_hit_list_from_a_real_tree_bypasses_the_llm() {
     assert_eq!(payload["hits"][0]["text"], "fn needle() {}");
 }
 
+// ── No-intent path (implicit --no-filter) ────────────────────────────
+
+#[test]
+fn no_intent_returns_every_hit_without_touching_the_model() {
+    // Well past `bypass_max_hits`, with no client configured: the absence of
+    // an intent must short-circuit before the model is ever needed.
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..40).map(|i| format!("let needle_{i} = 1;\n")).collect();
+    std::fs::write(dir.path().join("a.rs"), body).unwrap();
+    let ctx = offline_ctx(&dir.path().to_string_lossy());
+    let payload = run(&ctx, &serde_json::json!({"pattern": "needle", "max_hits": 100}))
+        .expect("no intent must never require the model");
+    assert_eq!(payload["mode"], "full");
+    assert_eq!(payload["intent"], serde_json::Value::Null);
+    assert_eq!(payload["hits_total"], 40);
+    assert_eq!(payload["returned"], 40);
+    assert_eq!(payload["hits"].as_array().unwrap().len(), 40);
+    assert!(payload["hint"].as_str().unwrap().contains("no intent given"));
+}
+
+#[test]
+fn an_empty_intent_is_the_same_as_no_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (0..40).map(|i| format!("let needle_{i} = 1;\n")).collect();
+    std::fs::write(dir.path().join("a.rs"), body).unwrap();
+    let ctx = offline_ctx(&dir.path().to_string_lossy());
+    for intent in [serde_json::Value::String(String::new()), serde_json::Value::Null] {
+        let payload =
+            run(&ctx, &serde_json::json!({"pattern": "needle", "intent": intent, "max_hits": 100}))
+                .expect("an empty intent must not demand the model");
+        assert_eq!(payload["mode"], "full");
+        assert_eq!(payload["intent"], serde_json::Value::Null);
+        assert_eq!(payload["returned"], 40);
+    }
+}
+
+#[test]
+fn no_intent_truncates_at_max_hits_and_says_so() {
+    let hits: Vec<RawHit> = (0..12).map(|i| hit("a.rs", i + 1, "x\ny\nA\nz\nw")).collect();
+    let p = unfiltered_payload("needle", &hits, 5, false);
+    assert_eq!(p["mode"], "full");
+    assert_eq!(p["intent"], serde_json::Value::Null);
+    assert_eq!(p["hits_total"], 12, "the full count stays visible");
+    assert_eq!(p["returned"], 5);
+    assert_eq!(p["hits"].as_array().unwrap().len(), 5);
+    let hint = p["hint"].as_str().unwrap();
+    assert!(hint.contains("first 5 of 12"), "hint must name the truncation: {hint}");
+    assert!(hint.contains("--max-hits"), "hint: {hint}");
+}
+
+#[test]
+fn no_intent_under_the_cap_reports_no_truncation() {
+    let hits = vec![hit("a.rs", 10, "x\ny\nA\nz\nw")];
+    let p = unfiltered_payload("needle", &hits, 10, true);
+    assert_eq!(p["hits_total"], 1);
+    assert_eq!(p["returned"], 1);
+    assert_eq!(p["search_truncated"], true, "a capped scan stays visible");
+    let hint = p["hint"].as_str().unwrap();
+    assert_eq!(hint, "no intent given — unfiltered search, no filtering applied");
+}
+
 // ── Rerank payload ───────────────────────────────────────────────────
 
 #[test]
@@ -213,14 +274,6 @@ fn missing_pattern_arg_fails_open() {
     let err = run(&ctx, &serde_json::json!({"intent": "ignored errors"})).unwrap_err();
     let text = assert_fails_open(&err);
     assert!(text.contains("'pattern'"), "text: {text}");
-}
-
-#[test]
-fn missing_intent_arg_fails_open() {
-    let ctx = offline_ctx(".");
-    let err = run(&ctx, &serde_json::json!({"pattern": "WritePack", "intent": ""})).unwrap_err();
-    let text = assert_fails_open(&err);
-    assert!(text.contains("'intent'"), "text: {text}");
 }
 
 #[test]

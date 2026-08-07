@@ -10,6 +10,9 @@
 //! * Returned hits always come from the real search output.  The model can
 //!   drop a hit, never invent one.
 //! * Short hit lists bypass the LLM entirely (`mode: "full"`).
+//! * An absent (or empty) `intent` means "no rerank": the search runs, the hit
+//!   list is truncated to `max_hits`, and the local model is never called — so
+//!   this path works with no LLM configured at all (`mode: "full"`).
 //! * `none_relevant` is reported explicitly so an empty filtered list can never
 //!   be mistaken for "the pattern had no matches".
 //! * Every failure path returns a `ToolError` naming the raw Grep tool.
@@ -57,8 +60,8 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
 
     let pattern = non_empty_arg(args, "pattern")
         .ok_or_else(|| fail("'pattern' argument is required and must be non-empty"))?;
-    let intent = non_empty_arg(args, "intent")
-        .ok_or_else(|| fail("'intent' argument is required and must be non-empty"))?;
+    // Absent, null or empty all mean the same thing: no rerank.  See step 2.
+    let intent = non_empty_arg(args, "intent");
     let use_regex = args.get("regex").and_then(Value::as_bool).unwrap_or(false);
     let max_hits = args
         .get("max_hits")
@@ -78,15 +81,24 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let hits = parse_hits(&results, cfg.context_lines);
     let hits_total = hits.len();
 
-    // ── 2. Bypass: nothing for the model to filter ───────────────────
+    // ── 2. No intent: unfiltered search, the model is never involved ─
+    //
+    // This is the implicit `--no-filter`.  It must hold for any hit count, so
+    // it is checked before the bypass threshold and truncates at `max_hits`
+    // rather than returning an unbounded list.
+    let Some(intent) = intent else {
+        return Ok(unfiltered_payload(&pattern, &hits, max_hits, search_truncated));
+    };
+
+    // ── 3. Bypass: nothing for the model to filter ───────────────────
     if hits_total <= cfg.bypass_max_hits {
         return Ok(bypass_payload(&pattern, &intent, &hits, search_truncated));
     }
 
-    // ── 3. Cap what the model sees; truncation stays visible ─────────
+    // ── 4. Cap what the model sees; truncation stays visible ─────────
     let considered: &[RawHit] = &hits[..hits_total.min(cfg.max_considered)];
 
-    // ── 4. Rerank, one call per batch ────────────────────────────────
+    // ── 5. Rerank, one call per batch ────────────────────────────────
     //
     // Batches run sequentially, matching ct.  Hit ids are global and 1-based,
     // so merging the score lists is a concatenation.
@@ -176,29 +188,74 @@ fn search_options(cfg: &GrepConfig, regex: bool) -> SearchOptions {
 
 // ── Payload builders (pure — unit-tested directly) ───────────────────
 
-/// Bypass result: every hit, verbatim, no LLM involved.
-pub fn bypass_payload(pattern: &str, intent: &str, hits: &[RawHit], search_truncated: bool) -> Value {
-    let hit_values: Vec<Value> = hits
-        .iter()
+/// Serialize raw hits verbatim — the shared body of both `mode: "full"` paths.
+fn raw_hit_values(hits: &[RawHit]) -> Vec<Value> {
+    hits.iter()
         .map(|h| {
             serde_json::json!({
                 "file": h.file, "line": h.line, "text": h.text, "context": h.context,
             })
         })
-        .collect();
+        .collect()
+}
+
+/// Assemble a `mode: "full"` payload.  `hits_total` is the pre-truncation
+/// count; `hits` is what actually goes back.
+fn full_payload(
+    pattern: &str,
+    intent: Option<&str>,
+    hits: &[RawHit],
+    hits_total: usize,
+    search_truncated: bool,
+    hint: String,
+) -> Value {
     serde_json::json!({
         "mode": "full",
         "pattern": pattern,
         "intent": intent,
-        "hits_total": hits.len(),
-        "hits_considered": hits.len(),
+        "hits_total": hits_total,
+        "hits_considered": hits_total,
         "returned": hits.len(),
-        "hits": hit_values,
+        "hits": raw_hit_values(hits),
         "dropped": 0,
         "none_relevant": false,
         "search_truncated": search_truncated,
-        "hint": "few enough hits to return whole — no filtering was applied",
+        "hint": hint,
     })
+}
+
+/// Bypass result: every hit, verbatim, no LLM involved.
+pub fn bypass_payload(pattern: &str, intent: &str, hits: &[RawHit], search_truncated: bool) -> Value {
+    full_payload(
+        pattern,
+        Some(intent),
+        hits,
+        hits.len(),
+        search_truncated,
+        "few enough hits to return whole — no filtering was applied".to_string(),
+    )
+}
+
+/// No-intent result: pure structured search, capped at `max_hits`.  The LLM is
+/// never consulted, so this succeeds with no model configured.
+pub fn unfiltered_payload(
+    pattern: &str,
+    hits: &[RawHit],
+    max_hits: usize,
+    search_truncated: bool,
+) -> Value {
+    let hits_total = hits.len();
+    let shown = &hits[..hits_total.min(max_hits)];
+    let hint = if shown.len() < hits_total {
+        format!(
+            "no intent given — unfiltered search, showing first {} of {hits_total} hits; \
+             raise --max-hits or add an intent to filter",
+            shown.len()
+        )
+    } else {
+        "no intent given — unfiltered search, no filtering applied".to_string()
+    };
+    full_payload(pattern, None, shown, hits_total, search_truncated, hint)
 }
 
 /// Filtered result.  `dropped` and the hint always expose the lossiness.

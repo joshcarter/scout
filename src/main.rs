@@ -53,8 +53,9 @@ enum Command {
     Grep {
         /// Search pattern (literal by default; see --regex).
         pattern: String,
-        /// What you are actually looking for.
-        intent: String,
+        /// What you are actually looking for. Omit it to skip the LLM rerank
+        /// entirely — an unfiltered structured search, capped at --max-hits.
+        intent: Option<String>,
         /// Treat the pattern as a regex.
         #[arg(long)]
         regex: bool,
