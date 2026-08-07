@@ -11,8 +11,9 @@
 //   0 — success (--ping: endpoint reachable; --preset: LLM returned non-empty output)
 //   1 — failure (endpoint unreachable, config missing, preset not found, empty output)
 //
-// Config is read from `~/.config/scout/config.toml` (see config.rs). Override
-// path via `$SCOUT_CONFIG` for testing.
+// Config is read from `$XDG_CONFIG_HOME/scout/config.toml`, default
+// `~/.config/scout/config.toml` (see config.rs). Override path via
+// `$SCOUT_CONFIG` for testing.
 
 use crate::client::LlmClient;
 use crate::config;

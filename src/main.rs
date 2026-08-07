@@ -126,18 +126,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Load the preset set scout uses everywhere: the 6 embedded built-ins,
-/// overlaid with any user overrides from `~/.config/scout/presets/`
+/// overlaid with any user overrides from `config::config_dir()/presets/`
+/// — honors `$XDG_CONFIG_HOME`, default `~/.config/scout/presets/` —
 /// (or `$SCOUT_PRESET_DIR`, for tests and non-standard installs).
 fn load_presets() -> Vec<presets::Preset> {
     let user_dir = std::env::var("SCOUT_PRESET_DIR")
         .ok()
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(".config").join("scout").join("presets"))
-        });
-    presets::load_all(user_dir.as_deref())
+        .unwrap_or_else(|| config::config_dir().join("presets"));
+    presets::load_all(Some(&user_dir))
 }
 
 /// Handle the three filter verbs (`grep`, `extract`, `check`).

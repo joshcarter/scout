@@ -1,0 +1,51 @@
+# scout configuration — copy to $XDG_CONFIG_HOME/scout/config.toml
+# (default ~/.config/scout/config.toml)
+#
+# Override the whole path with $SCOUT_CONFIG. Only the [llm] table is
+# required, and within it only `endpoint` and `model`; everything below
+# is optional and shown at its default.
+
+[llm]
+# Any OpenAI-compatible chat-completions base URL. A trailing slash is
+# stripped. Common hosts: ollama on :11434, LM Studio on :1234.
+endpoint = "http://localhost:11434/v1"
+model = "qwen3:27b"
+
+# Sent as `Authorization: Bearer <key>`. Local hosts usually ignore the
+# value but some require the header to be present at all.
+# api_key = "local"
+
+# Clamped to 1..3600.
+# timeout_seconds = 120
+
+# Cap on generated tokens. Unset means no cap is sent; a per-call
+# argument overrides this.
+# max_tokens = 2048
+
+# Filter tunables. Both tables are parsed leniently: an absent or
+# unusable value silently keeps the default rather than erroring, unlike
+# [llm] above.
+
+[extract]
+# Files at or under this many lines skip the local model and are
+# returned whole, so extract works before any config exists.
+# bypass_max_lines = 200
+# chunk_bytes = 393216
+# default_max_lines = 120
+# max_file_bytes = 4194304
+
+[grep]
+# Hit lists at or under this size skip the local model, as above.
+# bypass_max_hits = 8
+# max_considered = 500
+# batch_size = 250
+# context_lines = 2
+# context_max_bytes = 2000
+# max_file_bytes = 1048576
+# max_hits_scanned = 2000
+
+# Extra deny patterns for the shell-safety hook. These extend the
+# baked-in deny floor and can never shrink it. Read by
+# hooks/shell-safety.sh, not by the binary.
+# [shell_safety]
+# deny = ["rm -rf /", "dd if=.* of=/dev/"]

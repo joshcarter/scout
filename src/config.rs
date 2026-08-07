@@ -1,8 +1,9 @@
 // scout config loader.
 //
-// Single file, single format: `~/.config/scout/config.toml`, `[llm]` section.
-// Clean break from ct — no fallback to `~/.claude/ct/config.toml`, no
-// `$CT_LLM_CONFIG`. Override the whole file path with `$SCOUT_CONFIG`.
+// Single file, single format: `$XDG_CONFIG_HOME/scout/config.toml` (default
+// `~/.config/scout/config.toml`), `[llm]` section. Clean break from ct — no
+// fallback to `~/.claude/ct/config.toml`, no `$CT_LLM_CONFIG`. Override the
+// whole file path with `$SCOUT_CONFIG`.
 //
 // This is the sole config parser in scout (ct-local-llm carried two, with
 // different timeout clamping — collapsed here to one, keeping the saner
@@ -12,23 +13,40 @@ use crate::client::Config;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Returns scout's config directory.
+///
+/// `$XDG_CONFIG_HOME/scout`, falling back to `$HOME/.config/scout`, falling
+/// back to the relative `.config/scout` when `$HOME` is unset. Empty env
+/// values count as unset, matching the shell `${VAR:-...}` expansion the
+/// hooks use (`hooks/shell-safety.sh` resolves the same file) — the binary
+/// and the hooks must always agree on this path.
+pub fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("scout")
+}
+
 /// Returns the config file path.
 ///
 /// Resolution order:
 ///   1. `$SCOUT_CONFIG` env var (tests + non-standard installs)
-///   2. `~/.config/scout/config.toml`
-///   3. Relative fallback `.config/scout/config.toml` (when `$HOME` is unset)
+///   2. `config_dir()/config.toml` (honors `$XDG_CONFIG_HOME`)
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("SCOUT_CONFIG") {
-        return PathBuf::from(p);
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("scout")
-            .join("config.toml");
-    }
-    PathBuf::from(".config/scout/config.toml")
+    config_dir().join("config.toml")
 }
 
 /// Parse a `Config` from the `[llm]` section of `path`.
@@ -210,12 +228,53 @@ mod tests {
         assert_eq!(cfg.timeout, Duration::from_secs(3600));
     }
 
+    // The process environment is global and cargo runs tests on parallel
+    // threads, so every test that touches SCOUT_CONFIG / XDG_CONFIG_HOME
+    // must hold this lock. Recover from poisoning: a failed test must not
+    // cascade into the others.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn config_path_uses_scout_config_env_var() {
-        // Temporarily set SCOUT_CONFIG; restore afterward.
+        let _guard = env_lock();
         std::env::set_var("SCOUT_CONFIG", "/custom/path/config.toml");
+        std::env::set_var("XDG_CONFIG_HOME", "/xdg-should-lose");
         let p = config_path();
         std::env::remove_var("SCOUT_CONFIG");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        // SCOUT_CONFIG wins even over an explicit XDG_CONFIG_HOME.
         assert_eq!(p, PathBuf::from("/custom/path/config.toml"));
+    }
+
+    #[test]
+    fn config_path_honors_xdg_config_home() {
+        let _guard = env_lock();
+        std::env::remove_var("SCOUT_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", "/xdg/config");
+        let p = config_path();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(p, PathBuf::from("/xdg/config/scout/config.toml"));
+    }
+
+    #[test]
+    fn config_path_empty_xdg_config_home_falls_back_to_home() {
+        // ${XDG_CONFIG_HOME:-...} in the hooks treats empty as unset; the
+        // binary must agree.
+        let _guard = env_lock();
+        let saved_home = std::env::var("HOME").ok();
+        std::env::remove_var("SCOUT_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        std::env::set_var("HOME", "/home/tester");
+        let p = config_path();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(p, PathBuf::from("/home/tester/.config/scout/config.toml"));
     }
 }
