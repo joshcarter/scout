@@ -74,10 +74,11 @@ model = "qwen3:27b"
 # (find is not an MCP tool), and parsed leniently like the tables above.
 
 [find]
-# Pattern-guess rounds before giving up. A round is retried only when
-# *every* guessed pattern matched nothing — a thin result is still a
-# result. 1 disables the retry. --attempts overrides.
-# max_attempts = 2
+# Search rounds before giving up. A round is retried when *every* guessed
+# pattern matched nothing, and when the reflect stage below judges the
+# results off-target and names better patterns. Both kinds of retry share
+# this one budget. 1 disables both. --attempts overrides.
+# max_attempts = 3
 
 # Candidate patterns requested from the model per round. Each one costs
 # one search of the tree, so this is a latency knob as much as a
@@ -93,6 +94,14 @@ model = "qwen3:27b"
 # Byte cap on the paths-only file-tree sketch shown to the pattern
 # guesser. Paths only — never symbols or file contents.
 # tree_max_bytes = 8192
+
+# Reflect and refine: after the rerank keeps a list, one more small call
+# asks whether those hits actually answer the question, and re-searches
+# with the identifiers it can see in them when they do not (a comment
+# naming `draw_waterslide` is a pointer to the answer, not the answer).
+# Costs one LLM call per run, plus a round when it says no. Set false to
+# skip the stage entirely.
+# reflect = true
 
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by

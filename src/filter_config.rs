@@ -34,10 +34,11 @@
 // max_columns = 150
 //
 // [find]                     # `scout find` only — also never read by MCP
-// max_attempts       = 2
+// max_attempts       = 3
 // max_patterns       = 8
 // degenerate_hit_cap = 300
 // tree_max_bytes     = 8192
+// reflect            = true
 // ```
 //
 // Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
@@ -141,7 +142,8 @@ impl Default for CliConfig {
 /// can change what Claude sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindConfig {
-    /// Pattern-guess rounds before giving up.  `1` means no retry;
+    /// Rounds before giving up, shared by both retry kinds — the all-whiff
+    /// retry and the reflect-refine retry.  `1` means no retry of either;
     /// `--attempts` overrides.
     pub max_attempts: usize,
     /// Candidate patterns requested from the model per round.
@@ -152,11 +154,25 @@ pub struct FindConfig {
     pub degenerate_hit_cap: usize,
     /// Byte cap on the file-tree sketch sent to the pattern preset.
     pub tree_max_bytes: usize,
+    /// Run the reflect-and-refine stage: after the rerank keeps a list, ask the
+    /// model once whether those hits actually answer the question, and re-round
+    /// with the patterns it proposes when they do not.  Set `false` to spend
+    /// one fewer LLM call per run.
+    pub reflect: bool,
 }
 
 impl Default for FindConfig {
     fn default() -> Self {
-        FindConfig { max_attempts: 2, max_patterns: 8, degenerate_hit_cap: 300, tree_max_bytes: 8192 }
+        FindConfig {
+            // 3, not 2: the budget is now shared between the all-whiff retry
+            // and the reflect-refine retry, so the old value would have let one
+            // whiffed round consume the entire self-correction budget.
+            max_attempts: 3,
+            max_patterns: 8,
+            degenerate_hit_cap: 300,
+            tree_max_bytes: 8192,
+            reflect: true,
+        }
     }
 }
 
@@ -239,6 +255,10 @@ pub fn parse_find_overrides(toml_text: &str) -> FindConfig {
     set_usize(&mut find.max_patterns, t, "max_patterns");
     set_usize(&mut find.degenerate_hit_cap, t, "degenerate_hit_cap");
     set_usize(&mut find.tree_max_bytes, t, "tree_max_bytes");
+    // The one non-numeric knob here: a bool, so anything else keeps the default.
+    if let Some(v) = t.get("reflect").and_then(toml::Value::as_bool) {
+        find.reflect = v;
+    }
     find
 }
 
@@ -405,18 +425,19 @@ context_lines = 4
     #[test]
     fn find_defaults_match_spec() {
         let f = FindConfig::default();
-        assert_eq!(f.max_attempts, 2);
+        assert_eq!(f.max_attempts, 3, "the budget is shared by whiff- and reflect-retries");
         assert_eq!(f.max_patterns, 8);
         assert_eq!(f.degenerate_hit_cap, 300);
         assert_eq!(f.tree_max_bytes, 8192);
+        assert!(f.reflect, "self-correction is on unless it is turned off");
     }
 
     #[test]
     fn find_overrides_are_applied() {
         let f = parse_find_overrides(
-            "[find]\nmax_attempts = 3\nmax_patterns = 5\ndegenerate_hit_cap = 50\ntree_max_bytes = 1024\n",
+            "[find]\nmax_attempts = 4\nmax_patterns = 5\ndegenerate_hit_cap = 50\ntree_max_bytes = 1024\n",
         );
-        assert_eq!(f.max_attempts, 3);
+        assert_eq!(f.max_attempts, 4);
         assert_eq!(f.max_patterns, 5);
         assert_eq!(f.degenerate_hit_cap, 50);
         assert_eq!(f.tree_max_bytes, 1024);
@@ -424,6 +445,15 @@ context_lines = 4
         let partial = parse_find_overrides("[find]\nmax_attempts = 1\n");
         assert_eq!(partial.max_attempts, 1);
         assert_eq!(partial.max_patterns, 8);
+    }
+
+    #[test]
+    fn reflect_is_a_bool_and_junk_keeps_it_on() {
+        assert!(!parse_find_overrides("[find]\nreflect = false\n").reflect);
+        assert!(parse_find_overrides("[find]\nreflect = true\n").reflect);
+        // Not a bool — the stage stays on rather than silently disappearing.
+        assert!(parse_find_overrides("[find]\nreflect = 0\n").reflect);
+        assert!(parse_find_overrides("[find]\nreflect = \"no\"\n").reflect);
     }
 
     #[test]

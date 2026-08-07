@@ -399,12 +399,66 @@ pub fn rerank_payload(
 
 /// Render the numbered hit list the model scores.  Ids are 1-based and global
 /// across batches, so `first_id` is the batch's offset into the considered list.
+///
+/// The header carries a `(code)` / `(comment)` tag for the *matched* line, from
+/// `line_kind` — a cheap lexical hint that lets the selector prompt prefer a
+/// definition over a comment that merely names one (SPEC-cli P6/C).  It lives
+/// **only in this string**: the JSON payload and the MCP contract never see it,
+/// so the frozen shapes stay byte-identical.  A hit whose matched line was lost
+/// to the context budget (`text: None`) is rendered untagged rather than
+/// guessed at.
 pub fn render_hit_list(hits: &[RawHit], first_id: usize) -> String {
     let mut out = String::new();
     for (i, h) in hits.iter().enumerate() {
-        out.push_str(&format!("[{}] {}:{}\n{}\n\n", first_id + i, h.file, h.line, h.context));
+        let tag = match line_kind(h.text.as_deref()) {
+            Some(kind) => format!(" ({kind})"),
+            None => String::new(),
+        };
+        out.push_str(&format!("[{}] {}:{}{tag}\n{}\n\n", first_id + i, h.file, h.line, h.context));
     }
     out
+}
+
+/// C-preprocessor directives, so `#include <x>` reads as code rather than as a
+/// `#` comment.  Rust attributes (`#[…]`, `#![…]`) are handled by punctuation.
+const PREPROCESSOR: &[&str] = &[
+    "#include", "#define", "#undef", "#if", "#ifdef", "#ifndef", "#elif", "#else", "#endif",
+    "#pragma", "#error", "#warning", "#line", "#import",
+];
+
+/// Classify one matched line as `"code"` or `"comment"`, or `None` when there
+/// is no line to classify.
+///
+/// Deliberately dumb and language-generic: a leading-token check over the
+/// comment markers that cover nearly every language scout will ever walk.  It
+/// feeds a *hint* in the prompt, not a verdict — a misclassification costs the
+/// model a slightly worse prior, never a dropped hit — so the rule stays a
+/// handful of prefix tests rather than a parser.
+///
+/// The two disambiguations that earn their keep are the ones that would
+/// otherwise mislabel very common code: `#` (Rust attributes and C
+/// preprocessor lines are not comments) and `*` (a block-comment continuation
+/// is ` * text`; `*ptr = x` is a dereference).
+pub fn line_kind(text: Option<&str>) -> Option<&'static str> {
+    let t = text?.trim_start();
+    let comment = t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with("*/")
+        || t.starts_with("<!--")
+        || t.starts_with("--")
+        || t.starts_with(';')
+        || t.starts_with("\"\"\"")
+        || t.starts_with("'''")
+        || (t.starts_with('*') && (t == "*" || t.starts_with("* ")))
+        || (t.starts_with('#')
+            && !t.starts_with("#[")
+            && !t.starts_with("#!")
+            && !PREPROCESSOR.iter().any(|d| {
+                t.strip_prefix(d).is_some_and(|rest| {
+                    rest.is_empty() || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                })
+            }));
+    Some(if comment { "comment" } else { "code" })
 }
 
 /// Merge a search hit with its selection metadata into JSON output.

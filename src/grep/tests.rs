@@ -191,12 +191,85 @@ fn the_rerank_payload_carries_the_column_too() {
 fn hit_list_ids_are_global_across_batches() {
     let hits = vec![hit("a.rs", 10, "x\ny\nA\nz\nw"), hit("b.rs", 20, "x\ny\nB\nz\nw")];
     let first_batch = render_hit_list(&hits, 1);
-    assert!(first_batch.starts_with("[1] a.rs:10\n"));
-    assert!(first_batch.contains("[2] b.rs:20\n"));
+    assert!(first_batch.starts_with("[1] a.rs:10 (code)\n"));
+    assert!(first_batch.contains("[2] b.rs:20 (code)\n"));
     // A second batch continues the numbering rather than restarting.
     let second_batch = render_hit_list(&hits, 251);
-    assert!(second_batch.starts_with("[251] a.rs:10\n"));
-    assert!(second_batch.contains("[252] b.rs:20\n"));
+    assert!(second_batch.starts_with("[251] a.rs:10 (code)\n"));
+    assert!(second_batch.contains("[252] b.rs:20 (code)\n"));
+}
+
+// ── Comment-vs-code tagging ──────────────────────────────────────────
+
+#[test]
+fn the_line_classifier_covers_the_common_comment_markers() {
+    for (line, kind) in [
+        // Comments, in every dialect scout is likely to walk.
+        ("// renders the waterslide", "comment"),
+        ("/// doc comment", "comment"),
+        ("//! module doc", "comment"),
+        ("/* block open", "comment"),
+        ("*/", "comment"),
+        (" * continuation of a block comment", "comment"),
+        ("*", "comment"),
+        ("# a shell or python comment", "comment"),
+        ("#TODO no space needed", "comment"),
+        ("-- a SQL comment", "comment"),
+        ("; an asm or ini comment", "comment"),
+        ("<!-- an HTML comment -->", "comment"),
+        ("\"\"\"a python docstring", "comment"),
+        ("'''another one", "comment"),
+        // Code that a naive prefix test would mislabel.
+        ("pub fn draw_waterslide(v: WaterslideView) {", "code"),
+        ("#[derive(Debug)]", "code"),
+        ("#![allow(dead_code)]", "code"),
+        ("#include <stdio.h>", "code"),
+        ("#define MAX 10", "code"),
+        ("#ifndef GUARD_H", "code"),
+        ("*ptr = value;", "code"),
+        ("x -= 1;", "code"),
+        ("let n = a - -b;", "code"),
+    ] {
+        assert_eq!(line_kind(Some(line)), Some(kind), "line: {line:?}");
+    }
+}
+
+#[test]
+fn indentation_does_not_hide_a_comment_and_a_missing_line_is_untagged() {
+    assert_eq!(line_kind(Some("        // deeply indented")), Some("comment"));
+    assert_eq!(line_kind(Some("\t\t# tabbed")), Some("comment"));
+    // `text: None` — the context budget cut the block before the matched line.
+    // Nothing was recovered, so nothing is claimed about it.
+    assert_eq!(line_kind(None), None);
+}
+
+#[test]
+fn the_tag_lives_in_the_hit_list_string_and_never_in_the_payload() {
+    // The tag is a prompt hint.  The MCP contract is frozen, so it must not
+    // reach any payload — not the bypass path, not the rerank path.
+    let commented = RawHit {
+        file: "a.rs".into(),
+        line: 3,
+        text: Some("// renders the waterslide".into()),
+        col: Some(0),
+        col_end: Some(0),
+        context: "x\ny\n// renders the waterslide\nz\nw".into(),
+    };
+    let truncated = RawHit { text: None, col: None, col_end: None, ..commented.clone() };
+    let hits = vec![commented, truncated];
+
+    let list = render_hit_list(&hits, 1);
+    assert!(list.contains("[1] a.rs:3 (comment)\n"), "list: {list}");
+    assert!(list.contains("[2] a.rs:3\n"), "a null-text hit is untagged: {list}");
+
+    let payload = bypass_payload("waterslide", "the main renderer", &hits, false);
+    let json = serde_json::to_string(&payload).unwrap();
+    assert!(!json.contains("(comment)"), "tag leaked into the payload: {json}");
+    assert!(!json.contains("(code)"), "tag leaked into the payload: {json}");
+    // ...and the hit fields are exactly what they always were.
+    let out = payload["hits"].as_array().unwrap();
+    assert_eq!(out[0]["text"], "// renders the waterslide");
+    assert_eq!(out[1]["text"], serde_json::Value::Null);
 }
 
 // ── Bypass path ──────────────────────────────────────────────────────

@@ -34,6 +34,15 @@ Rules:
   was asked for, 2 = strong candidate, 1 = worth a look, 0 = marginal.
 - "why" is a LABEL, not a quote: "return value discarded", "test fixture only". \
   Never reproduce the matched code in "why".
+- Each hit header is tagged (code) or (comment) for the line that matched. \
+  When the intent asks for an implementation — "the function that ...", "where \
+  X is done", "the main handler" — prefer (code) hits, and a definition \
+  (`fn name`, `def name`, `class name`, an assignment) above a mere use.  A \
+  (comment) line that names an identifier is a POINTER to the answer, not the \
+  answer: score it low, or drop it if a (code) hit already covers it.
+- That is not a blanket penalty on comments.  When the intent asks about \
+  rationale, docs or history — "why do we ...", "what does X mean", "the \
+  explanation of ..." — the (comment) hits ARE the answer and outrank code.
 - Keep no more than the caller's limit.  Prefer precision: a short high-score \
   list beats a padded one.
 - Set "none_relevant": true with "keep": [] when no hit serves the intent. \

@@ -1,0 +1,92 @@
+# find_reflect preset — the self-correction stage of `scout find` (SPEC-cli §5)
+#
+# The rerank stage answers "which of these hits serve the intent?".  It never
+# answers "did we search for the right thing at all?" — so a round of
+# plausible-but-wrong hits terminates as a success.  This preset asks exactly
+# that one question, once, about the hits the rerank kept, and when the answer
+# is no it proposes the patterns that would do better.
+#
+# The whole point is that it is looking at REAL EXCERPTS: the identifiers it can
+# see in those excerpts (the `draw_waterslide` a nearby comment mentions) are
+# far better next patterns than any synonym it could invent, because they are
+# known to exist in this tree.  The prompt leans on that hard.
+#
+# Args (scout-injected): question, hit_list, max_patterns.
+# The hit list is already capped at the caller's --max-hits with its context
+# blocks byte-bounded, so this call is small by construction.
+# No context providers — scout supplies everything.
+#
+# CLI-only, like find_patterns: `find` is not exposed over MCP (SPEC §9), so
+# this preset is absent from `MCP_PRESETS` in mcp_server.rs.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You are a search QUALITY CHECK.  You are shown a question and the search hits \
+that were kept for it.  You judge one thing: do these hits actually answer the \
+question?  You respond with ONLY a JSON object: no prose, no markdown fences, \
+no explanation.
+
+Schema:
+{
+  "answered": true | false,
+  "patterns": ["<next pattern to grep for>"]
+}
+
+Rules:
+- "answered": true when the hits contain what was asked for.  Then "patterns" \
+  is ignored — return an empty list.
+- "answered": false when they do not: nothing on target, or only things NEAR \
+  the target (an inner helper when the question asked for the main one, a \
+  caller when it asked for the definition, a comment mentioning the thing \
+  instead of the thing).
+- When false, "patterns" is 1 to the requested maximum of NEW grep patterns, \
+  best first.  They are searched literally, exactly as written.
+- PREFER IDENTIFIERS YOU CAN SEE IN THE EXCERPTS over words you imagine.  If a \
+  comment or a call in a hit names `draw_waterslide`, propose \
+  "draw_waterslide" — and, to reach its definition, "fn draw_waterslide".  A \
+  name that is visibly present in this codebase beats any synonym you could \
+  invent, which may not exist here at all.
+- A pattern must be text that literally appears ON a line of source: an \
+  identifier, a definition line, a type or field name.  Not a description, not \
+  a sentence, not a file name.
+- Do not repeat a pattern whose hits you were just shown — those were already \
+  searched.
+- Be conservative: if the hits plausibly answer the question, say true.  A \
+  needless extra round costs the user time.
+- Output the JSON object only — the very first character must be '{'.
+"""
+
+user = """
+Question: ${args.question}
+
+Hits kept for it:
+${args.hit_list}
+
+Do these answer the question?  If not, propose at most \
+${args.max_patterns:-4} better patterns, preferring identifiers visible above.
+"""
+
+[preset]
+name        = "find_reflect"
+description = """Judge whether a set of search hits actually answers the question, and if not, propose \
+better grep patterns. Used internally by `scout find` between rounds: scout supplies the question and the \
+hits the rerank kept, and re-searches with the returned patterns when the answer is no. \
+Returns JSON: {answered, patterns}."""
+
+[preset.input_schema]
+type     = "object"
+required = ["question", "hit_list"]
+
+[preset.input_schema.properties.question]
+type        = "string"
+description = "The caller's natural-language question — the same one the hits were reranked against."
+
+[preset.input_schema.properties.hit_list]
+type        = "string"
+description = "The kept hits, numbered, each with its file:line and context block."
+
+[preset.input_schema.properties.max_patterns]
+type        = "integer"
+description = "Upper bound on refined patterns to propose when the answer is no. Defaults to 4."

@@ -280,8 +280,9 @@ struct FindArgs {
     /// What you are looking for, in words:
     /// "where are the config file options parsed?".
     question: String,
-    /// Pattern-guess rounds before giving up (default: `[find] max_attempts`,
-    /// 2). 1 disables the retry.
+    /// Search rounds before giving up (default: `[find] max_attempts`, 3).
+    /// A round is retried when every pattern whiffed, or when the model judges
+    /// the results off-target and proposes better patterns. 1 disables both.
     #[arg(long, value_name = "N")]
     attempts: Option<u64>,
     /// Output format (default: human text, colored only on a terminal).
@@ -311,8 +312,8 @@ struct EditArgs {
     /// Treat the pattern as a regex (grep pipeline only).
     #[arg(long)]
     regex: bool,
-    /// Pattern-guess rounds before giving up (find pipeline only;
-    /// default: `[find] max_attempts`, 2).
+    /// Search rounds before giving up (find pipeline only;
+    /// default: `[find] max_attempts`, 3).
     #[arg(long, value_name = "N")]
     attempts: Option<u64>,
     #[command(flatten)]

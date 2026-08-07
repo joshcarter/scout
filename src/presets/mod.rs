@@ -1,7 +1,7 @@
 // Preset subsystem for scout.
 //
 // Presets are named, parameterized prompt templates stored as TOML files.
-// scout embeds its 6 built-in presets at compile time and advertises them
+// scout embeds its 8 built-in presets at compile time and advertises them
 // on the CLI (`scout run --preset <name>`) and, in a later step, as MCP
 // tools.
 //
@@ -16,7 +16,7 @@
 //
 // ## Built-ins vs. user overrides
 //
-// The 6 built-in presets are embedded in the binary via `include_str!` so a
+// The built-in presets are embedded in the binary via `include_str!` so a
 // binary-only install always has them, with no directory to seed. A user
 // preset directory (`~/.config/scout/presets/` by default) is layered on
 // top: a user preset whose `[preset].name` matches a built-in shadows it;
@@ -84,15 +84,17 @@ pub struct ContextDef {
 
 // ── Built-in presets (embedded at compile time) ─────────────────────────────
 
-/// The 7 built-in presets, embedded so a binary-only install always has
+/// The 8 built-in presets, embedded so a binary-only install always has
 /// them. Order matches PLAN.md §1's kept-preset table, plus `find_patterns`
-/// (SPEC-cli §5), which backs `scout find` and is deliberately CLI-only.
+/// and `find_reflect` (SPEC-cli §5), which back `scout find`'s two model
+/// stages and are deliberately CLI-only.
 const BUILTIN_TOML: &[&str] = &[
     include_str!("../../presets/check_output.toml"),
     include_str!("../../presets/shell_safety.toml"),
     include_str!("../../presets/extract.toml"),
     include_str!("../../presets/grep.toml"),
     include_str!("../../presets/find_patterns.toml"),
+    include_str!("../../presets/find_reflect.toml"),
     include_str!("../../presets/quality_review.toml"),
     include_str!("../../presets/test_review.toml"),
 ];

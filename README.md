@@ -28,10 +28,16 @@ toward them land next.
 
 `find` is the intent-only end of the search spectrum: state what you
 want and the local model guesses the patterns, scout runs every guess
-itself and reranks the union against your question. It is CLI-only for
-now and needs a configured model; `grep` covers pattern-only and
-pattern-plus-intent, and degrades to a plain search with no model at
-all.
+itself and reranks the union against your question. Your question's own
+distinctive words are searched too, alongside the guesses — the word you
+typed is evidence, a synonym is a hypothesis. Then it checks its work:
+one more small call asks whether the kept hits actually answer the
+question, and when they don't, it re-searches for the identifiers
+visible in them (a comment naming `draw_waterslide` is a pointer to the
+answer, not the answer). Rounds are capped by `[find] max_attempts`
+(3 by default, `--attempts` overrides). It is CLI-only for now and needs
+a configured model; `grep` covers pattern-only and pattern-plus-intent,
+and degrades to a plain search with no model at all.
 
 `edit` fronts both pipelines and ends in `$EDITOR`, choosing which one
 by how many arguments you give it: `scout edit "<question>"` runs

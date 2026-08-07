@@ -112,6 +112,256 @@ fn an_unusable_reply_yields_no_candidates() {
     }
 }
 
+// ── Question-token seeds ─────────────────────────────────────────────
+
+#[test]
+fn the_tokenizer_keeps_the_distinctive_words_and_drops_the_rest() {
+    // The field case.  `waterslide` is the word that leads to the answer, and
+    // it is precisely the word the synthesis model never tries.
+    assert_eq!(
+        question_tokens("main rendering function for the waterslide view"),
+        vec!["rendering", "waterslide", "view"],
+    );
+    // Function words, generic programming words, sub-3-character words and
+    // bare numbers all discriminate nothing.
+    assert_eq!(
+        question_tokens("where are the config file options parsed?"),
+        vec!["config", "options", "parsed"],
+    );
+    assert_eq!(question_tokens("how does the main entry point of this code work"), vec!["point", "work"]);
+    assert_eq!(question_tokens("what is an i8 vs a u8 in 2024"), vec!["vs"; 0]);
+}
+
+#[test]
+fn the_tokenizer_splits_on_punctuation_but_never_inside_an_identifier() {
+    // An identifier the caller typed is the best seed there is — splitting it
+    // on `_` would throw that away.
+    assert_eq!(question_tokens("who calls draw_waterslide()?"), vec!["draw_waterslide"]);
+    assert_eq!(question_tokens("src/gui: the WaterslideView struct"), vec!["src", "gui", "waterslideview", "struct"]);
+    // Repeats collapse: one walk per distinct word.
+    assert_eq!(question_tokens("waterslide, waterslide, WATERSLIDE"), vec!["waterslide"]);
+}
+
+#[test]
+fn seeds_are_case_insensitive_regexes_so_identifier_casing_cannot_hide_them() {
+    // `waterslide` in the question must reach `WaterslideView` and
+    // `WATERSLIDE_BINS` too — the caller typed a word, not an identifier.
+    let seeds = seed_candidates("the waterslide view", &[], &[]);
+    assert_eq!(seeds.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(), vec!["(?i)waterslide", "(?i)view"]);
+    assert!(seeds.iter().all(|c| c.regex), "a (?i) seed is only case-insensitive as a regex");
+    // The tokenizer emits identifier characters only, so a seed can never
+    // carry a metacharacter into that regex.
+    for c in seed_candidates("what about a *b + c[0] (parens)?", &[], &[]) {
+        assert!(
+            c.pattern.trim_start_matches("(?i)").chars().all(|ch| ch.is_alphanumeric() || ch == '_'),
+            "metacharacter leaked into a seed: {}",
+            c.pattern
+        );
+    }
+}
+
+#[test]
+fn seeds_never_duplicate_a_guess_or_a_pattern_already_tried() {
+    // The model proposed `waterslide` itself: seeding it again is a second
+    // identical walk for the same hits.
+    let guesses = vec![Candidate { pattern: "waterslide".into(), ..Default::default() }];
+    let seeds = seed_candidates("the waterslide view", &guesses, &[]);
+    assert_eq!(seeds.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(), vec!["(?i)view"]);
+
+    // ...and a later round does not re-walk what round 1 already searched,
+    // whichever spelling it was searched under.
+    let tried = vec!["(?i)waterslide".to_string(), "View".to_string()];
+    assert!(seed_candidates("the waterslide view", &[], &tried).is_empty());
+}
+
+#[test]
+fn the_seed_count_is_bounded() {
+    // Each seed is a filesystem walk; a rambling question must not turn into
+    // twenty of them.
+    let question = "explain the waterslide spectrogram colormap gradient palette histogram \
+                    decimation resampling interpolation";
+    assert_eq!(seed_candidates(question, &[], &[]).len(), MAX_SEEDS);
+}
+
+#[test]
+fn a_seed_is_a_candidate_like_any_other_and_the_guard_judges_it() {
+    // Seeds cost nothing but search time precisely because the degenerate
+    // guard disposes of the useless ones before the model sees anything.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "pub fn draw_waterslide(v: WaterslideView) {}\n").unwrap();
+    let common: String = (0..40).map(|i| format!("// view {i}\n")).collect();
+    std::fs::write(dir.path().join("b.rs"), common).unwrap();
+
+    let seeds = seed_candidates("main rendering function for the waterslide view", &[], &[]);
+    let (results, kept, _) = search_candidates(
+        dir.path(),
+        &SearchOptions::default(),
+        &seeds,
+        &GrepConfig::default(),
+        &FindConfig { degenerate_hit_cap: 10, ..Default::default() },
+    );
+    let fate = |p: &str| results.iter().find(|r| r.pattern == p).unwrap().fate;
+    assert_eq!(fate("(?i)rendering"), Fate::Whiffed, "a word that is not in this tree costs one walk");
+    assert_eq!(fate("(?i)waterslide"), Fate::Kept, "...and the distinctive one finds the answer");
+    assert_eq!(fate("(?i)view"), Fate::TooCommon, "...while an everywhere-word is dropped whole");
+    // The case-insensitive seed matched both spellings on the one line.
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0][0].file, "a.rs");
+}
+
+// ── Reflect: parsing ─────────────────────────────────────────────────
+
+#[test]
+fn a_reflection_parses_through_fences_and_prose() {
+    for reply in [
+        r#"{"answered": false, "patterns": ["draw_waterslide"]}"#,
+        "```json\n{\"answered\": false, \"patterns\": [\"draw_waterslide\"]}\n```",
+        "<think>the hits are all comments…</think>{\"answered\": false, \"patterns\": [\"draw_waterslide\"]}",
+        "No, these miss it.\n{\"answered\": false, \"patterns\": [{\"pattern\": \"draw_waterslide\"}]}",
+        // A small model may spell a bool as a word.
+        r#"{"answered": "no", "patterns": ["draw_waterslide"]}"#,
+    ] {
+        let r = parse_reflection(reply, 4).unwrap_or_else(|| panic!("reply: {reply}"));
+        assert!(!r.answered, "reply: {reply}");
+        assert_eq!(r.patterns.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(), vec!["draw_waterslide"]);
+    }
+}
+
+#[test]
+fn an_answered_reflection_carries_no_patterns_even_if_the_model_sent_some() {
+    // "patterns are only meaningful when answered is false" — enforced here so
+    // no caller has to remember it.
+    let r = parse_reflection(r#"{"answered": true, "patterns": ["something_else"]}"#, 4).unwrap();
+    assert!(r.answered);
+    assert!(r.patterns.is_empty());
+}
+
+#[test]
+fn an_unreadable_or_absent_verdict_reads_as_answered() {
+    // The conservative direction: this stage exists to catch a wrong answer,
+    // and missing one costs the status quo, while a spurious "no" costs a
+    // whole extra round.
+    assert!(parse_reflection(r#"{"patterns": ["x"]}"#, 4).unwrap().answered, "absent verdict");
+    assert!(parse_reflection(r#"{"answered": "maybe"}"#, 4).unwrap().answered, "unreadable verdict");
+    assert!(parse_reflection(r#"{"answered": 0}"#, 4).unwrap().answered, "a number is not a verdict");
+    // Nothing parsed at all: the caller treats `None` exactly like "answered".
+    for reply in ["", "I think so?", "[1,2]"] {
+        assert_eq!(parse_reflection(reply, 4), None, "reply: {reply:?}");
+    }
+}
+
+#[test]
+fn the_reflect_pattern_list_is_capped() {
+    let many: Vec<String> = (0..20).map(|i| format!("\"p{i}\"")).collect();
+    let reply = format!("{{\"answered\": false, \"patterns\": [{}]}}", many.join(","));
+    assert_eq!(parse_reflection(&reply, 4).unwrap().patterns.len(), 4);
+}
+
+// ── Reflect: loop semantics ──────────────────────────────────────────
+
+fn reflection(answered: bool, patterns: &[&str]) -> Option<Reflection> {
+    Some(Reflection {
+        answered,
+        patterns: patterns
+            .iter()
+            .map(|p| Candidate { pattern: (*p).to_string(), ..Default::default() })
+            .collect(),
+    })
+}
+
+#[test]
+fn answered_stops_the_loop_and_unanswered_with_patterns_re_rounds() {
+    assert_eq!(next_patterns(reflection(true, &[]), &[]), None, "answered: return what we have");
+    assert_eq!(next_patterns(reflection(true, &["ignored"]), &[]), None, "answered wins over patterns");
+
+    let next = next_patterns(reflection(false, &["draw_waterslide", "fn draw_waterslide"]), &[]).unwrap();
+    assert_eq!(
+        next.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(),
+        vec!["draw_waterslide", "fn draw_waterslide"]
+    );
+}
+
+#[test]
+fn a_parse_failure_or_an_empty_refinement_returns_the_current_results() {
+    // Never fail toward discarding results: every uncertain reply stops the
+    // loop with what the rerank already kept.
+    assert_eq!(next_patterns(None, &[]), None, "unparseable reply");
+    assert_eq!(next_patterns(reflection(false, &[]), &[]), None, "'no' with nothing to try instead");
+}
+
+#[test]
+fn a_refinement_that_only_repeats_what_was_searched_stops_the_loop() {
+    // Re-searching a tried pattern would spend a whole round reproducing the
+    // result we are already holding.
+    let tried = vec!["render".to_string(), "(?i)waterslide".to_string()];
+    assert_eq!(next_patterns(reflection(false, &["render", "waterslide"]), &tried), None);
+    // ...but one new pattern among repeats is still worth a round.
+    let next = next_patterns(reflection(false, &["render", "draw_waterslide"]), &tried).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].pattern, "draw_waterslide");
+}
+
+#[test]
+fn the_reflect_stage_is_skipped_when_it_cannot_help() {
+    let kept = json!({"hits": [{"file": "a.rs", "line": 1, "context": "x"}]});
+    let on = FindConfig::default();
+    assert!(reflect_due(&on, 1, 3, &kept));
+
+    // The last allowed round has no round left to act on a "no": the call
+    // would be pure latency.  This is where the budget is shared with the
+    // whiff-retry — two whiffed rounds leave reflect nothing.
+    assert!(!reflect_due(&on, 3, 3, &kept), "no round left to refine in");
+    assert!(!reflect_due(&on, 1, 1, &kept), "--attempts 1 disables both retry kinds");
+
+    // The knob turns the stage off outright.
+    let off = FindConfig { reflect: false, ..Default::default() };
+    assert!(!reflect_due(&off, 1, 3, &kept));
+
+    // Nothing kept: no excerpts to read identifiers out of.
+    assert!(!reflect_due(&on, 1, 3, &json!({"hits": []})));
+    assert!(!reflect_due(&on, 1, 3, &json!({})));
+}
+
+#[test]
+fn an_unreachable_model_leaves_the_results_alone() {
+    // An LLM error in this stage must read as "answered": the rerank's result
+    // is already in hand and reflect can only ever add to it.
+    let payload = json!({"hits": [{"file": "a.rs", "line": 1, "text": "fn x() {}", "context": "fn x() {}"}]});
+    assert_eq!(reflect(&offline_ctx("."), "anything", &payload, &[], 8), None);
+}
+
+// ── Reflect: the hit list it reads ───────────────────────────────────
+
+#[test]
+fn the_reflect_hit_list_numbers_the_hits_and_tags_comment_lines() {
+    // "these are all comments *mentioning* the thing" is the shape of the
+    // near-miss this stage exists to catch, so the tag matters more here than
+    // anywhere else.
+    let hits = vec![
+        json!({"file": "panel.rs", "line": 12, "text": "    // calls draw_waterslide", "context": "a\n    // calls draw_waterslide\nb"}),
+        json!({"file": "mod.rs", "line": 708, "text": "pub fn draw_buckets() {", "context": "pub fn draw_buckets() {"}),
+        json!({"file": "cut.rs", "line": 3, "text": null, "context": "... (truncated)"}),
+    ];
+    let list = reflect_hit_list(&hits);
+    assert!(list.starts_with("[1] panel.rs:12 (comment)\n"), "list: {list}");
+    assert!(list.contains("[2] mod.rs:708 (code)\n"), "list: {list}");
+    assert!(list.contains("[3] cut.rs:3\n"), "a null-text hit is untagged: {list}");
+    assert!(list.contains("// calls draw_waterslide"), "the excerpt is what identifiers are read from");
+    assert!(reflect_hit_list(&[]).is_empty());
+}
+
+#[test]
+fn the_refining_status_line_names_what_it_will_search() {
+    let next = vec![
+        Candidate { pattern: "draw_waterslide".into(), ..Default::default() },
+        Candidate { pattern: "fn draw_waterslide".into(), ..Default::default() },
+    ];
+    assert_eq!(
+        refining_line(&next),
+        "results may be off-target — refining with: draw_waterslide, fn draw_waterslide"
+    );
+}
+
 // ── Degenerate-pattern guard ─────────────────────────────────────────
 
 #[test]
@@ -247,6 +497,24 @@ fn the_union_dedupes_by_file_and_line() {
 fn the_union_of_nothing_is_empty() {
     assert!(union_hits(vec![]).is_empty());
     assert!(union_hits(vec![vec![], vec![]]).is_empty());
+}
+
+#[test]
+fn a_refined_round_unions_with_the_prior_survivors_rather_than_replacing_them() {
+    // The reflect stage asks for *more* evidence, so a worse second guess must
+    // not lose what the first round found — and a line both rounds hit stays
+    // one hit, or the reranker scores it twice.
+    let prior = vec![raw("a.rs", 2), raw("b.rs", 5)];
+    let refined = vec![raw("b.rs", 5), raw("c.rs", 700)];
+    let union = union_hits(vec![refined, prior.clone()]);
+    let ids: Vec<(&str, usize)> = union.iter().map(|h| (h.file.as_str(), h.line)).collect();
+    assert_eq!(ids, vec![("a.rs", 2), ("b.rs", 5), ("c.rs", 700)]);
+
+    // Same length as the prior list means the refined round found nothing new
+    // — the loop's cue to return the payload it already built rather than
+    // spend a rerank reproducing it.
+    let nothing_new = union_hits(vec![vec![raw("a.rs", 2)], prior.clone()]);
+    assert_eq!(nothing_new.len(), prior.len());
 }
 
 #[test]
