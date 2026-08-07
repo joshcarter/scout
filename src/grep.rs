@@ -56,7 +56,14 @@ pub struct RawHit {
 /// Runs the filesystem search, then asks the local model which hits actually
 /// serve the intent; short hit lists skip the model entirely.
 pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
-    let (_, cfg) = crate::filter_config::load();
+    let (_, mut cfg) = crate::filter_config::load();
+
+    // `context_lines` is a CLI-only override (`-C`, or `[cli] context`).  It
+    // is deliberately absent from the MCP tool schema — the frozen contract —
+    // so for the MCP server this is always a no-op.
+    if let Some(n) = args.get("context_lines").and_then(Value::as_u64) {
+        cfg.context_lines = n as usize;
+    }
 
     let pattern = non_empty_arg(args, "pattern")
         .ok_or_else(|| fail("'pattern' argument is required and must be non-empty"))?;
@@ -102,6 +109,15 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     //
     // Batches run sequentially, matching ct.  Hit ids are global and 1-based,
     // so merging the score lists is a concatenation.
+    // The rerank takes seconds; silence at a terminal looks like a hang.  This
+    // is a no-op unless the caller installed a progress sink (SPEC-cli §2) —
+    // the MCP server never does, because stdout is its transport.
+    ctx.note(&format!(
+        "filtering {} hits with {}…",
+        considered.len(),
+        ctx.client.map(|c| c.model()).unwrap_or("the local model")
+    ));
+
     let batch_size = cfg.batch_size.max(1);
     let mut keeps: Vec<SelectedHit> = Vec::new();
     let mut none_relevant = true;

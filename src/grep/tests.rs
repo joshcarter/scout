@@ -40,6 +40,7 @@ fn offline_ctx(project: &str) -> Ctx<'static> {
         client_error: Some("no config in tests".into()),
         presets: &[],
         project: project.to_string(),
+        progress: None,
     }
 }
 

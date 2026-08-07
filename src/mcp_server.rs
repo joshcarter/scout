@@ -104,6 +104,8 @@ impl Scout {
             client_error,
             presets: &self.presets,
             project: project_root(),
+            // Silence is mandatory here: stdout is the JSON-RPC transport.
+            progress: None,
         };
         match tool {
             "check_output" => crate::check_output::run(&ctx, &args),

@@ -44,6 +44,24 @@ model = "qwen3:27b"
 # max_file_bytes = 1048576
 # max_hits_scanned = 2000
 
+# Terminal rendering for `scout grep`. Read only by the CLI — the MCP
+# server never consults this table, so nothing here changes what Claude
+# sees. Parsed leniently, like the two tables above.
+
+[cli]
+# auto | always | never. `auto` colors only when stdout is a terminal and
+# NO_COLOR is unset. --color overrides.
+# color = "auto"
+
+# Default context lines around a match. Falls back to [grep]
+# context_lines when unset. -C/--context overrides.
+# context = 2
+
+# Default result cap for terminal invocations — higher than the wire
+# default of 10 because it is a ceiling, not a quota: the model returns
+# only the hits it kept. -n/--max-hits overrides.
+# max_hits = 20
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.

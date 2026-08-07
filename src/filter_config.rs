@@ -26,6 +26,11 @@
 // context_max_bytes = 2000
 // max_file_bytes    = 1048576
 // max_hits_scanned  = 2000
+//
+// [cli]                      # terminal rendering only — MCP never reads it
+// color    = "auto"
+// context  = 2
+// max_hits = 20
 // ```
 //
 // Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
@@ -94,14 +99,78 @@ impl Default for GrepConfig {
     }
 }
 
-/// Load both configs, applying any overrides found in scout's config file.
-/// Any read/parse problem silently yields defaults.
+/// Terminal-only tunables (`[cli]`, SPEC-cli §7).
+///
+/// These exist purely for the CLI renderer — the MCP server never reads them,
+/// so nothing here can change what Claude sees.  That is also why `max_hits`
+/// differs from `grep`'s wire default of 10: a human at a terminal wants a
+/// fuller list, and the cap is a ceiling rather than a quota (SPEC §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliConfig {
+    /// `auto` | `always` | `never`.  Kept as a string here and validated by
+    /// the CLI, so an unknown value degrades to `auto` rather than erroring.
+    pub color: String,
+    /// Default `-C` for terminal use.  `None` means "fall back to
+    /// `[grep] context_lines`" — the fallback lives in the caller because
+    /// only it knows the resolved `GrepConfig`.
+    pub context: Option<usize>,
+    /// Default result cap for terminal invocations.
+    pub max_hits: usize,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        CliConfig { color: "auto".to_string(), context: None, max_hits: 20 }
+    }
+}
+
+/// Load both filter configs, applying any overrides found in scout's config
+/// file.  Any read/parse problem silently yields defaults.
 pub fn load() -> (ExtractConfig, GrepConfig) {
-    let path = crate::config::config_path();
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (ExtractConfig::default(), GrepConfig::default());
+    match read_config() {
+        Some(text) => parse_overrides(&text),
+        None => (ExtractConfig::default(), GrepConfig::default()),
+    }
+}
+
+/// Load the `[cli]` table.  Separate from `load` so the two MCP-facing
+/// configs keep their existing arity and call sites.
+pub fn load_cli() -> CliConfig {
+    match read_config() {
+        Some(text) => parse_cli_overrides(&text),
+        None => CliConfig::default(),
+    }
+}
+
+fn read_config() -> Option<String> {
+    std::fs::read_to_string(crate::config::config_path()).ok()
+}
+
+/// Parse `[cli]` overrides out of a scout config file body.  As lenient as
+/// `parse_overrides`: unknown keys, wrong types and a malformed file all
+/// silently keep the defaults.
+pub fn parse_cli_overrides(toml_text: &str) -> CliConfig {
+    let mut cli = CliConfig::default();
+    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
+        return cli;
     };
-    parse_overrides(&text)
+    let Some(t) = root.get("cli") else { return cli };
+
+    if let Some(v) = t.get("color").and_then(toml::Value::as_str) {
+        let v = v.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "auto" | "always" | "never") {
+            cli.color = v;
+        }
+    }
+    // `context = 0` is meaningful here (show the matched line only), so this
+    // one accepts zero — unlike the budget knobs above, where zero livelocks.
+    if let Some(v) = t.get("context").and_then(toml::Value::as_integer) {
+        if v >= 0 {
+            cli.context = Some(v as usize);
+        }
+    }
+    set_usize(&mut cli.max_hits, t, "max_hits");
+    cli
 }
 
 /// Parse `[extract]` / `[grep]` overrides out of a scout config file body.
@@ -214,11 +283,50 @@ context_lines = 4
     }
 
     #[test]
+    fn cli_defaults_match_spec() {
+        let c = CliConfig::default();
+        assert_eq!(c.color, "auto");
+        assert_eq!(c.context, None, "unset means: fall back to [grep] context_lines");
+        assert_eq!(c.max_hits, 20, "terminal default, not grep's wire default of 10");
+    }
+
+    #[test]
+    fn cli_overrides_are_applied() {
+        let c = parse_cli_overrides("[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\n");
+        assert_eq!(c.color, "never");
+        assert_eq!(c.context, Some(4));
+        assert_eq!(c.max_hits, 50);
+        // context = 0 is a real choice (matched line only), unlike the budgets.
+        assert_eq!(parse_cli_overrides("[cli]\ncontext = 0\n").context, Some(0));
+    }
+
+    #[test]
+    fn cli_junk_values_keep_defaults() {
+        assert_eq!(parse_cli_overrides("[cli]\ncolor = \"chartreuse\"\n"), CliConfig::default());
+        assert_eq!(parse_cli_overrides("[cli]\ncolor = 3\nmax_hits = -1\n"), CliConfig::default());
+        assert_eq!(parse_cli_overrides("[cli]\ncontext = -2\n").context, None);
+        assert_eq!(parse_cli_overrides("not = = toml"), CliConfig::default());
+        assert_eq!(parse_cli_overrides(""), CliConfig::default());
+        // Case and padding are forgiven; the value is normalized.
+        assert_eq!(parse_cli_overrides("[cli]\ncolor = \" Always \"\n").color, "always");
+    }
+
+    #[test]
+    fn cli_table_does_not_disturb_the_filter_tables() {
+        let text = "[cli]\nmax_hits = 50\ncontext = 9\n";
+        let (e, g) = parse_overrides(text);
+        assert_eq!(e, ExtractConfig::default());
+        assert_eq!(g, GrepConfig::default());
+    }
+
+    #[test]
     fn llm_only_config_yields_defaults() {
         // The common case: a config file that configures the endpoint and
         // nothing else must not disturb the filter tunables.
-        let (e, g) = parse_overrides("[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n");
+        let text = "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n";
+        let (e, g) = parse_overrides(text);
         assert_eq!(e, ExtractConfig::default());
         assert_eq!(g, GrepConfig::default());
+        assert_eq!(parse_cli_overrides(text), CliConfig::default());
     }
 }

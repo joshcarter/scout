@@ -309,6 +309,7 @@ fn require_client_explains_a_missing_config() {
         client_error: Some("cannot read config \"/nope/config.toml\"".into()),
         presets: &[],
         project: ".".into(),
+        progress: None,
     };
     let e = ctx.require_client().err().expect("no client configured");
     assert!(e.contains("not configured"), "{e}");
@@ -317,6 +318,7 @@ fn require_client_explains_a_missing_config() {
 
 #[test]
 fn unknown_preset_is_an_error_not_a_panic() {
-    let ctx = Ctx { client: None, client_error: None, presets: &[], project: ".".into() };
+    let ctx =
+        Ctx { client: None, client_error: None, presets: &[], project: ".".into(), progress: None };
     assert!(ctx.preset("extract").unwrap_err().contains("not found"));
 }

@@ -31,6 +31,9 @@ use serde_json::Value;
 use crate::client::LlmClient;
 use crate::presets::{self, Preset};
 
+/// Where a filter sends human-facing progress notes, when anyone is listening.
+pub type ProgressSink<'a> = Box<dyn Fn(&str) + 'a>;
+
 /// Ranges separated by at most this many lines are merged into one.
 pub const MERGE_GAP: usize = 3;
 
@@ -52,9 +55,25 @@ pub struct Ctx<'a> {
     pub presets: &'a [Preset],
     /// Project root: the base for relative paths and the search walk.
     pub project: String,
+    /// Optional sink for human-facing progress notes (SPEC-cli §2).
+    ///
+    /// The filters are shared verbatim with the MCP server, which speaks
+    /// JSON-RPC over stdio and must stay silent — so a filter can *never*
+    /// print unconditionally.  The CLI installs a closure that writes to
+    /// stderr; `mcp_server.rs` and the tests leave this `None`, which makes
+    /// silence the default rather than something each caller must remember
+    /// to arrange.
+    pub progress: Option<ProgressSink<'a>>,
 }
 
 impl Ctx<'_> {
+    /// Report progress to whoever asked for it; a no-op when nobody did.
+    pub fn note(&self, msg: &str) {
+        if let Some(sink) = &self.progress {
+            sink(msg);
+        }
+    }
+
     /// The client, or a caller-facing explanation of why there isn't one.
     pub fn require_client(&self) -> Result<&LlmClient, String> {
         match (self.client, &self.client_error) {
