@@ -1,0 +1,92 @@
+# find_patterns preset — pattern synthesis for `scout find` (SPEC-cli §5)
+#
+# The model never searches.  It is shown the caller's question plus a paths-only
+# sketch of the project tree, and it replies with 3–8 candidate grep patterns.
+# scout runs every candidate through its own search engine, drops the ones that
+# whiff or match everything, and hands the union to the *existing* grep rerank
+# preset — so a hallucinated pattern costs one wasted search, never a wrong hit.
+#
+# Args (scout-injected): question, tree, max_patterns, failed.
+# `failed` is empty on the first round; on a retry it names the patterns that
+# produced nothing, so round 2 does not re-guess round 1 (SPEC §5 step 4).
+# No context providers — scout builds the tree sketch itself, respecting
+# .gitignore and the caller's own -t/-g filters.
+#
+# CLI-only: `find` is not exposed over MCP (SPEC §9), so this preset is absent
+# from `MCP_PRESETS` in mcp_server.rs and its input_schema is documentation
+# rather than a tool contract.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You propose GREP PATTERNS.  You never search, and you never answer the \
+question yourself — another stage reads the actual code.  You respond with \
+ONLY a JSON object: no prose, no markdown fences, no explanation.
+
+Schema:
+{
+  "patterns": [
+    {"pattern": "<text to grep for>", "regex": false, "types": ["rust"], "globs": ["src/**"]}
+  ]
+}
+
+Rules:
+- Propose 3 to the requested maximum of patterns, ordered best first.  Each \
+  one is run as a separate search and the results are merged, so make them \
+  DIFFERENT guesses at the same question, not variations of one guess.
+- A pattern must be text that literally appears ON a line of source: an \
+  identifier, function or type name, a struct field, a config key, an import \
+  path, a string literal, an attribute.  Not a description, not a sentence, \
+  not a file name.
+- Patterns are matched literally.  Set "regex": true only when you really \
+  want regex syntax, and then keep the expression simple.
+- Avoid patterns that match half the project.  A bare common word ("parse", \
+  "get", "new", "config" on its own, "error") is a bad discriminator and its \
+  hits are thrown away.  Prefer a distinctive multi-word or qualified form \
+  ("load_config", "from_str", "#[derive(Deserialize)]").
+- "types" and "globs" are OPTIONAL narrowing hints, using ripgrep's type \
+  names and glob syntax.  Omit them unless the tree makes the location \
+  obvious.  They can only narrow a search the caller already scoped.
+- Use the file list only as evidence about how this project is laid out and \
+  named.  It is truncated; do not assume a file is absent because it is not \
+  listed.
+- Output the JSON object only — the very first character must be '{'.
+"""
+
+user = """
+Question: ${args.question}
+
+Files in this project (paths only, possibly truncated):
+${args.tree}
+
+Propose at most ${args.max_patterns:-8} patterns that would find the code this \
+question is about.
+${args.failed}"""
+
+[preset]
+name        = "find_patterns"
+description = """Guess grep patterns for a natural-language question about a codebase. \
+Used internally by `scout find`: scout supplies the question and a paths-only tree sketch, the local \
+model returns candidate patterns, and scout runs them itself and reranks the union with the grep preset. \
+Returns JSON: {patterns: [{pattern, regex, types, globs}]}."""
+
+[preset.input_schema]
+type     = "object"
+required = ["question", "tree"]
+
+[preset.input_schema.properties.question]
+type        = "string"
+description = "The caller's natural-language question, e.g. 'where are the config file options parsed?'."
+
+[preset.input_schema.properties.tree]
+type        = "string"
+description = "Paths-only sketch of the project tree, newline separated, truncated to a byte budget."
+
+[preset.input_schema.properties.max_patterns]
+type        = "integer"
+description = "Upper bound on candidates to propose. Defaults to 8."
+
+[preset.input_schema.properties.failed]
+type        = "string"
+description = "On a retry round: a sentence naming the patterns that already produced no matches. Empty on the first round."

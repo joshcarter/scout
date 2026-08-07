@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod extract;
 mod filter_config;
+mod find;
 mod grep;
 mod mcp_server;
 mod presets;
@@ -122,6 +123,13 @@ enum Command {
     },
     /// Intent-filtered grep: search the project, keep only what serves the intent.
     Grep(Box<GrepArgs>),
+    /// Intent-only search: ask a question, the local model guesses the patterns.
+    ///
+    /// `scout find "where are the config file options parsed?"` — scout runs
+    /// every guessed pattern itself and reranks the union against the question.
+    /// Requires a configured local model (unlike `grep`, which degrades to a
+    /// plain structured search).
+    Find(Box<FindArgs>),
     /// Targeted file Q&A: answer a question with the file's relevant line ranges.
     Extract {
         /// Path to the file (absolute, or relative to the project root).
@@ -161,20 +169,12 @@ enum Command {
     Stats,
 }
 
-/// `scout grep`'s flags.  Boxed into its own `Args` struct rather than an
-/// inline variant: the filter set (SPEC-cli §3) makes it far larger than any
-/// sibling, and `run_grep` wants to pass it around as one value.
+/// The flags `grep` and `find` share: what to search (SPEC-cli §3) and how to
+/// print it (§1–2).  Flattened into both verbs so the dialect can never drift
+/// between them — SPEC §5 requires `find`'s filter flags to be *identical* to
+/// grep's, and one struct is the only way to keep that true.
 #[derive(clap::Args)]
-struct GrepArgs {
-    /// Search pattern (literal by default; see --regex).
-    #[arg(required_unless_present = "type_list")]
-    pattern: Option<String>,
-    /// What you are actually looking for. Omit it to skip the LLM rerank
-    /// entirely — an unfiltered structured search, capped at --max-hits.
-    intent: Option<String>,
-    /// Treat the pattern as a regex.
-    #[arg(long)]
-    regex: bool,
+struct SearchFlags {
     /// Only search these file types (repeatable), e.g. -t rust -t toml.
     /// See --type-list for the full set.
     #[arg(short = 't', long = "type", value_name = "TYPE")]
@@ -182,10 +182,6 @@ struct GrepArgs {
     /// Exclude these file types (repeatable), e.g. -T md.
     #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
     type_not: Vec<String>,
-    /// Print every known file type with its globs, then exit.
-    /// Wins over everything else, as in ripgrep.
-    #[arg(long)]
-    type_list: bool,
     /// Include/exclude by glob (repeatable); a leading '!' excludes,
     /// e.g. -g 'src/**' -g '!**/tests/**'.
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
@@ -197,10 +193,6 @@ struct GrepArgs {
     /// Skip this directory (repeatable). Sugar for -g '!PATH/**'.
     #[arg(long, value_name = "PATH")]
     exclude_dir: Vec<String>,
-    /// Skip the LLM rerank entirely: pure structured search, capped at
-    /// --max-hits. Works with no model configured.
-    #[arg(long, conflicts_with = "intent")]
-    no_filter: bool,
     /// Hits to return after filtering (default: `[cli] max_hits`, 20).
     /// A ceiling, not a quota — the model returns only what it kept.
     #[arg(short = 'n', long)]
@@ -224,6 +216,52 @@ struct GrepArgs {
     project: Option<String>,
 }
 
+/// `scout grep`'s flags.  Boxed into its own `Args` struct rather than an
+/// inline variant: the filter set (SPEC-cli §3) makes it far larger than any
+/// sibling, and `run_grep` wants to pass it around as one value.
+#[derive(clap::Args)]
+struct GrepArgs {
+    /// Search pattern (literal by default; see --regex).
+    #[arg(required_unless_present = "type_list")]
+    pattern: Option<String>,
+    /// What you are actually looking for. Omit it to skip the LLM rerank
+    /// entirely — an unfiltered structured search, capped at --max-hits.
+    intent: Option<String>,
+    /// Treat the pattern as a regex.
+    #[arg(long)]
+    regex: bool,
+    /// Print every known file type with its globs, then exit.
+    /// Wins over everything else, as in ripgrep.
+    #[arg(long)]
+    type_list: bool,
+    /// Skip the LLM rerank entirely: pure structured search, capped at
+    /// --max-hits. Works with no model configured.
+    #[arg(long, conflicts_with = "intent")]
+    no_filter: bool,
+    #[command(flatten)]
+    flags: SearchFlags,
+}
+
+/// `scout find`'s flags: a question, the shared filter/render set, and the
+/// guess-again budget.
+///
+/// No `--no-filter` and no `--regex`, deliberately.  The rerank *is* the verb —
+/// without it there is nothing but a pile of guessed patterns — and the model
+/// decides per candidate whether its pattern is a regex, so a global flag would
+/// be overriding a decision the caller never made.
+#[derive(clap::Args)]
+struct FindArgs {
+    /// What you are looking for, in words:
+    /// "where are the config file options parsed?".
+    question: String,
+    /// Pattern-guess rounds before giving up (default: `[find] max_attempts`,
+    /// 2). 1 disables the retry.
+    #[arg(long, value_name = "N")]
+    attempts: Option<u64>,
+    #[command(flatten)]
+    flags: SearchFlags,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -231,6 +269,7 @@ fn main() -> anyhow::Result<()> {
         Command::Run { args } => run_cmd::run_subcommand(&args),
         Command::Task { prompt } => run_task(&prompt),
         Command::Grep(args) => run_grep(*args),
+        Command::Find(args) => run_find(*args),
         Command::Extract { file, question, max_lines, project } => run_filter(
             "extract",
             project,
@@ -287,45 +326,63 @@ fn run_grep(a: GrepArgs) -> ! {
     }
     // clap's `required_unless_present` guarantees this.
     let pattern = a.pattern.expect("clap requires a pattern unless --type-list");
-
-    let (_, grep_cfg) = filter_config::load();
-    let cli_cfg = filter_config::load_cli();
-
-    let context_lines = a.context.or(cli_cfg.context).unwrap_or(grep_cfg.context_lines);
-    let max_hits = a.max_hits.unwrap_or(cli_cfg.max_hits as u64);
-    let color = a.color.unwrap_or_else(|| ColorWhen::from_config(&cli_cfg.color));
-    let format = a.format.unwrap_or(Format::Human);
-    let globs = collect_globs(&a.glob, &a.dir, &a.exclude_dir);
+    let (mut args, out, project) = resolve_flags(a.flags);
+    args["pattern"] = json!(pattern);
+    args["intent"] = json!(a.intent);
+    args["regex"] = json!(a.regex);
 
     // `--no-filter` needs no argument of its own: an absent intent already
     // means "no rerank" (SPEC-cli §9), and clap's `conflicts_with` makes
     // `--no-filter` with an intent an error rather than a silent no-op — so
     // by the time we get here, `--no-filter` and "no intent" are the same
     // state and the pipeline sees exactly one code path.
-    run_filter(
-        "grep",
-        a.project,
-        json!({
-            "pattern": pattern,
-            "intent": a.intent,
-            "regex": a.regex,
-            "max_hits": max_hits,
-            "context_lines": context_lines,
-            "types": a.r#type,
-            "types_not": a.type_not,
-            "globs": globs,
-        }),
-        Some(GrepOutput {
-            format,
-            color: color.enabled(),
-            context_lines,
-            max_columns: a.max_columns.unwrap_or(cli_cfg.max_columns),
-            // `grep::run` clamps; mirror it so "capped at top N" never claims
-            // a cap the pipeline did not actually apply.
-            max_hits: (max_hits as usize).clamp(1, 100),
-            max_hits_scanned: grep_cfg.max_hits_scanned,
-        }),
-    )
+    run_filter("grep", project, args, Some(out))
+}
+
+/// Resolve `scout find`'s flags and hand off to `run_filter`.
+///
+/// Everything about the output side is grep's — same renderer, same status
+/// lines, same exit codes (SPEC-cli §5) — so the only find-specific work here
+/// is the question and the attempt budget.
+fn run_find(a: FindArgs) -> ! {
+    let (mut args, out, project) = resolve_flags(a.flags);
+    args["question"] = json!(a.question);
+    args["attempts"] = json!(a.attempts);
+    run_filter("find", project, args, Some(out))
+}
+
+/// Turn the shared flag set into the pipeline's argument object plus the
+/// renderer's options, applying the usual precedence: explicit flag, then
+/// `[cli]`, then the shared `[grep]` default.
+///
+/// It lives here rather than in `grep.rs`/`find.rs` so the MCP path never sees
+/// a terminal-only default.
+fn resolve_flags(f: SearchFlags) -> (serde_json::Value, GrepOutput, Option<String>) {
+    let (_, grep_cfg) = filter_config::load();
+    let cli_cfg = filter_config::load_cli();
+
+    let context_lines = f.context.or(cli_cfg.context).unwrap_or(grep_cfg.context_lines);
+    let max_hits = f.max_hits.unwrap_or(cli_cfg.max_hits as u64);
+    let color = f.color.unwrap_or_else(|| ColorWhen::from_config(&cli_cfg.color));
+
+    let args = json!({
+        "max_hits": max_hits,
+        "context_lines": context_lines,
+        "types": f.r#type,
+        "types_not": f.type_not,
+        "globs": collect_globs(&f.glob, &f.dir, &f.exclude_dir),
+    });
+    let out = GrepOutput {
+        format: f.format.unwrap_or(Format::Human),
+        color: color.enabled(),
+        context_lines,
+        max_columns: f.max_columns.unwrap_or(cli_cfg.max_columns),
+        // The pipelines clamp; mirror it so "capped at top N" never claims a
+        // cap the pipeline did not actually apply.
+        max_hits: (max_hits as usize).clamp(1, 100),
+        max_hits_scanned: grep_cfg.max_hits_scanned,
+    };
+    (args, out, f.project)
 }
 
 /// Fold `-g`, `--dir` and `--exclude-dir` into the single glob list the search
@@ -375,6 +432,7 @@ fn run_filter(
 
     let result = match tool {
         "grep" => grep::run(&ctx, &args),
+        "find" => find::run(&ctx, &args),
         "extract" => extract::run(&ctx, &args),
         _ => check_output::run(&ctx, &args),
     };
@@ -442,15 +500,29 @@ fn grep_status(payload: &serde_json::Value, out: &GrepOutput) -> Vec<String> {
     let hits_total = num("hits_total");
     let pattern = payload.get("pattern").and_then(serde_json::Value::as_str).unwrap_or("");
 
+    // `find` payloads carry the attempt count; grep's never do.  The two verbs
+    // need different advice on an empty result — `find` has no `--no-filter`
+    // (the rerank is the whole verb) and no pattern to re-run, so both of its
+    // empty cases point at an explicit `scout grep` instead (SPEC-cli §5).
+    let find_attempts = payload.get("find_attempts").and_then(serde_json::Value::as_u64);
+
     // Empty is the one case a human can misread, so it says which empty it is.
     if returned == 0 {
-        return vec![if flag("none_relevant") {
-            format!(
+        return vec![match (find_attempts, flag("none_relevant")) {
+            (Some(n), false) => format!(
+                "no pattern guess produced hits after {n} attempt{} — \
+                 try scout grep with an explicit pattern",
+                if n == 1 { "" } else { "s" }
+            ),
+            (Some(_), true) => format!(
+                "local model judged none of the {hits_total} hits relevant — \
+                 try scout grep with an explicit pattern"
+            ),
+            (None, true) => format!(
                 "local model judged none of the {hits_total} hits relevant — \
                  rerun with --no-filter to see all of them"
-            )
-        } else {
-            format!("no matches for '{pattern}'")
+            ),
+            (None, false) => format!("no matches for '{pattern}'"),
         }];
     }
 
@@ -558,16 +630,16 @@ mod tests {
     #[test]
     fn type_and_glob_flags_are_repeatable() {
         let a = grep_args(&["needle", "-t", "rust", "-t", "toml", "-T", "md", "-g", "src/**"]);
-        assert_eq!(a.r#type, vec!["rust", "toml"]);
-        assert_eq!(a.type_not, vec!["md"]);
-        assert_eq!(a.glob, vec!["src/**"]);
+        assert_eq!(a.flags.r#type, vec!["rust", "toml"]);
+        assert_eq!(a.flags.type_not, vec!["md"]);
+        assert_eq!(a.flags.glob, vec!["src/**"]);
     }
 
     #[test]
     fn dir_flags_are_sugar_over_globs() {
         let a = grep_args(&["needle", "-g", "*.rs", "--dir", "src", "--exclude-dir", "vendor/"]);
         assert_eq!(
-            collect_globs(&a.glob, &a.dir, &a.exclude_dir),
+            collect_globs(&a.flags.glob, &a.flags.dir, &a.flags.exclude_dir),
             vec!["*.rs", "src/**", "!vendor/**"],
             "--dir includes, --exclude-dir negates, and a trailing slash is tolerated"
         );
@@ -603,6 +675,122 @@ mod tests {
         // Alone, it is just the no-intent path spelled out.
         let a = grep_args(&["needle", "--no-filter"]);
         assert!(a.no_filter && a.intent.is_none());
+    }
+
+    /// Parse an argv, returning find's flags.
+    fn find_args(argv: &[&str]) -> FindArgs {
+        let mut full = vec!["scout", "find"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).expect("should parse").command {
+            Command::Find(a) => *a,
+            _ => panic!("not the find subcommand"),
+        }
+    }
+
+    #[test]
+    fn find_takes_the_same_filter_flags_as_grep() {
+        // SPEC §5: "filter flags are identical to scout grep".  The shared
+        // `SearchFlags` makes that structural, and this pins it.
+        let a = find_args(&[
+            "where is config parsed?",
+            "-t",
+            "rust",
+            "-T",
+            "md",
+            "-g",
+            "src/**",
+            "--exclude-dir",
+            "vendor",
+            "-n",
+            "5",
+            "-C",
+            "1",
+            "-M",
+            "80",
+            "--format",
+            "vimgrep",
+        ]);
+        assert_eq!(a.question, "where is config parsed?");
+        assert_eq!(a.flags.r#type, vec!["rust"]);
+        assert_eq!(a.flags.type_not, vec!["md"]);
+        assert_eq!(collect_globs(&a.flags.glob, &a.flags.dir, &a.flags.exclude_dir),
+                   vec!["src/**", "!vendor/**"]);
+        assert_eq!(a.flags.max_hits, Some(5));
+        assert_eq!(a.flags.context, Some(1));
+        assert_eq!(a.flags.max_columns, Some(80));
+        assert!(matches!(a.flags.format, Some(Format::Vimgrep)));
+    }
+
+    #[test]
+    fn find_attempts_defaults_to_the_config_and_overrides_cleanly() {
+        assert_eq!(find_args(&["a question"]).attempts, None, "unset means [find] max_attempts");
+        assert_eq!(find_args(&["a question", "--attempts", "1"]).attempts, Some(1));
+    }
+
+    #[test]
+    fn find_rejects_the_flags_that_would_contradict_it() {
+        // `--no-filter` would remove the only stage that makes find work, and
+        // `--regex` would override a per-candidate decision the caller never
+        // made — neither exists on this verb.
+        for flag in ["--no-filter", "--regex"] {
+            match Cli::try_parse_from(["scout", "find", "a question", flag]) {
+                Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "flag: {flag}"),
+                Ok(_) => panic!("find must not accept {flag}"),
+            }
+        }
+    }
+
+    #[test]
+    fn find_requires_a_question() {
+        match Cli::try_parse_from(["scout", "find"]) {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::MissingRequiredArgument),
+            Ok(_) => panic!("find must require a question"),
+        }
+    }
+
+    #[test]
+    fn a_whiffed_find_names_scout_grep_not_no_filter() {
+        let out = test_output();
+        let payload = json!({
+            "mode": "full", "pattern": "quantum|flux", "intent": "a question",
+            "hits_total": 0, "hits": [], "none_relevant": false,
+            "find_attempts": 2, "find_patterns": ["quantum", "flux"],
+        });
+        let lines = grep_status(&payload, &out);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "no pattern guess produced hits after 2 attempts — try scout grep with an explicit pattern"
+        );
+        // ...and one attempt is singular, because a status line that says
+        // "1 attempts" reads as a bug in the tool.
+        let single = json!({"hits": [], "find_attempts": 1, "none_relevant": false});
+        assert!(grep_status(&single, &out)[0].contains("after 1 attempt —"), "{:?}", grep_status(&single, &out));
+    }
+
+    #[test]
+    fn a_none_relevant_find_also_points_at_scout_grep() {
+        // find has no --no-filter to rerun with, so grep's advice would be a
+        // dead end here.
+        let payload = json!({
+            "mode": "rerank", "pattern": "a|b", "intent": "a question",
+            "hits_total": 31, "hits": [], "none_relevant": true, "find_attempts": 1,
+        });
+        let line = grep_status(&payload, &test_output()).remove(0);
+        assert!(line.contains("none of the 31 hits relevant"), "{line}");
+        assert!(line.contains("scout grep"), "{line}");
+        assert!(!line.contains("--no-filter"), "{line}");
+    }
+
+    fn test_output() -> GrepOutput {
+        GrepOutput {
+            format: Format::Human,
+            color: false,
+            context_lines: 2,
+            max_columns: 150,
+            max_hits: 20,
+            max_hits_scanned: 2000,
+        }
     }
 
     #[test]

@@ -69,6 +69,31 @@ model = "qwen3:27b"
 # --format json and --format vimgrep are never capped.
 # max_columns = 150
 
+# `scout find` — intent-only search: you ask a question, the local model
+# guesses the patterns, scout runs them and reranks the union. CLI-only
+# (find is not an MCP tool), and parsed leniently like the tables above.
+
+[find]
+# Pattern-guess rounds before giving up. A round is retried only when
+# *every* guessed pattern matched nothing — a thin result is still a
+# result. 1 disables the retry. --attempts overrides.
+# max_attempts = 2
+
+# Candidate patterns requested from the model per round. Each one costs
+# one search of the tree, so this is a latency knob as much as a
+# recall knob.
+# max_patterns = 8
+
+# A guessed pattern matching more lines than this is a bad discriminator
+# (`parse` in a parser), and *all* of its hits are dropped before the
+# reranker sees them — a pattern that matches everything distinguishes
+# nothing.
+# degenerate_hit_cap = 300
+
+# Byte cap on the paths-only file-tree sketch shown to the pattern
+# guesser. Paths only — never symbols or file contents.
+# tree_max_bytes = 8192
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.

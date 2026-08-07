@@ -8,7 +8,7 @@
 // Only `quality_review` and `test_review` have context-provider-driven golden
 // tests here: they're the only two of the 6 kept presets that use context
 // providers at all (`file_read`, `git_diff_range`). `check_output`, `shell_safety`,
-// `extract`, and `grep` are pure ${args.*} pass-throughs with no `[context.*]`
+// `extract`, `grep` and `find_patterns` are pure ${args.*} pass-throughs with no `[context.*]`
 // sections — see `tests_selectors.rs` for `extract`/`grep` golden coverage.
 //
 // ## What "golden" means here
@@ -143,21 +143,30 @@ fn shell_safety_toml_parses_with_no_context() {
 // ── load_builtins() / load_all() integration ─────────────────────────────────
 
 #[test]
-fn load_builtins_returns_exactly_six_presets() {
+fn load_builtins_returns_exactly_seven_presets() {
     let presets = load_builtins();
     let mut names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["check_output", "extract", "grep", "quality_review", "shell_safety", "test_review"],
-        "the 6 kept presets from PLAN.md §1 must all be embedded and parse"
+        vec![
+            "check_output",
+            "extract",
+            "find_patterns",
+            "grep",
+            "quality_review",
+            "shell_safety",
+            "test_review"
+        ],
+        "the 6 kept presets from PLAN.md §1 plus find_patterns (SPEC-cli §5) \
+         must all be embedded and parse"
     );
 }
 
 #[test]
 fn load_all_with_no_user_dir_returns_builtins_only() {
     let presets = load_all(None);
-    assert_eq!(presets.len(), 6);
+    assert_eq!(presets.len(), 7);
 }
 
 #[test]
@@ -176,7 +185,7 @@ description = "USER OVERRIDE"
     )
     .unwrap();
     let presets = load_all(Some(&tmp));
-    assert_eq!(presets.len(), 6, "override replaces, does not add");
+    assert_eq!(presets.len(), 7, "override replaces, does not add");
     let grep = presets.iter().find(|p| p.name == "grep").expect("grep missing");
     assert_eq!(grep.description, "USER OVERRIDE");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -197,7 +206,7 @@ description = "Not a builtin."
     )
     .unwrap();
     let presets = load_all(Some(&tmp));
-    assert_eq!(presets.len(), 7);
+    assert_eq!(presets.len(), 8);
     assert!(presets.iter().any(|p| p.name == "explain"));
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -205,7 +214,7 @@ description = "Not a builtin."
 #[test]
 fn load_all_missing_user_dir_does_not_error() {
     let presets = load_all(Some(std::path::Path::new("/definitely/does/not/exist")));
-    assert_eq!(presets.len(), 6, "a missing override dir should silently fall back to builtins only");
+    assert_eq!(presets.len(), 7, "a missing override dir should silently fall back to builtins only");
 }
 
 // ── load() + resolve() unit tests ────────────────────────────────────────────

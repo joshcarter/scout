@@ -32,6 +32,12 @@
 // context     = 2
 // max_hits    = 20
 // max_columns = 150
+//
+// [find]                     # `scout find` only — also never read by MCP
+// max_attempts       = 2
+// max_patterns       = 8
+// degenerate_hit_cap = 300
+// tree_max_bytes     = 8192
 // ```
 //
 // Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
@@ -128,6 +134,32 @@ impl Default for CliConfig {
     }
 }
 
+/// Tunables for `find` — the intent-only search (SPEC-cli §5, §7).
+///
+/// CLI-only, like `[cli]`: `find` is deliberately not an MCP tool (SPEC §9
+/// defers it until the pattern-synthesis preset proves out), so nothing here
+/// can change what Claude sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindConfig {
+    /// Pattern-guess rounds before giving up.  `1` means no retry;
+    /// `--attempts` overrides.
+    pub max_attempts: usize,
+    /// Candidate patterns requested from the model per round.
+    pub max_patterns: usize,
+    /// A candidate matching more lines than this is a bad discriminator — the
+    /// moral equivalent of low IDF — and *all* of its hits are dropped before
+    /// the reranker sees them.
+    pub degenerate_hit_cap: usize,
+    /// Byte cap on the file-tree sketch sent to the pattern preset.
+    pub tree_max_bytes: usize,
+}
+
+impl Default for FindConfig {
+    fn default() -> Self {
+        FindConfig { max_attempts: 2, max_patterns: 8, degenerate_hit_cap: 300, tree_max_bytes: 8192 }
+    }
+}
+
 /// Load both filter configs, applying any overrides found in scout's config
 /// file.  Any read/parse problem silently yields defaults.
 pub fn load() -> (ExtractConfig, GrepConfig) {
@@ -143,6 +175,15 @@ pub fn load_cli() -> CliConfig {
     match read_config() {
         Some(text) => parse_cli_overrides(&text),
         None => CliConfig::default(),
+    }
+}
+
+/// Load the `[find]` table.  Separate from `load` for the same reason
+/// `load_cli` is: the MCP-facing configs keep their existing arity.
+pub fn load_find() -> FindConfig {
+    match read_config() {
+        Some(text) => parse_find_overrides(&text),
+        None => FindConfig::default(),
     }
 }
 
@@ -182,6 +223,23 @@ pub fn parse_cli_overrides(toml_text: &str) -> CliConfig {
         }
     }
     cli
+}
+
+/// Parse `[find]` overrides out of a scout config file body.  Every knob here
+/// has no meaningful zero — a zero attempt count, pattern budget, hit cap or
+/// tree budget all mean "never search" — so `set_usize`'s positive-only rule
+/// is exactly right, and junk keeps the default.
+pub fn parse_find_overrides(toml_text: &str) -> FindConfig {
+    let mut find = FindConfig::default();
+    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
+        return find;
+    };
+    let Some(t) = root.get("find") else { return find };
+    set_usize(&mut find.max_attempts, t, "max_attempts");
+    set_usize(&mut find.max_patterns, t, "max_patterns");
+    set_usize(&mut find.degenerate_hit_cap, t, "degenerate_hit_cap");
+    set_usize(&mut find.tree_max_bytes, t, "tree_max_bytes");
+    find
 }
 
 /// Parse `[extract]` / `[grep]` overrides out of a scout config file body.
@@ -345,6 +403,53 @@ context_lines = 4
     }
 
     #[test]
+    fn find_defaults_match_spec() {
+        let f = FindConfig::default();
+        assert_eq!(f.max_attempts, 2);
+        assert_eq!(f.max_patterns, 8);
+        assert_eq!(f.degenerate_hit_cap, 300);
+        assert_eq!(f.tree_max_bytes, 8192);
+    }
+
+    #[test]
+    fn find_overrides_are_applied() {
+        let f = parse_find_overrides(
+            "[find]\nmax_attempts = 3\nmax_patterns = 5\ndegenerate_hit_cap = 50\ntree_max_bytes = 1024\n",
+        );
+        assert_eq!(f.max_attempts, 3);
+        assert_eq!(f.max_patterns, 5);
+        assert_eq!(f.degenerate_hit_cap, 50);
+        assert_eq!(f.tree_max_bytes, 1024);
+        // An unset key keeps its default rather than zeroing out.
+        let partial = parse_find_overrides("[find]\nmax_attempts = 1\n");
+        assert_eq!(partial.max_attempts, 1);
+        assert_eq!(partial.max_patterns, 8);
+    }
+
+    #[test]
+    fn find_junk_values_keep_defaults() {
+        // Zero is junk for every knob in this table: no attempts, no patterns,
+        // a zero hit cap and a zero tree budget all mean "never find anything".
+        assert_eq!(
+            parse_find_overrides("[find]\nmax_attempts = 0\ndegenerate_hit_cap = 0\n"),
+            FindConfig::default()
+        );
+        assert_eq!(parse_find_overrides("[find]\nmax_patterns = -3\n"), FindConfig::default());
+        assert_eq!(parse_find_overrides("[find]\ntree_max_bytes = \"lots\"\n"), FindConfig::default());
+        assert_eq!(parse_find_overrides("not = = toml"), FindConfig::default());
+        assert_eq!(parse_find_overrides(""), FindConfig::default());
+    }
+
+    #[test]
+    fn find_table_does_not_disturb_the_other_tables() {
+        let text = "[find]\nmax_attempts = 3\ntree_max_bytes = 99\n";
+        let (e, g) = parse_overrides(text);
+        assert_eq!(e, ExtractConfig::default());
+        assert_eq!(g, GrepConfig::default());
+        assert_eq!(parse_cli_overrides(text), CliConfig::default());
+    }
+
+    #[test]
     fn llm_only_config_yields_defaults() {
         // The common case: a config file that configures the endpoint and
         // nothing else must not disturb the filter tunables.
@@ -353,5 +458,6 @@ context_lines = 4
         assert_eq!(e, ExtractConfig::default());
         assert_eq!(g, GrepConfig::default());
         assert_eq!(parse_cli_overrides(text), CliConfig::default());
+        assert_eq!(parse_find_overrides(text), FindConfig::default());
     }
 }

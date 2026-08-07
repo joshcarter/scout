@@ -214,6 +214,43 @@ pub fn type_definitions() -> Vec<(String, Vec<String>)> {
     defs
 }
 
+/// Walk `root` and return the project-relative path of every file, in sorted
+/// order — the paths-only tree sketch `find` shows the pattern-synthesis
+/// preset (SPEC-cli §5, §9).
+///
+/// Same walk `search` performs (`.gitignore`, `.ignore`, hidden files, and the
+/// caller's `types`/`overrides`), so a `-t rust` run is described the way it
+/// will be searched.  `max_entries` bounds the walk itself: the caller trims to
+/// a *byte* budget afterwards, but a monorepo should not be fully enumerated
+/// into memory first.  Nothing is read — this is names, never contents.
+pub fn list_paths(root: &Path, opts: &SearchOptions, max_entries: usize) -> Vec<String> {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .standard_filters(true)
+        .parents(true)
+        .require_git(false)
+        .sort_by_file_path(|a, b| a.cmp(b));
+    if let Some(types) = &opts.types {
+        builder.types(types.clone());
+    }
+    if let Some(ov) = &opts.overrides {
+        builder.overrides(ov.clone());
+    }
+
+    let mut paths = Vec::new();
+    for entry in builder.build() {
+        if paths.len() >= max_entries {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        paths.push(display_path(root, entry.path()));
+    }
+    paths
+}
+
 /// Walk `root` and return every hit for `pattern`, with context.
 ///
 /// Files are visited in sorted path order so a given tree always produces the

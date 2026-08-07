@@ -84,13 +84,15 @@ pub struct ContextDef {
 
 // ── Built-in presets (embedded at compile time) ─────────────────────────────
 
-/// The 6 built-in presets, embedded so a binary-only install always has
-/// them. Order matches PLAN.md §1's kept-preset table.
+/// The 7 built-in presets, embedded so a binary-only install always has
+/// them. Order matches PLAN.md §1's kept-preset table, plus `find_patterns`
+/// (SPEC-cli §5), which backs `scout find` and is deliberately CLI-only.
 const BUILTIN_TOML: &[&str] = &[
     include_str!("../../presets/check_output.toml"),
     include_str!("../../presets/shell_safety.toml"),
     include_str!("../../presets/extract.toml"),
     include_str!("../../presets/grep.toml"),
+    include_str!("../../presets/find_patterns.toml"),
     include_str!("../../presets/quality_review.toml"),
     include_str!("../../presets/test_review.toml"),
 ];

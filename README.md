@@ -21,16 +21,25 @@ toward them land next.
   and (coming) PreToolUse hooks that steer the agent toward the local
   tools.
 - **CLI**: first-class human surface, same code path as the MCP tools:
-  `scout grep <pattern> "<intent>"`, `scout extract <file>
-  "<question>"`, `scout check "<build cmd>"`, `scout task "<prompt>"`,
-  plus `scout run --preset ...` for hooks and `scout stats`.
+  `scout grep <pattern> "<intent>"`, `scout find "<question>"`,
+  `scout extract <file> "<question>"`, `scout check "<build cmd>"`,
+  `scout task "<prompt>"`, plus `scout run --preset ...` for hooks and
+  `scout stats`.
+
+`find` is the intent-only end of the search spectrum: state what you
+want and the local model guesses the patterns, scout runs every guess
+itself and reranks the union against your question. It is CLI-only for
+now and needs a configured model; `grep` covers pattern-only and
+pattern-plus-intent, and degrades to a plain search with no model at
+all.
 
 Search is self-contained: gitignore-aware walking and matching come
 from ripgrep's libraries, so there is no dependency on an installed
 `rg`/`grep`. Small inputs (a file under ~200 lines, a hit list of 8 or
 fewer) skip the local model entirely and are returned whole, so those
 paths work before any `~/.config/scout/config.toml` exists. Filter
-tunables live in that same file under `[extract]` and `[grep]`.
+tunables live in that same file under `[extract]`, `[grep]`, `[cli]`
+and `[find]`.
 
 ## Install
 

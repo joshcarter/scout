@@ -99,7 +99,6 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         .map_err(|e| fail(&format!("grep failed: {e}")))?;
     let search_truncated = results.truncated;
     let hits = parse_hits(&results, cfg.context_lines);
-    let hits_total = hits.len();
 
     // ── 2. No intent: unfiltered search, the model is never involved ─
     //
@@ -110,9 +109,38 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         return Ok(unfiltered_payload(&pattern, &hits, max_hits, search_truncated));
     };
 
+    // ── 3-5. Bypass / cap / rerank — the shared stage ────────────────
+    rerank(ctx, args, &cfg, &pattern, &intent, &hits, max_hits, search_truncated)
+}
+
+/// The rerank stage: bypass a short list, cap what the model sees, then ask it
+/// which hits serve the intent, one call per batch.
+///
+/// Split out of `run` so `find` can reuse it *verbatim* (SPEC-cli §5 step 3:
+/// "the existing stage, unchanged").  `find`'s union list is noisier than a
+/// single-pattern list, which is precisely what this stage exists for — so it
+/// gets the same bypass threshold, the same `max_considered` / `batch_size`
+/// budgets and the same payloads, with no find-specific branch anywhere in it.
+///
+/// `args` is the base argument object for the preset call: this adds
+/// `hit_list` / `hits_considered` / `max_hits` to a clone of it and leaves the
+/// rest (`intent`, `pattern`) to the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn rerank(
+    ctx: &Ctx,
+    args: &Value,
+    cfg: &GrepConfig,
+    pattern: &str,
+    intent: &str,
+    hits: &[RawHit],
+    max_hits: usize,
+    search_truncated: bool,
+) -> ToolResult {
+    let hits_total = hits.len();
+
     // ── 3. Bypass: nothing for the model to filter ───────────────────
     if hits_total <= cfg.bypass_max_hits {
-        return Ok(bypass_payload(&pattern, &intent, &hits, search_truncated));
+        return Ok(bypass_payload(pattern, intent, hits, search_truncated));
     }
 
     // ── 4. Cap what the model sees; truncation stays visible ─────────
@@ -193,8 +221,8 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         .collect();
 
     Ok(rerank_payload(
-        &pattern,
-        &intent,
+        pattern,
+        intent,
         hits_total,
         considered.len(),
         returned,
