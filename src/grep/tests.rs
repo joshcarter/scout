@@ -12,22 +12,32 @@ use crate::source::SearchHit;
 const CTX: usize = 2;
 
 fn hit(file: &str, line: usize, ctx: &str) -> RawHit {
+    let text = matched_line(ctx, line, CTX).map(str::to_string);
     RawHit {
         file: file.to_string(),
         line,
-        text: matched_line(ctx, line, CTX).map(str::to_string),
+        col: text.as_ref().map(|_| 0),
+        col_end: text.as_ref().map(|_| 0),
+        text,
         context: ctx.to_string(),
     }
 }
 
 fn results(hits: Vec<(&str, usize, &str)>) -> SearchResults {
+    search_results(hits.into_iter().map(|(f, l, t)| (f, l, t, 0, 0)).collect())
+}
+
+/// `results`, plus the per-hit match span the search layer now records.
+fn search_results(hits: Vec<(&str, usize, &str, usize, usize)>) -> SearchResults {
     SearchResults {
         hits: hits
             .into_iter()
-            .map(|(file, line, text)| SearchHit {
+            .map(|(file, line, text, col, col_end)| SearchHit {
                 file: file.to_string(),
                 line,
                 text: text.to_string(),
+                col,
+                col_end,
             })
             .collect(),
         truncated: false,
@@ -101,6 +111,78 @@ fn parse_hits_keeps_a_truncated_hit_with_null_text() {
 fn parse_hits_on_an_empty_result_is_empty() {
     assert!(parse_hits(&results(vec![]), CTX).is_empty());
     assert!(parse_hits(&SearchResults::default(), CTX).is_empty());
+}
+
+// ── Match columns (SPEC-cli §4) ──────────────────────────────────────
+
+#[test]
+fn parse_hits_carries_the_match_column_through() {
+    let r = search_results(vec![("a.rs", 412, "a\nb\nlet needle = 1;\nd\ne", 4, 10)]);
+    let hits = parse_hits(&r, CTX);
+    assert_eq!(hits[0].col, Some(4));
+    assert_eq!(hits[0].col_end, Some(10));
+    // The offsets are 0-based and address the payload's own `text`.
+    let text = hits[0].text.clone().unwrap();
+    assert_eq!(&text[4..10], "needle");
+}
+
+#[test]
+fn a_null_matched_line_gets_a_null_column() {
+    // An offset into a line nobody recovered is not a column, it is a lie.
+    let hits = parse_hits(&search_results(vec![("gen.go", 900, "fragment", 40, 46)]), CTX);
+    assert_eq!(hits[0].text, None);
+    assert_eq!(hits[0].col, None);
+    assert_eq!(hits[0].col_end, None);
+}
+
+#[test]
+fn a_column_past_the_surviving_line_is_kept_whole() {
+    // The regression this pins: a minified line arrives cut at the context
+    // budget while its match sits far beyond that cut.  Clamping the column to
+    // the surviving prefix would report the match at the truncation point, and
+    // `--format vimgrep` would send an editor there — to a column that is not
+    // the match, in a file the editor opens in full.  The column belongs to the
+    // file; only the renderer, which slices the prefix, clamps.
+    let hits = parse_hits(&search_results(vec![("bundle.json", 1, "short", 15_700, 15_706)]), CTX);
+    assert_eq!(hits[0].text.as_deref(), Some("short"));
+    assert_eq!((hits[0].col, hits[0].col_end), (Some(15_700), Some(15_706)));
+}
+
+#[test]
+fn a_backwards_span_is_normalized_rather_than_trusted() {
+    let hits = parse_hits(&search_results(vec![("a.rs", 1, "abc", 2, 0)]), CTX);
+    assert_eq!((hits[0].col, hits[0].col_end), (Some(2), Some(2)), "col_end never precedes col");
+}
+
+#[test]
+fn hit_payloads_gain_col_without_disturbing_any_existing_field() {
+    // Additive-only, the same rule P2 followed: every key that was in the
+    // frozen payload is still there, unchanged, plus two new ones.
+    let hits = parse_hits(&search_results(vec![("a.rs", 1, "let needle = 1;", 4, 10)]), CTX);
+    let v = &raw_hit_values(&hits)[0];
+    assert_eq!(v["file"], "a.rs");
+    assert_eq!(v["line"], 1);
+    assert_eq!(v["text"], "let needle = 1;");
+    assert_eq!(v["context"], "let needle = 1;");
+    assert_eq!(v["col"], 4);
+    assert_eq!(v["col_end"], 10);
+
+    // ...and a hit with no recoverable line serializes both as JSON null.
+    let cut = parse_hits(&search_results(vec![("g.go", 900, "fragment", 4, 10)]), CTX);
+    let v = &raw_hit_values(&cut)[0];
+    assert!(v["text"].is_null() && v["col"].is_null() && v["col_end"].is_null(), "{v}");
+}
+
+#[test]
+fn the_rerank_payload_carries_the_column_too() {
+    // `materialize` builds its own object rather than reusing `raw_hit_values`,
+    // so the two shapes have to be kept in step deliberately.
+    let hits = parse_hits(&search_results(vec![("a.rs", 1, "let needle = 1;", 4, 10)]), CTX);
+    let keep = SelectedHit { id: 1, score: 5, why: "because".to_string() };
+    let v = materialize(&hits[0], &keep);
+    assert_eq!(v["col"], 4);
+    assert_eq!(v["col_end"], 10);
+    assert_eq!(v["why"], "because");
 }
 
 // ── Hit-list rendering ───────────────────────────────────────────────

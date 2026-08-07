@@ -31,7 +31,7 @@ enum Format {
     /// returns.  Structure is opt-in, for scripts that want it.
     Json,
     /// `file:line:col: text`, one hit per line — quickfix-compatible
-    /// (`vim -q`).  `col` is 1 until match offsets land.
+    /// (`vim -q`).  `col` is the real 1-based match column.
     Vimgrep,
 }
 
@@ -81,6 +81,8 @@ struct GrepOutput {
     /// The `context_lines` the search ran with — the gutter needs it to number
     /// the block, which the payload itself does not record.
     context_lines: usize,
+    /// Per-line render cap (`-M`); 0 is unlimited.  Human format only.
+    max_columns: usize,
     /// The effective `--max-hits`, for the "capped at top N" status line.
     max_hits: usize,
     /// `[grep] max_hits_scanned`, for the "search truncated" status line.
@@ -207,6 +209,10 @@ struct GrepArgs {
     /// (default: `[cli] context`, else `[grep] context_lines`).
     #[arg(short = 'C', long)]
     context: Option<usize>,
+    /// Cap each rendered line at N columns (default: `[cli] max_columns`, 150;
+    /// 0 disables). An over-long matched line shows a window around the match.
+    #[arg(short = 'M', long, value_name = "N")]
+    max_columns: Option<usize>,
     /// Output format (default: human text, colored only on a terminal).
     #[arg(long, value_enum)]
     format: Option<Format>,
@@ -313,6 +319,7 @@ fn run_grep(a: GrepArgs) -> ! {
             format,
             color: color.enabled(),
             context_lines,
+            max_columns: a.max_columns.unwrap_or(cli_cfg.max_columns),
             // `grep::run` clamps; mirror it so "capped at top N" never claims
             // a cap the pipeline did not actually apply.
             max_hits: (max_hits as usize).clamp(1, 100),
@@ -407,7 +414,11 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
             "{}",
             render::render_human(
                 payload,
-                &render::RenderOpts { color: out.color, context_lines: out.context_lines },
+                &render::RenderOpts {
+                    color: out.color,
+                    context_lines: out.context_lines,
+                    max_columns: out.max_columns,
+                },
             )
         ),
     }
@@ -600,6 +611,7 @@ mod tests {
             format: Format::Human,
             color: false,
             context_lines: 2,
+            max_columns: 150,
             max_hits: 20,
             max_hits_scanned: 2000,
         };

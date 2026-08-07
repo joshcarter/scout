@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
@@ -104,6 +105,16 @@ pub struct SearchHit {
     /// The ±`context_lines` block around the match, newline-joined and
     /// truncated at `context_max_bytes`.
     pub text: String,
+    /// **0-based byte** offset of the first match *within the matched line*
+    /// (SPEC-cli §4).  Only the first match is recorded: the renderer windows
+    /// around one span and quickfix wants one column, so per-match detail
+    /// would be carried for nobody.  Editors want 1-based columns — the
+    /// conversion belongs at the formatter, not here.
+    pub col: usize,
+    /// Byte offset one past that first match (exclusive).  `col_end == col`
+    /// means the matcher declined to re-locate the match on the sunk line, so
+    /// there is no span to highlight — never a reason to drop the hit.
+    pub col_end: usize,
 }
 
 /// The full result of one search: hits plus whether the scan hit its cap.
@@ -269,21 +280,32 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
         // Collect matching line numbers first, then render context from the
         // same buffer — one read per file, and the context block is built
         // exactly the way the daemon used to build it.
-        let mut line_numbers: Vec<usize> = Vec::new();
-        let sink = UTF8(|line_number, _line| {
-            line_numbers.push(line_number as usize);
+        //
+        // The sink hands back the matched line itself but not where in it the
+        // match sat, so re-run the matcher over that one line to recover the
+        // offset (the standard grep-searcher idiom).  It is a single `find`
+        // over one line, not a second pass over the file.
+        let mut line_hits: Vec<(usize, usize, usize)> = Vec::new();
+        let sink = UTF8(|line_number, line| {
+            let (col, col_end) = match matcher.find(line.as_bytes()) {
+                Ok(Some(m)) => (m.start(), m.end()),
+                // No re-match (or a matcher error) is not a reason to lose a
+                // hit the searcher already confirmed: record an empty span.
+                _ => (0, 0),
+            };
+            line_hits.push((line_number as usize, col, col_end));
             Ok(true)
         });
         if searcher.search_slice(&matcher, &bytes, sink).is_err() {
             continue; // unreadable/binary mid-file — skip the file, not the run
         }
-        if line_numbers.is_empty() {
+        if line_hits.is_empty() {
             continue;
         }
 
         let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
         let rel = display_path(root, path);
-        for line in line_numbers {
+        for (line, col, col_end) in line_hits {
             if out.hits.len() >= opts.max_hits {
                 out.truncated = true;
                 break;
@@ -292,6 +314,8 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
                 file: rel.clone(),
                 line,
                 text: extract_context(&lines, line - 1, opts.context_lines, opts.context_max_bytes),
+                col,
+                col_end,
             });
         }
     }

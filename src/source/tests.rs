@@ -21,6 +21,11 @@ fn opts() -> SearchOptions {
     }
 }
 
+/// The `(line, col, col_end)` triples of every hit, in walk order.
+fn spans(dir: &TempDir, pattern: &str, o: &SearchOptions) -> Vec<(usize, usize, usize)> {
+    search(dir.path(), pattern, o).unwrap().hits.iter().map(|h| (h.line, h.col, h.col_end)).collect()
+}
+
 /// Collect the hit files for `pattern` under `dir`, in walk order.
 fn files(dir: &TempDir, pattern: &str, o: &SearchOptions) -> Vec<String> {
     search(dir.path(), pattern, o).unwrap().hits.iter().map(|h| h.file.clone()).collect()
@@ -184,6 +189,62 @@ fn search_rejects_an_invalid_regex_rather_than_returning_nothing() {
     o.regex = true;
     let e = search(dir.path(), "(unclosed", &o).unwrap_err();
     assert!(e.contains("invalid pattern"), "{e}");
+}
+
+// ── search: match columns (SPEC-cli §4) ──────────────────────────────
+
+#[test]
+fn search_records_the_match_column_as_a_byte_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "let needle = 1;\n");
+    // 0-based: "needle" starts at byte 4 and ends (exclusive) at 10.
+    assert_eq!(spans(&dir, "needle", &opts()), vec![(1, 4, 10)]);
+}
+
+#[test]
+fn a_match_at_the_start_of_a_line_has_column_zero() {
+    // The one value that distinguishes 0-based from 1-based capture.
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "needle first\n");
+    assert_eq!(spans(&dir, "needle", &opts()), vec![(1, 0, 6)]);
+}
+
+#[test]
+fn only_the_first_match_on_a_line_is_recorded() {
+    // SPEC §4 wants one column per hit: a window centres on one span and
+    // quickfix carries one column, so later matches have no consumer.
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "xx needle yy needle\n");
+    assert_eq!(spans(&dir, "needle", &opts()), vec![(1, 3, 9)]);
+}
+
+#[test]
+fn match_columns_are_byte_offsets_not_character_offsets() {
+    // "é" is two bytes, so a character-counting capture would report 4 here
+    // and the renderer would slice mid-codepoint.
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "éééé needle\n");
+    let s = spans(&dir, "needle", &opts());
+    assert_eq!(s, vec![(1, 9, 15)]);
+    // ...and the offsets really do address the match in the file's bytes.
+    let body = fs::read_to_string(dir.path().join("a.rs")).unwrap();
+    assert_eq!(&body[9..15], "needle");
+}
+
+#[test]
+fn regex_matches_report_the_span_they_actually_matched() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "let value_42 = 1;\n");
+    let mut o = opts();
+    o.regex = true;
+    assert_eq!(spans(&dir, r"value_\d+", &o), vec![(1, 4, 12)]);
+}
+
+#[test]
+fn every_hit_in_a_file_carries_its_own_column() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "a.rs", "hit\n  hit\n     hit\n");
+    assert_eq!(spans(&dir, "hit", &opts()), vec![(1, 0, 3), (2, 2, 5), (3, 5, 8)]);
 }
 
 // ── search: what it refuses to look at ───────────────────────────────

@@ -28,9 +28,10 @@
 // max_hits_scanned  = 2000
 //
 // [cli]                      # terminal rendering only — MCP never reads it
-// color    = "auto"
-// context  = 2
-// max_hits = 20
+// color       = "auto"
+// context     = 2
+// max_hits    = 20
+// max_columns = 150
 // ```
 //
 // Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
@@ -116,11 +117,14 @@ pub struct CliConfig {
     pub context: Option<usize>,
     /// Default result cap for terminal invocations.
     pub max_hits: usize,
+    /// Per-line render cap in bytes (`-M`, SPEC-cli §4).  `0` is unlimited —
+    /// a real choice here, unlike the budget knobs, so zero is accepted.
+    pub max_columns: usize,
 }
 
 impl Default for CliConfig {
     fn default() -> Self {
-        CliConfig { color: "auto".to_string(), context: None, max_hits: 20 }
+        CliConfig { color: "auto".to_string(), context: None, max_hits: 20, max_columns: 150 }
     }
 }
 
@@ -170,6 +174,13 @@ pub fn parse_cli_overrides(toml_text: &str) -> CliConfig {
         }
     }
     set_usize(&mut cli.max_hits, t, "max_hits");
+    // `max_columns = 0` means "no cap" (SPEC-cli §7), so this one accepts zero
+    // for the same reason `context` does.
+    if let Some(v) = t.get("max_columns").and_then(toml::Value::as_integer) {
+        if v >= 0 {
+            cli.max_columns = v as usize;
+        }
+    }
     cli
 }
 
@@ -288,14 +299,28 @@ context_lines = 4
         assert_eq!(c.color, "auto");
         assert_eq!(c.context, None, "unset means: fall back to [grep] context_lines");
         assert_eq!(c.max_hits, 20, "terminal default, not grep's wire default of 10");
+        assert_eq!(c.max_columns, 150, "SPEC-cli §9 fixed the per-line cap at 150");
+    }
+
+    #[test]
+    fn max_columns_accepts_zero_as_unlimited() {
+        // Unlike the budget knobs, 0 is a real setting here (SPEC §7) — it is
+        // how a user turns the cap off for good rather than typing -M 0 daily.
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 0\n").max_columns, 0);
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 400\n").max_columns, 400);
+        // ...but a negative is still junk, and junk keeps the default.
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = -1\n").max_columns, 150);
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = \"wide\"\n").max_columns, 150);
     }
 
     #[test]
     fn cli_overrides_are_applied() {
-        let c = parse_cli_overrides("[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\n");
+        let c =
+            parse_cli_overrides("[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\nmax_columns = 80\n");
         assert_eq!(c.color, "never");
         assert_eq!(c.context, Some(4));
         assert_eq!(c.max_hits, 50);
+        assert_eq!(c.max_columns, 80);
         // context = 0 is a real choice (matched line only), unlike the budgets.
         assert_eq!(parse_cli_overrides("[cli]\ncontext = 0\n").context, Some(0));
     }

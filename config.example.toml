@@ -62,6 +62,13 @@ model = "qwen3:27b"
 # only the hits it kept. -n/--max-hits overrides.
 # max_hits = 20
 
+# Per-line render cap, in bytes. A matched line over the cap is shown as a
+# window around the match, ellipsised on the truncated side(s) and labelled
+# with the line's real width; a context line is simply cut at the cap. 0
+# disables the cap. -M/--max-columns overrides. Terminal rendering only:
+# --format json and --format vimgrep are never capped.
+# max_columns = 150
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.

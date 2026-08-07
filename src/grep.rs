@@ -47,6 +47,21 @@ pub struct RawHit {
     /// cut it off before the match was reached (serialized as JSON null —
     /// never another line's text mislabeled as the match).
     pub text: Option<String>,
+    /// 0-based byte offset of the first match within the matched line **as it
+    /// exists in the file**, and one past its end (SPEC-cli §4).
+    ///
+    /// Deliberately *not* clamped to `text`.  `text` can be a prefix — the
+    /// context block's byte budget is measured from the block's start, so a
+    /// minified line arrives cut at 2 KB while its match sits at column 15,700
+    /// — and clamping would report that match at column 2,001, sending `vim -q`
+    /// to the wrong place in a file the editor is about to open in full.  The
+    /// column belongs to the file; only the *renderer*, which slices `text`,
+    /// clamps, and it does so against the line it actually holds.
+    ///
+    /// `None` exactly when `text` is `None`: there the block was cut before the
+    /// matched line was reached at all, so nothing about it was recovered.
+    pub col: Option<usize>,
+    pub col_end: Option<usize>,
     /// The ±context_lines block around it, as the search engine rendered it.
     pub context: String,
 }
@@ -239,11 +254,17 @@ fn string_list(args: &Value, key: &str) -> Vec<String> {
 // ── Payload builders (pure — unit-tested directly) ───────────────────
 
 /// Serialize raw hits verbatim — the shared body of both `mode: "full"` paths.
+///
+/// `col`/`col_end` are additive (SPEC-cli §4): every field that was here before
+/// is still here, byte for byte, so an MCP caller reading the frozen payload
+/// shape sees exactly what it saw before, plus two keys it can ignore.
 fn raw_hit_values(hits: &[RawHit]) -> Vec<Value> {
     hits.iter()
         .map(|h| {
             serde_json::json!({
-                "file": h.file, "line": h.line, "text": h.text, "context": h.context,
+                "file": h.file, "line": h.line, "text": h.text,
+                "col": h.col, "col_end": h.col_end,
+                "context": h.context,
             })
         })
         .collect()
@@ -364,6 +385,8 @@ fn materialize(hit: &RawHit, keep: &SelectedHit) -> Value {
         "file": hit.file,
         "line": hit.line,
         "text": hit.text,
+        "col": hit.col,
+        "col_end": hit.col_end,
         "context": hit.context,
         "why": keep.why,
         "score": keep.score,
@@ -381,11 +404,17 @@ pub fn parse_hits(results: &SearchResults, context_lines: usize) -> Vec<RawHit> 
     results
         .hits
         .iter()
-        .map(|h| RawHit {
-            file: h.file.clone(),
-            line: h.line,
-            text: matched_line(&h.text, h.line, context_lines).map(str::to_string),
-            context: h.text.clone(),
+        .map(|h| {
+            let text = matched_line(&h.text, h.line, context_lines).map(str::to_string);
+            // The column travels with the *line*, not with whatever prefix of
+            // it survived the context budget — see `RawHit::col`.  It is only
+            // dropped when the matched line was not recovered at all, because
+            // then there is no line for it to be an offset into.
+            let (col, col_end) = match text {
+                Some(_) => (Some(h.col), Some(h.col_end.max(h.col))),
+                None => (None, None),
+            };
+            RawHit { file: h.file.clone(), line: h.line, text, col, col_end, context: h.text.clone() }
         })
         .collect()
 }
