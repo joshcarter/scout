@@ -4,15 +4,19 @@
 # Verifies:
 #   - Each intercepted verb prefix produces a deny JSON whose
 #     permissionDecisionReason names check_output (unqualified — see below)
+#   - Command-position matching (SPEC-command-matching.md §3): chained
+#     commands are intercepted, build verbs that are merely mentioned inside
+#     heredoc bodies or quoted strings are not
 #   - The "# raw-output" escape hatch lets an otherwise-intercepted command
-#     through (no deny)
+#     through (no deny), and only when it is a real comment
 #   - Non-build commands produce no output and exit 0
 #   - JSONL intercept log is written with matched:true/false correctly
 #   - Malformed stdin → exit 0 silently (fail-open)
-#   - Reachability fail-open: missing scout binary, or an unreachable
-#     endpoint (ping fails), both let the raw command through instead of
-#     denying into a dead end — the ported fix for the ct issue where a
-#     hard deny with no live redirect target bricked the Bash tool.
+#   - Reachability fail-open: missing scout binary, an unusable classifier
+#     (version skew), or an unreachable endpoint (ping fails) all let the raw
+#     command through instead of denying into a dead end — the ported fix for
+#     the ct issue where a hard deny with no live redirect target bricked the
+#     Bash tool.
 #   - macOS/Linux portability (no GNU-only constructs)
 #
 # Usage:
@@ -44,6 +48,24 @@ if [ ! -x "$HOOK" ]; then
   exit 0
 fi
 
+# Stage 2 of the hook's matching is `scout classify-command`, so these tests
+# need a real scout binary — a hand-rolled stub would just be a second, wrong
+# implementation of the classifier. Prefer an already-built one; build if
+# needed. Must happen before $HOME is redirected below, since cargo needs it.
+REAL_SCOUT=""
+for cand in "$PROJECT_DIR/target/debug/scout" "$PROJECT_DIR/target/release/scout"; do
+  [ -x "$cand" ] && REAL_SCOUT="$cand" && break
+done
+if [ -z "$REAL_SCOUT" ] || ! printf 'true' | "$REAL_SCOUT" classify-command >/dev/null 2>&1; then
+  echo "building scout for classify-command tests..." >&2
+  (cd "$PROJECT_DIR" && cargo build --quiet >/dev/null 2>&1) || true
+  REAL_SCOUT="$PROJECT_DIR/target/debug/scout"
+fi
+if [ ! -x "$REAL_SCOUT" ] || ! printf 'true' | "$REAL_SCOUT" classify-command >/dev/null 2>&1; then
+  echo "SKIP: no scout binary with classify-command available" >&2
+  exit 0
+fi
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 TMPDIR_TEST=$(mktemp -d)
@@ -54,33 +76,49 @@ export HOME="$TMPDIR_TEST"
 mkdir -p "$TMPDIR_TEST/.claude"
 INTERCEPT_LOG="$TMPDIR_TEST/.claude/scout-intercepts.jsonl"
 
-# A working scout binary stub: `run --ping` succeeds (reachable). Used as the
-# default CLAUDE_PLUGIN_DATA for every test in this file except the
-# reachability fail-open tests, which point at a missing/broken one instead.
+# A working scout binary stub: `run --ping` succeeds (reachable) and
+# `classify-command` delegates to the real binary, so the hook's stage-2
+# matching is exercised for real. Used as the default CLAUDE_PLUGIN_DATA for
+# every test in this file except the fail-open tests, which point at a
+# missing/broken one instead.
 GOOD_DATA="$TMPDIR_TEST/scout-data-good"
 mkdir -p "$GOOD_DATA/bin"
-cat > "$GOOD_DATA/bin/scout" <<'EOF'
+cat > "$GOOD_DATA/bin/scout" <<EOF
 #!/usr/bin/env bash
-case "$1 $2" in
-  "run --ping") exit 0 ;;
-  *) exit 0 ;;
-esac
+[ "\$1 \$2" = "run --ping" ] && exit 0
+[ "\$1" = "classify-command" ] && exec "$REAL_SCOUT" classify-command
+exit 0
 EOF
 chmod +x "$GOOD_DATA/bin/scout"
 export CLAUDE_PLUGIN_DATA="$GOOD_DATA"
 
 # A stub binary that exists but whose endpoint is unreachable (`run --ping`
-# fails), for the reachability fail-open tests.
+# fails), for the reachability fail-open test. Classification still works —
+# otherwise the hook would bail one step earlier, on classify-failure.
 DEAD_DATA="$TMPDIR_TEST/scout-data-dead"
 mkdir -p "$DEAD_DATA/bin"
-cat > "$DEAD_DATA/bin/scout" <<'EOF'
+cat > "$DEAD_DATA/bin/scout" <<EOF
 #!/usr/bin/env bash
-case "$1 $2" in
-  "run --ping") exit 1 ;;
-  *) exit 1 ;;
-esac
+[ "\$1" = "classify-command" ] && exec "$REAL_SCOUT" classify-command
+exit 1
 EOF
 chmod +x "$DEAD_DATA/bin/scout"
+
+# A stub whose classify-command fails — stands in for an installed binary
+# predating the subcommand (version skew), for the classify-failure fail-open.
+SKEW_DATA="$TMPDIR_TEST/scout-data-skew"
+mkdir -p "$SKEW_DATA/bin"
+cat > "$SKEW_DATA/bin/scout" <<'EOF'
+#!/usr/bin/env bash
+[ "$1 $2" = "run --ping" ] && exit 0
+if [ "$1" = "classify-command" ]; then
+  cat >/dev/null
+  echo "error: unrecognized subcommand 'classify-command'" >&2
+  exit 2
+fi
+exit 0
+EOF
+chmod +x "$SKEW_DATA/bin/scout"
 
 # A CLAUDE_PLUGIN_DATA dir with no scout binary at all, for the missing-binary
 # fail-open test.
@@ -245,21 +283,72 @@ assert_eq "$output" "" "[empty stdin] no output"
 
 # ── Test: edge cases — empty, whitespace, leading whitespace ─────────────────
 
-# Empty command: BUILD_RE requires a verb after ^\s*, so empty never matches
+# Empty command: mentions no verb, so stage 1 rejects it outright
 output=$(make_payload "" | "$HOOK" 2>/dev/null)
 assert_eq "$output" "" "[empty command] no output (no false-positive deny)"
 assert_eq "$(last_log_matched)" "false" "[empty command] log matched=false"
 
-# Whitespace-only command: ^\s* matches but verb alternation doesn't follow
+# Whitespace-only command: likewise no verb
 output=$(make_payload "   " | "$HOOK" 2>/dev/null)
 assert_eq "$output" "" "[whitespace command] no output (no false-positive deny)"
 assert_eq "$(last_log_matched)" "false" "[whitespace command] log matched=false"
 
-# Leading whitespace before build verb — ^\s* must absorb it
+# Leading whitespace before build verb — still command position
 output=$(make_payload "  cargo test" | "$HOOK" 2>/dev/null)
 decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
 assert_eq "$decision" "deny" "[leading whitespace] cargo test still intercepted"
 assert_eq "$(last_log_matched)" "true" "[leading whitespace] log matched=true"
+
+# ── Tests: command-position matching (SPEC-command-matching.md §3) ───────────
+#
+# End-to-end through the hook, so the stage-1 pre-filter, the stage-2
+# `scout classify-command` call and the JSON parsing are all in the loop. The
+# per-lexer-rule matrix lives in `cargo test` (src/classify_command/tests.rs);
+# what these cases pin is that the hook actually honors the verdict.
+
+assert_deny() {
+  local out dec
+  out=$(run_hook "$1")
+  dec=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+  assert_eq "$dec" "deny" "$2"
+  assert_eq "$(last_log_matched)" "true" "$2 (log matched=true)"
+}
+
+assert_allow() {
+  local out
+  out=$(run_hook "$1")
+  assert_eq "$out" "" "$2"
+  assert_eq "$(last_log_matched)" "false" "$2 (log matched=false)"
+}
+
+# Row 1 — plain build command.
+assert_deny "cargo test" "[§3 row 1] plain cargo test denied"
+
+# Row 2 — line-leading verb in a multi-line script. A true positive that must
+# survive: real scripts do put build verbs at the start of a line.
+assert_deny "$(printf 'cd foo\ncargo test')" "[§3 row 2] line-leading verb denied"
+
+# Row 3 — the original symptom: a commit message passed by heredoc that merely
+# mentions a build verb. Previously denied; must now be allowed.
+assert_allow "$(printf 'git commit -F - <<EOF\nfix: stop hardcoding tool names\n\ncargo test; both shell suites carry a pre-existing failure.\nEOF')" \
+  "[§3 row 3] heredoc commit message allowed"
+
+# Row 4 — a verb inside a multi-line quoted string. (Read as quoted data: an
+# unquoted second line really is a command and must behave like row 2.)
+assert_allow "$(printf 'echo "hello\ncargo build is fast"')" \
+  "[§3 row 4] verb inside a multi-line string allowed"
+
+# Rows 5 & 6 — chained commands. Previously escaped the anchor entirely, so
+# raw build output flooded the context.
+assert_deny "cd foo && cargo test" "[§3 row 5] && chain denied"
+assert_deny "cd foo; cargo test" "[§3 row 6] ; chain denied"
+
+# Adjacent cases from §7 that used to pass by luck rather than by design.
+assert_allow 'git commit -m "fix cargo build"' "[quoted -m message] allowed"
+assert_allow 'bash -c "cargo test"' "[bash -c payload] allowed (documented miss)"
+assert_deny 'echo "$(cargo test 2>&1 | tail -1)"' "[command substitution] denied"
+assert_deny 'RUST_BACKTRACE=1 timeout 60 cargo test' "[env prefix + wrapper] denied"
+assert_deny '(cd foo && cargo test)' "[subshell] denied"
 
 # ── Test: intercepted command appears in permissionDecisionReason ────────────
 
@@ -284,6 +373,23 @@ assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "true" "[
 # A normal intercepted command logs escaped=false
 run_hook "cargo build" >/dev/null
 assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "false" "[no marker] log escaped=false"
+
+# SPEC §6: the marker only counts in a real comment. Inside a heredoc body or a
+# quoted string it is data, and must not silently switch the hook off.
+output=$(run_hook "$(printf 'cargo test <<EOF\n# raw-output\nEOF')")
+decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+assert_eq "$decision" "deny" "[marker in heredoc body] still denied"
+assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "false" "[marker in heredoc body] log escaped=false"
+
+output=$(run_hook 'cargo test --features "# raw-output"')
+decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+assert_eq "$decision" "deny" "[marker in quoted string] still denied"
+assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "false" "[marker in quoted string] log escaped=false"
+
+# A command that is not intercepted at all never reaches the escape check.
+output=$(run_hook 'echo "# raw-output"')
+assert_eq "$output" "" "[marker without a verb] no output"
+assert_eq "$(last_log_matched)" "false" "[marker without a verb] log matched=false"
 
 # The deny reason advertises the escape hatch so Claude can discover it
 output=$(run_hook "cargo test")
@@ -323,6 +429,15 @@ rc=$?
 assert_eq "$rc" "0" "[endpoint unreachable] exits 0"
 assert_eq "$output" "" "[endpoint unreachable] no deny output (fail-open)"
 assert_eq "$(last_log_reason)" "endpoint-unreachable" "[endpoint unreachable] log reason=endpoint-unreachable"
+
+# Classifier unusable: an installed binary predating `classify-command`
+# (version skew), or one that returns unparseable output. The hook cannot tell
+# whether to intercept, so it must fail open rather than guess.
+output=$(make_payload "cargo test" | CLAUDE_PLUGIN_DATA="$SKEW_DATA" "$HOOK" 2>/dev/null)
+rc=$?
+assert_eq "$rc" "0" "[classify failure] exits 0"
+assert_eq "$output" "" "[classify failure] no deny output (fail-open)"
+assert_eq "$(last_log_reason)" "classify-failure" "[classify failure] log reason=classify-failure"
 
 # Sanity: with the GOOD stub restored, the same command still denies normally
 # (proves the fail-open tests above aren't just a broken hook).

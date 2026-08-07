@@ -1,4 +1,5 @@
 mod check_output;
+mod classify_command;
 mod client;
 mod config;
 mod extract;
@@ -91,6 +92,14 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Classify a Bash command (read from stdin) as a build/test invocation.
+    ///
+    /// Hook-internal plumbing for hooks/prefer-local-llm.sh — deliberately not
+    /// an MCP tool. Reads the raw command from stdin (never argv: commands
+    /// carry quotes, newlines and heredocs), prints
+    /// `{"intercept":bool,"escape":bool}` and exits 0. Purely lexical: no
+    /// config, no network, no local model.
+    ClassifyCommand,
     /// Print the call log report (presets/tasks run so far).
     Stats,
 }
@@ -121,6 +130,7 @@ fn main() -> anyhow::Result<()> {
             project,
             json!({ "command": command, "cwd": cwd, "timeout_seconds": timeout_seconds }),
         ),
+        Command::ClassifyCommand => classify_command::run_subcommand(),
         Command::Stats => stats::print_report(),
     }
 }

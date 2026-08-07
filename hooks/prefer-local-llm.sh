@@ -18,7 +18,8 @@
 # marker appended; the hook recognizes the marker and lets the command through.
 # Output stays out of context by default, with a deliberate one-step opt-in.
 #
-# Intercepted (anchored ^\s* to avoid false positives):
+# Intercepted, but ONLY in command position — as the head of a simple command
+# the shell will actually run:
 #   cargo build|test|check|clippy
 #   go build|test|vet
 #   npx tsc
@@ -28,6 +29,31 @@
 #   pytest
 #
 # Not intercepted: cargo add, cargo fmt, go fmt, go mod, npm install, etc.
+#
+# Matching is two-stage (see SPEC-command-matching.md):
+#
+#   Stage 1 — an unanchored grep for any verb's leading word. Runs on every
+#     Bash call, so it stays to one grep; it over-matches deliberately and has
+#     no false negatives by construction, which is what makes it safe as a
+#     pre-filter. No hit → log and exit, zero further subprocesses.
+#   Stage 2 — `scout classify-command`, reached only on a stage-1 hit. It lexes
+#     the command (quotes, heredocs, comments, command substitution) and
+#     reports whether a verb sits in command position and whether the escape
+#     marker is in a real comment.
+#
+#   HISTORY: this used to be one anchored regex over the raw command string,
+#   with a comment claiming `^\s*` kept the verbs out of echo/printf strings.
+#   That claim was FALSE — grep is line-oriented, so `^` anchors to the start of
+#   any line inside the command, including a heredoc body. It blocked commit
+#   messages that merely mentioned `cargo test` while letting
+#   `cd foo && cargo test` run raw. Position in the string was never the
+#   property that mattered; command position is, and that needs a lexer.
+#
+#   Stage 2 lives in the Rust binary rather than in bash: the hook already
+#   refuses to deny without a working `scout` (see invariant 2), so it adds no
+#   new dependency, and the lexer's test matrix belongs under `cargo test`.
+#   Version skew — an older installed binary with no `classify-command` — is
+#   just another fail-open path (reason `classify-failure`).
 #
 # Hard invariants:
 #   1. Fail-open on the hook's own errors. Any error or parse failure → exit 0
@@ -62,30 +88,30 @@ INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 # have no plugin-data dir — fall back to scout on PATH.
 SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
-PING_TIMEOUT_SECS=6
+SUBPROCESS_TIMEOUT_SECS=6
 
-# Wrapper: use timeout/gtimeout if available, otherwise run bare (`scout run
-# --ping` has its own internal ~5s HTTP timeout; missing timeout cmd is not
-# fatal, just less defensive against a hung process).
+# Wrapper for the two scout subprocesses this hook spawns (`classify-command`
+# and `run --ping`): use timeout/gtimeout if available, otherwise run bare
+# (`run --ping` has its own internal ~5s HTTP timeout and classify-command is
+# pure local lexing; a missing timeout cmd is not fatal, just less defensive
+# against a hung process).
 _timeout() {
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$PING_TIMEOUT_SECS" "$@"
+    timeout "$SUBPROCESS_TIMEOUT_SECS" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$PING_TIMEOUT_SECS" "$@"
+    gtimeout "$SUBPROCESS_TIMEOUT_SECS" "$@"
   else
     "$@"
   fi
 }
 
-# Build/test intercept pattern. Anchored with ^\s* to avoid matching these verbs
-# inside echo/printf strings or variable assignments. Verb-level anchoring prevents
-# false positives like "cargo add serde" matching "cargo".
-BUILD_RE='^\s*(cargo\s+(build|test|check|clippy)\b|go\s+(build|test|vet)\b|npx\s+tsc\b|tsc\s+--|npm(\s+run)?\s+(build|test)\b|python\s+-m\s+pytest\b|pytest\b)'
-
-# Escape-hatch marker: an explicit opt-in to run an otherwise-intercepted command
-# and see its full raw output. POSIX class [[:space:]] for macOS/Linux portability
-# (BSD grep lacks \s). The "#" makes it a harmless shell comment when the cmd runs.
-ESCAPE_RE='#[[:space:]]*raw-output'
+# Stage-1 pre-filter: the leading word of every entry in the verb table, plus
+# the bare-verb entries. Unanchored and deliberately loose — a hit means only
+# "worth asking the classifier", never "intercept". The one hard requirement is
+# that it must not under-match relative to the table, so every leading word
+# above appears here. Word boundaries are spelled out with POSIX bracket
+# expressions rather than \b, which BSD grep -E does not support.
+PREFILTER_RE='(^|[^[:alnum:]_])(cargo|go|tsc|npx|npm|pytest|python)([^[:alnum:]_]|$)'
 
 COMMAND=""
 CWD=""
@@ -114,28 +140,53 @@ COMMAND=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/nul
 CWD=$(printf '%s' "$INPUT" | jq -r '.tool_input.cwd // empty' 2>/dev/null) || true
 [ -z "$CWD" ] && CWD="$(pwd)"
 
-# ── Apply intercept pattern ───────────────────────────────────────────────────
-if ! printf '%s' "$COMMAND" | grep -qE "$BUILD_RE" 2>/dev/null; then
+# ── Stage 1: cheap pre-filter ─────────────────────────────────────────────────
+# The overwhelming majority of Bash commands mention no build verb at all and
+# leave here having spawned exactly one grep.
+if ! printf '%s' "$COMMAND" | grep -qE "$PREFILTER_RE" 2>/dev/null; then
   _log false
   exit 0
 fi
 
-# Escape hatch: an explicit "# raw-output" marker means Claude has decided it needs
-# the full log. Let the command run unmodified (exit 0 → normal permission flow).
-if printf '%s' "$COMMAND" | grep -qE "$ESCAPE_RE" 2>/dev/null; then
+# ── Stage 2: command-position classification ──────────────────────────────────
+# Needs the scout binary, which the deny path requires anyway (see invariant 2),
+# so check for it first and reuse the existing missing-binary fail-open.
+if [ ! -x "$SCOUT_BIN" ]; then
+  _log true false "missing-binary"
+  exit 0
+fi
+
+# The command goes in on stdin: it can contain quotes, newlines and heredoc
+# bodies, and stdin sidesteps every quoting hazard argv would introduce.
+CLASSIFY=$(printf '%s' "$COMMAND" | _timeout "$SCOUT_BIN" classify-command 2>/dev/null) || CLASSIFY=""
+INTERCEPT=$(printf '%s' "$CLASSIFY" | jq -r 'if (.intercept | type) == "boolean" then .intercept else empty end' 2>/dev/null) || INTERCEPT=""
+ESCAPED=$(printf '%s' "$CLASSIFY" | jq -r 'if (.escape | type) == "boolean" then .escape else empty end' 2>/dev/null) || ESCAPED=""
+
+# Non-zero exit, empty output, or anything that isn't the expected JSON — which
+# includes an older installed binary that has no classify-command subcommand.
+# We cannot tell whether this command should be intercepted, so fail open.
+if [ -z "$INTERCEPT" ] || [ -z "$ESCAPED" ]; then
+  _log true false "classify-failure"
+  exit 0
+fi
+
+if [ "$INTERCEPT" != "true" ]; then
+  _log false
+  exit 0
+fi
+
+# Escape hatch: an explicit "# raw-output" marker — in a real comment, not in a
+# quoted string or heredoc body — means Claude has decided it needs the full
+# log. Let the command run unmodified (exit 0 → normal permission flow).
+if [ "$ESCAPED" = "true" ]; then
   _log true true
   exit 0
 fi
 
 # ── Reachability check — fail open before denying ─────────────────────────────
 # A deny with no working redirect target is worse than no hook at all: it
-# blocks every build/test command with no sanctioned way to run them. Verify
-# the redirect target is actually usable first.
-if [ ! -x "$SCOUT_BIN" ]; then
-  _log true false "missing-binary"
-  exit 0
-fi
-
+# blocks every build/test command with no sanctioned way to run them. The
+# binary is already known to exist; confirm its endpoint answers too.
 if ! _timeout "$SCOUT_BIN" run --ping >/dev/null 2>&1; then
   _log true false "endpoint-unreachable"
   exit 0
