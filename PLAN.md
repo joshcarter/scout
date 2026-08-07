@@ -110,7 +110,10 @@ scout/
 ```
 
 MCP tools exposed: `check_output`, `extract`, `grep` (short names —
-the server name provides the namespace: `mcp__scout__check_output`).
+Claude Code adds the namespace itself: `mcp__<server>__check_output` from a
+`.mcp.json` entry, `mcp__plugin_<plugin>_<server>__check_output` under a
+plugin install. The prefix is install-dependent, so nothing in this repo
+hardcodes a fully-qualified tool name).
 
 ### CLI is a first-class surface, not just hook plumbing
 
@@ -218,8 +221,9 @@ layer if the standing context proves too weak in practice.
 3. **Move + rewire extract/grep/select/filter_config** onto the fs/ignore
    backend; move slimmed `verify.rs` + `check_output`. MCP parity.
 4. **Port the hooks** (`shell-safety.sh`, `prefer-local-llm.sh`) into the
-   plugin; update the redirect string to `mcp__scout__check_output`;
-   write the guidance/skill content.
+   plugin; point the redirect string at the unqualified `check_output` plus
+   a ToolSearch pointer (NOT a fully-qualified name — the prefix depends on
+   install method); write the guidance/skill content.
 5. **Cutover day**: install the plugin; update claude-review
    (`lib-launch.sh` binary name, CLAUDE.md delegation table,
    `install-global-config.sh`); remove the old `.mcp.json` ct-local
@@ -231,8 +235,7 @@ step 5 is the only switch-flip.
 
 ## 8. Decision log (all issues resolved)
 
-- **Name: `scout`** — binary, plugin id, MCP prefix (`mcp__scout__*`),
-  config dir. Chosen over `sidecar` (name exhausted by multiple AI-agent
+- **Name: `scout`** — binary, plugin id, MCP server name, config dir. Chosen over `sidecar` (name exhausted by multiple AI-agent
   companion tools, including an existing MCP server) and `recon`
   (owned by pentest/OSINT tooling; wrong connotation in a tool list).
   Docker Scout is namespaced under `docker`, so no PATH conflict; the

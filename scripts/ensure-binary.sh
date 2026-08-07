@@ -70,15 +70,15 @@ fi
 # three-layer fix for "MCP server alone sits unused."
 GUIDANCE="Prefer scout over raw Bash/Read/Grep for token-heavy work: it runs the job against a local model and only a short summary enters this conversation.
 
-  mcp__scout__check_output(command)    run a build/test command, get {ok, summary, first_error, suggested_next_step}. CLI: scout check \"<cmd>\"
-  mcp__scout__extract(file, question)  answer a specific question about a large file instead of reading it whole. CLI: scout extract <file> \"<question>\"
-  mcp__scout__grep(pattern, intent)    intent-filtered grep when a raw pattern match would return too many irrelevant hits. CLI: scout grep <pattern> \"<intent>\"
+  check_output(command)    run a build/test command, get {ok, summary, first_error, suggested_next_step}. CLI: scout check \"<cmd>\"
+  extract(file, question)  answer a specific question about a large file instead of reading it whole. CLI: scout extract <file> \"<question>\"
+  grep(pattern, intent)    intent-filtered grep when a raw pattern match would return too many irrelevant hits. CLI: scout grep <pattern> \"<intent>\"
   scout task \"<prompt>\"                ad-hoc escape hatch straight to the local LLM
   scout run --preset <name> --arg k=v  raw preset invocation (used by hooks/scripts, e.g. quality_review, test_review)
 
-If a scout tool is not in your loaded toolset, it is a deferred MCP tool: run ToolSearch for its name (e.g. \"check_output\") to load its schema.
+Those three are MCP tools; the names above are unqualified. Their full names carry a prefix that depends on how scout was installed — mcp__plugin_<plugin>_<server>__check_output under a plugin install, mcp__<server>__check_output from a .mcp.json entry. If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
 
-A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|clippy, go build|test|vet, npm/npx tsc, python -m pytest, pytest) and redirects to mcp__scout__check_output so raw output never floods context. If you already know you need the full raw log (e.g. the classifier could not parse prior output), re-run the SAME command with a \"# raw-output\" marker appended once to bypass the redirect.
+A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|clippy, go build|test|vet, npm/npx tsc, python -m pytest, pytest) and redirects to check_output so raw output never floods context. If you already know you need the full raw log (e.g. the classifier could not parse prior output), re-run the SAME command with a \"# raw-output\" marker appended once to bypass the redirect.
 
 A second PreToolUse hook silently auto-allows confidently-safe Bash commands via local classification — it only ever adds an allow, never blocks; on any error it is a no-op and the normal permission prompt applies."
 

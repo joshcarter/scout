@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # prefer-local-llm.sh — PreToolUse hook: redirect build/test commands to
-# mcp__scout__check_output.
+# scout's check_output MCP tool.
 #
 # Emits a deny when the Bash command matches a known build/test verb, carrying a
-# permissionDecisionReason that names mcp__scout__check_output and its exact
-# call pattern. Deny (not advisory allow) because raw build output flooding the
+# permissionDecisionReason that names the check_output tool and its call
+# pattern. The reason deliberately does NOT hardcode a fully-qualified tool
+# name: the prefix depends on the install method (mcp__plugin_<plugin>_<server>__
+# under a plugin, mcp__<server>__ from a .mcp.json entry), so a literal name is
+# wrong half the time. It names the unqualified tool and points at ToolSearch to
+# resolve it. Deny (not advisory allow) because raw build output flooding the
 # conversation context is the failure mode to prevent, not merely a suboptimal
 # choice. NOTE: the redirect text MUST ride in permissionDecisionReason — Claude
 # Code silently drops a field named "reason", leaving only a bare "denied".
@@ -144,6 +148,6 @@ jq -n --arg cmd "$COMMAND" '{
   hookSpecificOutput: {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",
-    permissionDecisionReason: ("Build/test output floods conversation context. Use mcp__scout__check_output instead:\n\n  mcp__scout__check_output(command=\"" + $cmd + "\")\n\nIf that tool is not in your loaded toolset, it is a deferred MCP tool — run ToolSearch for \"check_output\" to load its schema, then call it.\n\nReturns: {ok: bool, summary: string, first_error: {...}|null, suggested_next_step: string}\n\nNeed the full raw log — e.g. ok=false AND first_error=null (the classifier could not parse the output), or detail it dropped? Re-run the SAME command with a \"# raw-output\" marker appended to bypass this redirect:\n\n  " + $cmd + " # raw-output")
+    permissionDecisionReason: ("Build/test output floods conversation context. Use the scout check_output MCP tool instead, with:\n\n  command=\"" + $cmd + "\"\n\nIts fully-qualified name depends on how scout was installed — mcp__plugin_<plugin>_<server>__check_output under a plugin install, mcp__<server>__check_output from a .mcp.json entry. If it is not already in your loaded toolset, run ToolSearch for \"check_output\" to resolve the name and load its schema, then call it.\n\nReturns: {ok: bool, summary: string, first_error: {...}|null, suggested_next_step: string}\n\nNeed the full raw log — e.g. ok=false AND first_error=null (the classifier could not parse the output), or detail it dropped? Re-run the SAME command with a \"# raw-output\" marker appended to bypass this redirect:\n\n  " + $cmd + " # raw-output")
   }
 }'

@@ -3,7 +3,7 @@
 #
 # Verifies:
 #   - Each intercepted verb prefix produces a deny JSON whose
-#     permissionDecisionReason names mcp__scout__check_output
+#     permissionDecisionReason names check_output (unqualified — see below)
 #   - The "# raw-output" escape hatch lets an otherwise-intercepted command
 #     through (no deny)
 #   - Non-build commands produce no output and exit 0
@@ -111,7 +111,12 @@ last_log_reason() {
   jq -r '.reason' "$INTERCEPT_LOG" 2>/dev/null | tail -1
 }
 
-# ── Tests: intercepted verbs → deny whose permissionDecisionReason names mcp__scout__check_output ─
+# ── Tests: intercepted verbs → deny whose permissionDecisionReason names check_output ─
+#
+# Asserts the UNQUALIFIED tool name: the fully-qualified name carries an
+# install-dependent prefix (mcp__plugin_<plugin>_<server>__ under a plugin,
+# mcp__<server>__ from .mcp.json), so pinning a literal here would pin the
+# hook to one install method.
 
 for cmd in \
   "cargo build" \
@@ -152,10 +157,18 @@ for cmd in \
   fi
 
   reason=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty')
-  if echo "$reason" | grep -q "mcp__scout__check_output"; then
-    pass "[$cmd] permissionDecisionReason names mcp__scout__check_output"
+  if echo "$reason" | grep -q "check_output"; then
+    pass "[$cmd] permissionDecisionReason names check_output"
   else
-    fail "[$cmd] permissionDecisionReason missing mcp__scout__check_output" "reason: $reason"
+    fail "[$cmd] permissionDecisionReason missing check_output" "reason: $reason"
+  fi
+
+  # And it must point at ToolSearch, which is how the model resolves the
+  # install-dependent prefix into a callable name.
+  if echo "$reason" | grep -q "ToolSearch"; then
+    pass "[$cmd] permissionDecisionReason points at ToolSearch for name resolution"
+  else
+    fail "[$cmd] permissionDecisionReason missing ToolSearch pointer" "reason: $reason"
   fi
 
   if echo "$reason" | grep -q "first_error"; then

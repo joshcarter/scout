@@ -1,9 +1,11 @@
 // MCP stdio server (rmcp 3.1).
 //
 // Four tools: `ping` (wiring check), plus the three that do the work —
-// `check_output`, `extract`, `grep`.  Short names on purpose: the server name
-// supplies the namespace, so Claude Code sees `mcp__scout__check_output`
-// (PLAN §3).
+// `check_output`, `extract`, `grep`.  Short names on purpose: Claude Code
+// prefixes them with the server namespace on its own, so what the model sees is
+// `mcp__<server>__check_output` from a .mcp.json entry, or
+// `mcp__plugin_<plugin>_<server>__check_output` under a plugin install.  Nothing
+// on this side should hardcode either form (PLAN §3).
 //
 // `ServerHandler` is implemented by hand rather than via `#[tool_router]` /
 // `#[tool_handler]`: the three real tools advertise the `description` and
