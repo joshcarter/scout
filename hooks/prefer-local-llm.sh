@@ -53,8 +53,11 @@ set -euo pipefail
 INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 
 # The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and .mcp.json use.
+# Same resolution order that script and .mcp.json use. Standalone installs
+# (make install, hooks registered in settings.json rather than plugin mode)
+# have no plugin-data dir — fall back to scout on PATH.
 SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout"
+[ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 PING_TIMEOUT_SECS=6
 
 # Wrapper: use timeout/gtimeout if available, otherwise run bare (`scout run

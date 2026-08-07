@@ -35,8 +35,11 @@ AUDIT_LOG="${HOME}/.claude/scout-shell-safety.jsonl"
 LLM_TIMEOUT_SECS=5
 
 # The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and .mcp.json use.
+# Same resolution order that script and .mcp.json use. Standalone installs
+# (make install, hooks registered in settings.json rather than plugin mode)
+# have no plugin-data dir — fall back to scout on PATH.
 SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout"
+[ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 
 # Wrapper: use timeout/gtimeout if available, otherwise run bare (the LLM
 # call's own config timeout still applies; missing timeout cmd is not fatal).
@@ -326,7 +329,10 @@ if [ -n "$VAR_NAMES" ]; then
     # Never leak credential-looking values into the classifier's input (and thus
     # its process/logs). Redact by name; the LLM then treats the value as
     # unknowable and leans "ask", which is the safe outcome.
-    case "${vname^^}" in
+    # tr, not ${vname^^}: stock macOS bash is 3.2, where ^^ is a fatal
+    # "bad substitution" under set -e — the hook would die right here.
+    vname_uc=$(printf '%s' "$vname" | tr '[:lower:]' '[:upper:]') || vname_uc="$vname"
+    case "$vname_uc" in
       *KEY* | *TOKEN* | *SECRET* | *PASSWORD* | *PASSWD* | *CREDENTIAL* | *AUTH*)
         vval="<redacted>" ;;
     esac

@@ -45,6 +45,24 @@ if [ -z "$HAVE" ] || [ "$HAVE" != "$WANT" ]; then
   fi
 fi
 
+# Seed the default config on first run. Lives in the XDG config dir — NOT
+# CLAUDE_PLUGIN_DATA — because the same file serves the CLI (`scout grep ...`
+# in a terminal) and the hooks; the plugin-data dir holds only the binary.
+# Never overwrites, and stays out of the way when SCOUT_CONFIG points
+# elsewhere. Resolution matches src/config.rs and hooks/shell-safety.sh.
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/scout/config.toml"
+CONFIG_NOTE="config: $CFG"
+if [ -n "${SCOUT_CONFIG:-}" ]; then
+  CONFIG_NOTE="config: \$SCOUT_CONFIG override ($SCOUT_CONFIG)"
+elif [ ! -f "$CFG" ]; then
+  if mkdir -p "$(dirname "$CFG")" 2>/dev/null &&
+     cp "$PLUGIN_ROOT/config.example.toml" "$CFG" 2>/dev/null; then
+    CONFIG_NOTE="config: seeded default at $CFG — edit [llm].endpoint and [llm].model to match your local LLM host"
+  else
+    CONFIG_NOTE="config: missing ($CFG) and could not seed default"
+  fi
+fi
+
 # Guidance injection (PLAN.md §6): plugins have no CLAUDE.md equivalent, so
 # the delegation-table content that used to live there is injected here as
 # SessionStart additionalContext instead. Layered with MCP tool descriptions
@@ -65,8 +83,8 @@ A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|c
 A second PreToolUse hook silently auto-allows confidently-safe Bash commands via local classification — it only ever adds an allow, never blocks; on any error it is a no-op and the normal permission prompt applies."
 
 if command -v jq >/dev/null 2>&1; then
-  jq -n --arg status "$STATUS" --arg guidance "$GUIDANCE" \
-    '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:("scout (local-LLM helper) plugin is active. Binary status: " + $status + "\n\n" + $guidance)}}'
+  jq -n --arg status "$STATUS" --arg config "$CONFIG_NOTE" --arg guidance "$GUIDANCE" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:("scout (local-LLM helper) plugin is active. Binary status: " + $status + ". " + $config + "\n\n" + $guidance)}}'
 else
   # jq missing: degrade to a single-line, special-character-free status
   # report rather than risk emitting malformed JSON from hand-escaping a

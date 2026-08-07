@@ -1,0 +1,11 @@
+{
+  "name": "scout",
+  "owner": { "name": "Josh Carter", "url": "https://github.com/joshcarter" },
+  "plugins": [
+    {
+      "name": "scout",
+      "source": "./",
+      "description": "Local-LLM scout: classifies build/test output, screens shell commands, and answers targeted code questions with a local model so the cloud model doesn't have to."
+    }
+  ]
+}
