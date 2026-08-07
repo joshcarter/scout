@@ -1,4 +1,5 @@
 {
+  "description": "scout: PreToolUse hooks that screen and redirect Bash commands to the local LLM, plus SessionStart bootstrap + guidance injection.",
   "hooks": {
     "SessionStart": [
       {
@@ -6,6 +7,26 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/shell-safety.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/prefer-local-llm.sh"
           }
         ]
       }

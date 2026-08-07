@@ -1,0 +1,67 @@
+# test_review preset
+#
+# Routes the Test Skeptic reviewer through the local LLM.
+# Falls back to Claude in claude-review's lib-launch.sh if the endpoint is
+# unreachable (PLAN.md §1: consumed only via `scout run --preset test_review`).
+#
+# Required args:
+#   git_diff_range — git revision range passed directly to `git diff`
+#                    (e.g. "HEAD~3..HEAD" or "abc123..def456")
+#   prompt_file    — absolute path to the reviewer .md prompt file
+#                    (e.g. /home/user/.claude/claude-review/hooks/reviewers/tests.md)
+#                    Passed as absolute path by lib-launch.sh so the preset
+#                    works regardless of process CWD.
+#
+# Output contract:
+#   Markdown starting with "## Test Coverage & Quality Review" followed by
+#   a ```findings``` fenced block of newline-delimited JSON objects, matching
+#   the format that consolidation expects from Claude reviewers.
+#   Finding IDs (TST-NNN) are assigned by the consolidation step — not here.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You are a test reviewer executing a structured review against the provided checklist.
+Follow the review instructions precisely — including the output format requirements
+at the end of the instructions.
+
+Do NOT invent new output formats. The consolidation pipeline expects exactly the
+format described in the instructions you receive.
+"""
+
+user = """
+{review_instructions}
+
+## DIFF CONTENT
+
+{diff}
+"""
+
+[preset]
+name        = "test_review"
+description = """\
+Route the Test Skeptic reviewer through the local LLM. \
+Requires: git_diff_range (e.g. HEAD~3..HEAD) and prompt_file \
+(absolute path to hooks/reviewers/tests.md). \
+Output matches the Claude reviewer JSON findings format."""
+
+[preset.input_schema]
+type     = "object"
+required = ["git_diff_range", "prompt_file"]
+
+[preset.input_schema.properties.git_diff_range]
+type        = "string"
+description = "Git revision range passed to git diff (e.g. 'HEAD~3..HEAD')"
+
+[preset.input_schema.properties.prompt_file]
+type        = "string"
+description = "Absolute path to the reviewer .md prompt file"
+
+[context.review_instructions]
+provider = "file_read"
+_args    = ["${args.prompt_file}"]
+
+[context.diff]
+provider = "git_diff_range"
+_args    = ["${args.git_diff_range}"]

@@ -1,0 +1,79 @@
+# grep preset — selector-mode grep reranking
+#
+# scout runs the real grep engine, injects the numbered hit list, and the
+# model replies with HIT IDS ONLY. scout validates the ids against the real
+# hit list and materializes the surviving hits from the original grep output,
+# so the model can drop a hit but never invent one.
+#
+# Args (caller): pattern, intent, regex, max_hits.
+# Args (scout-injected): hit_list, hits_considered.
+# No context providers — the caller supplies everything.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You are a search-result reranker operating in SELECTOR MODE.  You are shown a \
+numbered list of grep hits and the caller's actual intent.  You respond with \
+ONLY a JSON object — no prose, no markdown fences, no explanation.
+
+Schema:
+{
+  "keep": [{"id": <int>, "why": "<label, <= 60 chars>", "score": 0-3}],
+  "none_relevant": true | false
+}
+
+Rules:
+- Judge each hit against the INTENT, not the pattern — the pattern already \
+  matched every hit shown.  A hit that matches the pattern but not the intent \
+  must be dropped.
+- "id" is the bracketed number of a hit in the list.  Only ids that appear in \
+  the list are valid; invented ids are discarded.
+- "score" is your confidence that the hit serves the intent: 3 = exactly what \
+  was asked for, 2 = strong candidate, 1 = worth a look, 0 = marginal.
+- "why" is a LABEL, not a quote: "return value discarded", "test fixture only". \
+  Never reproduce the matched code in "why".
+- Keep no more than the caller's limit.  Prefer precision: a short high-score \
+  list beats a padded one.
+- Set "none_relevant": true with "keep": [] when no hit serves the intent. \
+  Never pad the list to look useful.
+- Output the JSON object only — the very first character must be '{'.
+"""
+
+user = """
+Intent: ${args.intent}
+Pattern already matched: ${args.pattern}
+Keep at most ${args.max_hits:-10} hits out of ${args.hits_considered} shown.
+
+Hits:
+${args.hit_list}
+"""
+
+[preset]
+name        = "grep"
+description = """Grep the codebase and have the local LLM keep only the hits that serve your stated intent. \
+scout runs the real grep engine internally (the full hit list never enters this conversation), the local model \
+returns hit ids, and scout materializes those hits from the original results. Prefer this over a raw grep when the \
+pattern is expected to be noisy; 8 or fewer hits are returned whole with no LLM call. \
+Returns JSON: {mode, pattern, intent, hits_total, hits_considered, returned, hits, dropped, hint}. \
+Lossy by design — the hint names the raw fallback (a raw grep)."""
+
+[preset.input_schema]
+type     = "object"
+required = ["pattern", "intent"]
+
+[preset.input_schema.properties.pattern]
+type        = "string"
+description = "Search pattern (plain text or regex, see `regex`)."
+
+[preset.input_schema.properties.intent]
+type        = "string"
+description = "What you are actually looking for, e.g. 'call sites that ignore the error return'."
+
+[preset.input_schema.properties.regex]
+type        = "boolean"
+description = "Treat the pattern as a regex. Defaults to false."
+
+[preset.input_schema.properties.max_hits]
+type        = "integer"
+description = "Hits to return after filtering. Defaults to 10."

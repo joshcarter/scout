@@ -1,0 +1,78 @@
+# extract preset — selector-mode targeted file reading
+#
+# The caller injects the numbered file content; the model answers with LINE
+# RANGES ONLY. scout validates the ranges against the real file length and
+# materializes the text itself, so the model can misjudge relevance but can
+# never misquote code into Claude's context.
+#
+# Args (caller): file, question, max_lines.
+# Args (scout-injected): numbered_content, file_lines, chunk_of, chunk_total.
+# No context providers — the caller supplies everything.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You are a code-reading assistant operating in SELECTOR MODE.  You are shown a \
+file with line numbers and a question about it.  You respond with ONLY a JSON \
+object — no prose, no markdown fences, no explanation.
+
+Schema:
+{
+  "ranges": [{"start": <int>, "end": <int>, "why": "<label, <= 80 chars>", "score": 0-3}],
+  "answer": "<= 2 sentences answering the question, or null>",
+  "not_found": true | false
+}
+
+Rules:
+- "start" and "end" are 1-based inclusive line numbers copied from the \
+  numbered content.  They must be real lines of the file shown.
+- Ranges are minimal but self-contained: return the whole function, block, or \
+  statement that answers the question — never a lone closing brace, never a \
+  single line torn out of the middle of an expression.
+- At most 8 ranges.  Prefer fewer, higher-score ranges over many weak ones.
+- "score" is your confidence that the range answers the question: 3 = directly \
+  answers it, 2 = strongly related, 1 = supporting context, 0 = marginal.
+- "why" is a LABEL, not a quote: "backoff computation", "retry cap constant". \
+  Never reproduce code in "why".
+- "answer" may state a fact read from the file but must not reproduce code. \
+  Use null when you cannot answer in two sentences.
+- Set "not_found": true with "ranges": [] when the file does not answer the \
+  question.  Never pad the list with vaguely-related code.
+- Output the JSON object only — the very first character must be '{'.
+"""
+
+user = """
+Question: ${args.question}
+
+File: ${args.file} (${args.file_lines} lines total)
+Chunk ${args.chunk_of:-1} of ${args.chunk_total:-1}
+
+Numbered content:
+${args.numbered_content}
+"""
+
+[preset]
+name        = "extract"
+description = """Answer a question about a file using the local LLM, returning only the relevant line ranges. \
+scout reads the file internally (its content never enters this conversation), the local model picks line ranges, \
+and scout materializes the real text from the file. Prefer this over reading the whole file for a targeted \
+question about a file longer than ~200 lines; files at or below that size are returned whole with no LLM call. \
+Returns JSON: {mode, file, file_lines, answer, not_found, snippets: [{lines, why, text}], coverage, hint}. \
+Lossy by design — the hint names the raw fallback (reading the file directly)."""
+
+[preset.input_schema]
+type     = "object"
+required = ["file", "question"]
+
+[preset.input_schema.properties.file]
+type        = "string"
+description = "Project-relative path to a file. scout reads it internally."
+
+[preset.input_schema.properties.question]
+type        = "string"
+description = "What you want from the file, e.g. 'where is the retry loop and what is its backoff policy?'"
+
+[preset.input_schema.properties.max_lines]
+type        = "integer"
+description = "Budget for returned materialized lines. Defaults to 120."

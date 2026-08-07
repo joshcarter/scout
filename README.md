@@ -7,9 +7,10 @@ shell commands before they run, and answering targeted questions about
 files and search results without dumping them into the big model's
 context.
 
-**Status: scaffold.** Extraction from [ct] is in progress — see
-`PLAN.md`. The MCP server currently exposes a `ping` tool to verify
-wiring; `check_output`, `extract`, and `grep` land next.
+**Status: in progress.** Extraction from [ct] is underway — see
+`PLAN.md`. The MCP server exposes `check_output`, `extract` and `grep`
+(plus `ping` for wiring checks); the hooks that steer Claude Code
+toward them land next.
 
 ## Shape
 
@@ -19,9 +20,17 @@ wiring; `check_output`, `extract`, and `grep` land next.
   server (`scout mcp`), SessionStart bootstrap + guidance injection,
   and (coming) PreToolUse hooks that steer the agent toward the local
   tools.
-- **CLI**: first-class human surface (coming): `scout grep <pattern>
-  "<intent>"`, `scout extract <file> "<question>"`, `scout check
-  "<build cmd>"`, `scout task "<prompt>"`.
+- **CLI**: first-class human surface, same code path as the MCP tools:
+  `scout grep <pattern> "<intent>"`, `scout extract <file>
+  "<question>"`, `scout check "<build cmd>"`, `scout task "<prompt>"`,
+  plus `scout run --preset ...` for hooks and `scout stats`.
+
+Search is self-contained: gitignore-aware walking and matching come
+from ripgrep's libraries, so there is no dependency on an installed
+`rg`/`grep`. Small inputs (a file under ~200 lines, a hit list of 8 or
+fewer) skip the local model entirely and are returned whole, so those
+paths work before any `~/.config/scout/config.toml` exists. Filter
+tunables live in that same file under `[extract]` and `[grep]`.
 
 ## Development
 

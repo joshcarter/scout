@@ -1,0 +1,70 @@
+# check_output preset
+#
+# Classifies build/test runner output as pass or fail, extracts the first
+# actionable error, and suggests a next step.
+#
+# Args (caller): command, cwd, timeout_seconds.
+# Args (scout-injected): output (captured stdout+stderr, capped at 16 KB) and
+#   language (detected project toolchain, or null) — available to preset
+#   overrides as ${args.output} / ${args.language}.
+# No context providers — args supply the full context.
+# Returns: strict JSON only — no prose outside the object.
+#
+# Note: `system` and `user` are top-level TOML keys; they must appear
+# before any [section] headers.
+
+system = """
+You are a build-output classifier. Given a command and its output, respond \
+with ONLY a JSON object — no prose, no markdown fences, no explanation.
+
+Schema:
+{
+  "ok": true | false,
+  "summary": "<one sentence describing the overall result>",
+  "first_error": {
+    "file": "<path or null>",
+    "line": <integer or null>,
+    "message": "<error text>"
+  } | null,
+  "suggested_next_step": "<one concrete action to take next>"
+}
+
+Rules:
+- "ok" is true only if the command fully succeeded (exit 0, no errors).
+- "summary" is one sentence, past tense ("Build succeeded", "3 tests failed").
+- "first_error" is the first actionable error or null when ok is true.
+  Prefer the error with a file+line over bare linker or linking errors.
+  Set file/line to null if not present in the output.
+- "suggested_next_step" is one concrete action: a command to run, a field \
+  to fix, or a concept to investigate. Never say "review the output".
+- Output the JSON object only — the very first character must be '{'.
+"""
+
+user = """
+Command: ${args.command}
+
+Output:
+${args.output}
+"""
+
+[preset]
+name        = "check_output"
+description = """Run a build/test command and classify its output using the local LLM. \
+Pass only the command string — scout runs it internally and the raw output never enters Claude's context. \
+Returns strict JSON: {ok, summary, first_error: {file, line, message} | null, suggested_next_step}."""
+
+[preset.input_schema]
+type     = "object"
+required = ["command"]
+
+[preset.input_schema.properties.command]
+type        = "string"
+description = "The command to run (e.g. 'cargo test --quiet'). scout executes it and captures output internally."
+
+[preset.input_schema.properties.cwd]
+type        = "string"
+description = "Optional working directory for the command. Defaults to the project root."
+
+[preset.input_schema.properties.timeout_seconds]
+type        = "integer"
+description = "Optional timeout in seconds. Defaults to 60."

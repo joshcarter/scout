@@ -45,6 +45,34 @@ if [ -z "$HAVE" ] || [ "$HAVE" != "$WANT" ]; then
   fi
 fi
 
-CONTEXT="scout (local-LLM helper) plugin is active. Binary status: $STATUS. The MCP server 'scout' currently exposes a ping tool for wiring verification; check_output, extract, and grep arrive as the extraction from ct proceeds."
+# Guidance injection (PLAN.md §6): plugins have no CLAUDE.md equivalent, so
+# the delegation-table content that used to live there is injected here as
+# SessionStart additionalContext instead. Layered with MCP tool descriptions
+# (passive discovery) and the PreToolUse hooks (active steering), this is the
+# three-layer fix for "MCP server alone sits unused."
+GUIDANCE="Prefer scout over raw Bash/Read/Grep for token-heavy work: it runs the job against a local model and only a short summary enters this conversation.
 
-printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$CONTEXT"
+  mcp__scout__check_output(command)    run a build/test command, get {ok, summary, first_error, suggested_next_step}. CLI: scout check \"<cmd>\"
+  mcp__scout__extract(file, question)  answer a specific question about a large file instead of reading it whole. CLI: scout extract <file> \"<question>\"
+  mcp__scout__grep(pattern, intent)    intent-filtered grep when a raw pattern match would return too many irrelevant hits. CLI: scout grep <pattern> \"<intent>\"
+  scout task \"<prompt>\"                ad-hoc escape hatch straight to the local LLM
+  scout run --preset <name> --arg k=v  raw preset invocation (used by hooks/scripts, e.g. quality_review, test_review)
+
+If a scout tool is not in your loaded toolset, it is a deferred MCP tool: run ToolSearch for its name (e.g. \"check_output\") to load its schema.
+
+A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|clippy, go build|test|vet, npm/npx tsc, python -m pytest, pytest) and redirects to mcp__scout__check_output so raw output never floods context. If you already know you need the full raw log (e.g. the classifier could not parse prior output), re-run the SAME command with a \"# raw-output\" marker appended once to bypass the redirect.
+
+A second PreToolUse hook silently auto-allows confidently-safe Bash commands via local classification — it only ever adds an allow, never blocks; on any error it is a no-op and the normal permission prompt applies."
+
+if command -v jq >/dev/null 2>&1; then
+  jq -n --arg status "$STATUS" --arg guidance "$GUIDANCE" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:("scout (local-LLM helper) plugin is active. Binary status: " + $status + "\n\n" + $guidance)}}'
+else
+  # jq missing: degrade to a single-line, special-character-free status
+  # report rather than risk emitting malformed JSON from hand-escaping a
+  # multi-line, quote-and-backtick-laden guidance block. Fail-open in
+  # spirit: SessionStart never blocks, so worst case here is thinner
+  # guidance, never a broken session.
+  SAFE_STATUS=$(printf '%s' "$STATUS" | tr -d '"\\' | tr '\n' ' ')
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"scout (local-LLM helper) plugin is active. Binary status: %s. (jq not found: install jq for full usage guidance.)"}}\n' "$SAFE_STATUS"
+fi

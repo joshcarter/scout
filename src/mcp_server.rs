@@ -1,7 +1,38 @@
-use rmcp::{
-    handler::server::wrapper::Parameters, schemars, tool, tool_handler, tool_router,
-    transport::stdio, ServerHandler, ServiceExt,
+// MCP stdio server (rmcp 3.1).
+//
+// Four tools: `ping` (wiring check), plus the three that do the work —
+// `check_output`, `extract`, `grep`.  Short names on purpose: the server name
+// supplies the namespace, so Claude Code sees `mcp__scout__check_output`
+// (PLAN §3).
+//
+// `ServerHandler` is implemented by hand rather than via `#[tool_router]` /
+// `#[tool_handler]`: the three real tools advertise the `description` and
+// `input_schema` written in their preset TOMLs, which are loaded at runtime
+// and cannot be baked into a macro attribute.  One steering surface, one
+// source of truth — editing a preset changes what the model is told about it.
+//
+// Tool bodies are blocking (subprocess + HTTP), so each call runs on
+// `spawn_blocking`; the stdio loop stays responsive.
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
+use rmcp::service::RequestContext;
+use rmcp::{schemars, ErrorData, RoleServer, ServerHandler, ServiceExt};
+use serde_json::Value;
+
+use crate::client::LlmClient;
+use crate::presets::Preset;
+use crate::select::{Ctx, ToolResult};
+
+const INSTRUCTIONS: &str = "scout offloads small problems to a local LLM so they never consume \
+cloud-model context. Prefer its tools for classifying build/test output and targeted file/search \
+questions.";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PingParams {
@@ -11,34 +42,224 @@ pub struct PingParams {
 }
 
 #[derive(Clone)]
-struct Scout;
+struct Scout {
+    presets: Arc<Vec<Preset>>,
+}
 
-#[tool_router]
 impl Scout {
-    #[tool(
-        description = "Health check for the scout server: returns the server version and echoes an optional message. Use to verify the local-LLM plugin is wired up."
-    )]
-    fn ping(&self, Parameters(PingParams { message }): Parameters<PingParams>) -> String {
+    fn new() -> Self {
+        Scout { presets: Arc::new(crate::load_presets()) }
+    }
+
+    fn ping(&self, message: Option<String>) -> String {
         let version = env!("CARGO_PKG_VERSION");
         match message {
             Some(m) => format!("scout {version} — pong: {m}"),
             None => format!("scout {version} — pong"),
         }
     }
+
+    /// The tool table: `ping` plus one tool per preset scout exposes over MCP,
+    /// described by that preset's own `description` / `input_schema`.
+    fn tools(&self) -> Vec<Tool> {
+        let mut tools = vec![Tool::new(
+            Cow::Borrowed("ping"),
+            Cow::Borrowed(
+                "Health check for the scout server: returns the server version and echoes an \
+                 optional message. Use to verify the local-LLM plugin is wired up.",
+            ),
+            Arc::new(schema_object(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Optional message to echo back."}
+                },
+                "required": []
+            }))),
+        )];
+
+        for name in MCP_PRESETS {
+            if let Some(p) = self.presets.iter().find(|p| p.name == *name) {
+                tools.push(Tool::new(
+                    Cow::Owned(p.name.clone()),
+                    Cow::Owned(p.description.clone()),
+                    Arc::new(schema_object(&p.input_schema)),
+                ));
+            }
+        }
+        tools
+    }
+
+    /// Run one filter, loading config lazily so a missing `config.toml` is a
+    /// per-call tool error naming a fallback, never a dead server.
+    fn dispatch(&self, tool: &str, args: Value) -> ToolResult {
+        let cfg = crate::config::load_config(&crate::config::config_path());
+        let (client, client_error) = match cfg {
+            Ok(c) => (Some(LlmClient::new(c)), None),
+            Err(e) => (None, Some(e)),
+        };
+        let ctx = Ctx {
+            client: client.as_ref(),
+            client_error,
+            presets: &self.presets,
+            project: project_root(),
+        };
+        match tool {
+            "check_output" => crate::check_output::run(&ctx, &args),
+            "extract" => crate::extract::run(&ctx, &args),
+            "grep" => crate::grep::run(&ctx, &args),
+            other => Err(crate::select::ToolError::new(
+                format!("unknown tool {other:?}"),
+                "the built-in tools",
+            )),
+        }
+    }
 }
 
-#[tool_handler(
-    name = "scout",
-    version = "0.1.0",
-    instructions = "scout offloads small problems to a local LLM so they never consume cloud-model context. Prefer its tools for classifying build/test output and targeted file/search questions."
-)]
-impl ServerHandler for Scout {}
+/// Presets exposed as MCP tools.  The other three (`shell_safety`,
+/// `quality_review`, `test_review`) are CLI-only by design (PLAN §1).
+const MCP_PRESETS: &[&str] = &["check_output", "extract", "grep"];
+
+/// The MCP server's notion of "the project": the directory Claude Code
+/// launched it in.
+fn project_root() -> String {
+    std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
+}
+
+/// Coerce a JSON Schema `Value` into the object map rmcp wants, falling back
+/// to a permissive object schema if a preset carries something odd.
+fn schema_object(v: &Value) -> serde_json::Map<String, Value> {
+    match v {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::json!({"type": "object", "properties": {}, "required": []})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+impl ServerHandler for Scout {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("scout", env!("CARGO_PKG_VERSION")))
+            .with_instructions(INSTRUCTIONS.to_string())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(self.tools()))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tools().into_iter().find(|t| t.name == name)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let name = request.name.to_string();
+        let args = Value::Object(request.arguments.unwrap_or_default());
+
+        if name == "ping" {
+            let Parameters(PingParams { message }) = Parameters(
+                serde_json::from_value::<PingParams>(args)
+                    .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
+            );
+            return Ok(CallToolResult::success(vec![ContentBlock::text(self.ping(message))]).into());
+        }
+
+        let this = self.clone();
+        // The filters block on subprocesses and HTTP; keep them off the reactor.
+        let result = tokio::task::spawn_blocking(move || this.dispatch(&name, args))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("scout: tool task failed: {e}"), None))?;
+
+        Ok(match result {
+            Ok(payload) => CallToolResult::success(vec![ContentBlock::text(compact(&payload))]),
+            // A filter failure is the caller's problem to route around, not a
+            // protocol error: it comes back as tool-level `isError` content
+            // naming the raw tool to fall back to.
+            Err(e) => CallToolResult::error(vec![ContentBlock::text(e.text())]),
+        }
+        .into())
+    }
+}
+
+/// Serialize a payload as compact JSON text (the MCP content body).
+fn compact(payload: &Value) -> String {
+    serde_json::to_string(payload).unwrap_or_else(|_| payload.to_string())
+}
 
 pub fn serve() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let service = Scout.serve(stdio()).await?;
+        let service = Scout::new().serve(rmcp::transport::stdio()).await?;
         service.waiting().await?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server() -> Scout {
+        Scout::new()
+    }
+
+    #[test]
+    fn advertises_ping_and_the_three_filters() {
+        let names: Vec<String> = server().tools().iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names, vec!["ping", "check_output", "extract", "grep"]);
+    }
+
+    #[test]
+    fn tool_descriptions_come_from_the_presets() {
+        let tools = server().tools();
+        let grep = tools.iter().find(|t| t.name == "grep").unwrap();
+        let desc = grep.description.as_deref().unwrap();
+        assert!(desc.contains("intent"), "preset description not used: {desc}");
+        assert!(desc.len() > 100, "description looks truncated: {desc}");
+    }
+
+    #[test]
+    fn tool_schemas_come_from_the_presets() {
+        let tools = server().tools();
+        for (name, required) in
+            [("check_output", vec!["command"]), ("extract", vec!["file", "question"]), ("grep", vec!["pattern", "intent"])]
+        {
+            let t = tools.iter().find(|t| t.name == name).unwrap();
+            let schema = Value::Object((*t.input_schema).clone());
+            assert_eq!(schema["type"], "object", "{name} schema: {schema}");
+            let req: Vec<&str> =
+                schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            assert_eq!(req, required, "{name} required args");
+            assert!(schema["properties"].is_object(), "{name} has no properties: {schema}");
+        }
+    }
+
+    #[test]
+    fn ping_reports_the_version() {
+        let out = server().ping(Some("hi".into()));
+        assert!(out.contains(env!("CARGO_PKG_VERSION")));
+        assert!(out.contains("hi"));
+    }
+
+    #[test]
+    fn unknown_tool_is_a_fail_open_error_not_a_panic() {
+        let err = server().dispatch("nope", serde_json::json!({})).unwrap_err();
+        assert!(err.text().contains("unknown tool"), "{}", err.text());
+    }
+
+    #[test]
+    fn get_info_names_the_server_and_enables_tools() {
+        let info = server().get_info();
+        assert_eq!(info.server_info.name, "scout");
+        assert!(info.capabilities.tools.is_some());
+        assert!(info.instructions.unwrap().contains("local LLM"));
+    }
 }
