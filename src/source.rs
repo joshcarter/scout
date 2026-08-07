@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
+use ignore::overrides::{Override, OverrideBuilder};
+use ignore::types::{Types, TypesBuilder};
 use ignore::WalkBuilder;
 
 // ── File reads ────────────────────────────────────────────────────────
@@ -113,7 +115,11 @@ pub struct SearchResults {
 }
 
 /// Knobs for one search run.  Sourced from `filter_config::GrepConfig`.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy`: `types`/`overrides` own compiled glob sets.  `None` for either
+/// is an exact no-op — the corresponding `WalkBuilder` call is skipped
+/// entirely, so a filterless run walks precisely the tree it always did.
+#[derive(Debug, Clone)]
 pub struct SearchOptions {
     /// Treat the pattern as a regex rather than a literal string.
     pub regex: bool,
@@ -125,6 +131,76 @@ pub struct SearchOptions {
     pub max_file_bytes: u64,
     /// Stop the walk after this many hits.
     pub max_hits: usize,
+    /// ripgrep-style file-type selection (`-t rust`, `-T js`).
+    pub types: Option<Types>,
+    /// ripgrep-style glob include/exclude (`-g '!target/**'`).
+    pub overrides: Option<Override>,
+}
+
+impl Default for SearchOptions {
+    /// Only the filters default — every other knob is a config value with no
+    /// meaningful zero, so callers build the struct explicitly.
+    fn default() -> Self {
+        SearchOptions {
+            regex: false,
+            context_lines: 2,
+            context_max_bytes: 2000,
+            max_file_bytes: 1 << 20,
+            max_hits: 1000,
+            types: None,
+            overrides: None,
+        }
+    }
+}
+
+// ── Filter construction ───────────────────────────────────────────────
+
+/// Build a `Types` matcher from ripgrep's built-in type list.
+///
+/// `select` names are `-t`, `negate` names are `-T`.  An empty pair yields
+/// `None` so the walk is left untouched.  An unknown type name is an error
+/// with the caller-facing text scout surfaces verbatim.
+pub fn build_types(select: &[String], negate: &[String]) -> Result<Option<Types>, String> {
+    if select.is_empty() && negate.is_empty() {
+        return Ok(None);
+    }
+    let mut b = TypesBuilder::new();
+    b.add_defaults();
+    for name in select {
+        b.select(name);
+    }
+    for name in negate {
+        b.negate(name);
+    }
+    b.build().map(Some).map_err(|e| format!("invalid file type: {e}"))
+}
+
+/// Build an `Override` (glob include/exclude) rooted at `root`.
+///
+/// rg-compatible: a leading `!` negates.  Empty input yields `None`.
+pub fn build_overrides(root: &Path, globs: &[String]) -> Result<Option<Override>, String> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut b = OverrideBuilder::new(root);
+    for g in globs {
+        b.add(g).map_err(|e| format!("invalid glob {g:?}: {e}"))?;
+    }
+    b.build().map(Some).map_err(|e| format!("invalid glob set: {e}"))
+}
+
+/// Every file type ripgrep knows, as `(name, globs)`, sorted by name.
+/// Backs `scout grep --type-list`.
+pub fn type_definitions() -> Vec<(String, Vec<String>)> {
+    let mut b = TypesBuilder::new();
+    b.add_defaults();
+    let mut defs: Vec<(String, Vec<String>)> = b
+        .definitions()
+        .iter()
+        .map(|d| (d.name().to_string(), d.globs().iter().map(|g| g.to_string()).collect()))
+        .collect();
+    defs.sort_by(|a, b| a.0.cmp(&b.0));
+    defs
 }
 
 /// Walk `root` and return every hit for `pattern`, with context.
@@ -148,14 +224,23 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
 
     let mut out = SearchResults::default();
 
-    let walker = WalkBuilder::new(root)
+    let mut builder = WalkBuilder::new(root);
+    builder
         .standard_filters(true) // .gitignore + .ignore + global ignores + hidden
         .parents(true)
         // Apply .gitignore even outside a git checkout — an exported tree or a
         // vendored directory still means what its ignore file says.
         .require_git(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .build();
+        .sort_by_file_path(|a, b| a.cmp(b));
+    // Only touched when the caller actually asked for a filter, so the
+    // no-filter walk is bit-for-bit what it was before these existed.
+    if let Some(types) = &opts.types {
+        builder.types(types.clone());
+    }
+    if let Some(ov) = &opts.overrides {
+        builder.overrides(ov.clone());
+    }
+    let walker = builder.build();
 
     for entry in walker {
         if out.hits.len() >= opts.max_hits {

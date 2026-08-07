@@ -16,7 +16,24 @@ fn opts() -> SearchOptions {
         context_max_bytes: 2000,
         max_file_bytes: 1024 * 1024,
         max_hits: 1000,
+        types: None,
+        overrides: None,
     }
+}
+
+/// Collect the hit files for `pattern` under `dir`, in walk order.
+fn files(dir: &TempDir, pattern: &str, o: &SearchOptions) -> Vec<String> {
+    search(dir.path(), pattern, o).unwrap().hits.iter().map(|h| h.file.clone()).collect()
+}
+
+/// A small mixed-language tree, for the type/glob filter tests.
+fn mixed_tree() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "src/a.rs", "needle\n");
+    write(&dir, "src/b.js", "needle\n");
+    write(&dir, "docs/c.md", "needle\n");
+    write(&dir, "vendor/d.rs", "needle\n");
+    dir
 }
 
 fn write(dir: &TempDir, rel: &str, body: &str) {
@@ -237,6 +254,103 @@ fn search_of_an_empty_tree_is_an_empty_result_not_an_error() {
     let r = search(dir.path(), "needle", &opts()).unwrap();
     assert!(r.hits.is_empty());
     assert!(!r.truncated);
+}
+
+// ── search: type and glob filters (SPEC-cli §3) ──────────────────────
+
+#[test]
+fn no_filters_is_an_exact_no_op() {
+    // The contract that lets every existing caller keep its behaviour: an
+    // explicitly-None pair must walk precisely the tree it always did.
+    let dir = mixed_tree();
+    let baseline = files(&dir, "needle", &opts());
+    assert_eq!(baseline, vec!["docs/c.md", "src/a.rs", "src/b.js", "vendor/d.rs"]);
+
+    let mut o = opts();
+    o.types = build_types(&[], &[]).unwrap();
+    o.overrides = build_overrides(dir.path(), &[]).unwrap();
+    assert!(o.types.is_none() && o.overrides.is_none(), "empty filter lists must stay None");
+    assert_eq!(files(&dir, "needle", &o), baseline);
+}
+
+#[test]
+fn selecting_a_type_keeps_only_that_type() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.types = build_types(&["rust".to_string()], &[]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["src/a.rs", "vendor/d.rs"]);
+}
+
+#[test]
+fn selecting_several_types_is_a_union() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.types = build_types(&["rust".to_string(), "md".to_string()], &[]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["docs/c.md", "src/a.rs", "vendor/d.rs"]);
+}
+
+#[test]
+fn negating_a_type_drops_only_that_type() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.types = build_types(&[], &["js".to_string()]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["docs/c.md", "src/a.rs", "vendor/d.rs"]);
+}
+
+#[test]
+fn an_unknown_type_name_is_an_error_not_an_empty_result() {
+    // Silently searching nothing would read as "no matches" — the one answer
+    // a typo must never produce.
+    let e = build_types(&["rustt".to_string()], &[]).unwrap_err();
+    assert!(e.contains("invalid file type"), "{e}");
+    assert!(build_types(&[], &["nosuchtype".to_string()]).is_err());
+}
+
+#[test]
+fn an_include_glob_restricts_the_walk() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.overrides = build_overrides(dir.path(), &["src/**".to_string()]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["src/a.rs", "src/b.js"]);
+}
+
+#[test]
+fn a_negated_glob_excludes_and_leaves_everything_else() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.overrides = build_overrides(dir.path(), &["!vendor/**".to_string()]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["docs/c.md", "src/a.rs", "src/b.js"]);
+}
+
+#[test]
+fn globs_and_types_compose() {
+    let dir = mixed_tree();
+    let mut o = opts();
+    o.types = build_types(&["rust".to_string()], &[]).unwrap();
+    o.overrides = build_overrides(dir.path(), &["!vendor/**".to_string()]).unwrap();
+    assert_eq!(files(&dir, "needle", &o), vec!["src/a.rs"], "both filters must apply");
+}
+
+#[test]
+fn a_malformed_glob_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = build_overrides(dir.path(), &["src/**/[".to_string()]).unwrap_err();
+    assert!(e.contains("invalid glob"), "{e}");
+}
+
+#[test]
+fn type_definitions_are_ripgreps_and_sorted() {
+    let defs = type_definitions();
+    assert!(defs.len() > 50, "the built-in list should be large, got {}", defs.len());
+    let names: Vec<&str> = defs.iter().map(|(n, _)| n.as_str()).collect();
+    for expected in ["rust", "js", "json", "md", "toml"] {
+        assert!(names.contains(&expected), "missing type {expected}");
+    }
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "--type-list output must be stable");
+    let (_, globs) = defs.iter().find(|(n, _)| n == "rust").unwrap();
+    assert!(globs.iter().any(|g| g == "*.rs"), "globs must be carried along: {globs:?}");
 }
 
 // ── extract_context ──────────────────────────────────────────────────

@@ -119,33 +119,7 @@ enum Command {
         prompt: String,
     },
     /// Intent-filtered grep: search the project, keep only what serves the intent.
-    Grep {
-        /// Search pattern (literal by default; see --regex).
-        pattern: String,
-        /// What you are actually looking for. Omit it to skip the LLM rerank
-        /// entirely — an unfiltered structured search, capped at --max-hits.
-        intent: Option<String>,
-        /// Treat the pattern as a regex.
-        #[arg(long)]
-        regex: bool,
-        /// Hits to return after filtering (default: `[cli] max_hits`, 20).
-        /// A ceiling, not a quota — the model returns only what it kept.
-        #[arg(short = 'n', long)]
-        max_hits: Option<u64>,
-        /// Context lines on each side of a match
-        /// (default: `[cli] context`, else `[grep] context_lines`).
-        #[arg(short = 'C', long)]
-        context: Option<usize>,
-        /// Output format (default: human text, colored only on a terminal).
-        #[arg(long, value_enum)]
-        format: Option<Format>,
-        /// When to colorize human output (default: `[cli] color`, `auto`).
-        #[arg(long, value_enum)]
-        color: Option<ColorWhen>,
-        /// Project root to search (default: $PWD).
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Grep(Box<GrepArgs>),
     /// Targeted file Q&A: answer a question with the file's relevant line ranges.
     Extract {
         /// Path to the file (absolute, or relative to the project root).
@@ -185,15 +159,72 @@ enum Command {
     Stats,
 }
 
+/// `scout grep`'s flags.  Boxed into its own `Args` struct rather than an
+/// inline variant: the filter set (SPEC-cli §3) makes it far larger than any
+/// sibling, and `run_grep` wants to pass it around as one value.
+#[derive(clap::Args)]
+struct GrepArgs {
+    /// Search pattern (literal by default; see --regex).
+    #[arg(required_unless_present = "type_list")]
+    pattern: Option<String>,
+    /// What you are actually looking for. Omit it to skip the LLM rerank
+    /// entirely — an unfiltered structured search, capped at --max-hits.
+    intent: Option<String>,
+    /// Treat the pattern as a regex.
+    #[arg(long)]
+    regex: bool,
+    /// Only search these file types (repeatable), e.g. -t rust -t toml.
+    /// See --type-list for the full set.
+    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    r#type: Vec<String>,
+    /// Exclude these file types (repeatable), e.g. -T md.
+    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
+    type_not: Vec<String>,
+    /// Print every known file type with its globs, then exit.
+    /// Wins over everything else, as in ripgrep.
+    #[arg(long)]
+    type_list: bool,
+    /// Include/exclude by glob (repeatable); a leading '!' excludes,
+    /// e.g. -g 'src/**' -g '!**/tests/**'.
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    glob: Vec<String>,
+    /// Restrict the search to this directory (repeatable).
+    /// Sugar for -g 'PATH/**'.
+    #[arg(long, value_name = "PATH")]
+    dir: Vec<String>,
+    /// Skip this directory (repeatable). Sugar for -g '!PATH/**'.
+    #[arg(long, value_name = "PATH")]
+    exclude_dir: Vec<String>,
+    /// Skip the LLM rerank entirely: pure structured search, capped at
+    /// --max-hits. Works with no model configured.
+    #[arg(long, conflicts_with = "intent")]
+    no_filter: bool,
+    /// Hits to return after filtering (default: `[cli] max_hits`, 20).
+    /// A ceiling, not a quota — the model returns only what it kept.
+    #[arg(short = 'n', long)]
+    max_hits: Option<u64>,
+    /// Context lines on each side of a match
+    /// (default: `[cli] context`, else `[grep] context_lines`).
+    #[arg(short = 'C', long)]
+    context: Option<usize>,
+    /// Output format (default: human text, colored only on a terminal).
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    /// When to colorize human output (default: `[cli] color`, `auto`).
+    #[arg(long, value_enum)]
+    color: Option<ColorWhen>,
+    /// Project root to search (default: $PWD).
+    #[arg(long)]
+    project: Option<String>,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Mcp => mcp_server::serve(),
         Command::Run { args } => run_cmd::run_subcommand(&args),
         Command::Task { prompt } => run_task(&prompt),
-        Command::Grep { pattern, intent, regex, max_hits, context, format, color, project } => {
-            run_grep(pattern, intent, regex, max_hits, context, format, color, project)
-        }
+        Command::Grep(args) => run_grep(*args),
         Command::Extract { file, question, max_lines, project } => run_filter(
             "extract",
             project,
@@ -238,36 +269,48 @@ fn load_presets() -> Vec<presets::Preset> {
 /// The precedence is the usual one — explicit flag, then `[cli]`, then the
 /// shared `[grep]` default — and it lives here rather than in `grep.rs` so
 /// the MCP path never sees a terminal-only default.
-#[allow(clippy::too_many_arguments)]
-fn run_grep(
-    pattern: String,
-    intent: Option<String>,
-    regex: bool,
-    max_hits: Option<u64>,
-    context: Option<usize>,
-    format: Option<Format>,
-    color: Option<ColorWhen>,
-    project: Option<String>,
-) -> ! {
+fn run_grep(a: GrepArgs) -> ! {
+    // `--type-list` is informational and wins over everything, ripgrep-style:
+    // it answers "what can I pass to -t?", so it must work before the caller
+    // has a pattern in mind.
+    if a.type_list {
+        for (name, globs) in source::type_definitions() {
+            println!("{name}: {}", globs.join(", "));
+        }
+        std::process::exit(0);
+    }
+    // clap's `required_unless_present` guarantees this.
+    let pattern = a.pattern.expect("clap requires a pattern unless --type-list");
+
     let (_, grep_cfg) = filter_config::load();
     let cli_cfg = filter_config::load_cli();
 
-    let context_lines = context.or(cli_cfg.context).unwrap_or(grep_cfg.context_lines);
-    let max_hits = max_hits.unwrap_or(cli_cfg.max_hits as u64);
-    let color = color.unwrap_or_else(|| ColorWhen::from_config(&cli_cfg.color));
+    let context_lines = a.context.or(cli_cfg.context).unwrap_or(grep_cfg.context_lines);
+    let max_hits = a.max_hits.unwrap_or(cli_cfg.max_hits as u64);
+    let color = a.color.unwrap_or_else(|| ColorWhen::from_config(&cli_cfg.color));
+    let format = a.format.unwrap_or(Format::Human);
+    let globs = collect_globs(&a.glob, &a.dir, &a.exclude_dir);
 
+    // `--no-filter` needs no argument of its own: an absent intent already
+    // means "no rerank" (SPEC-cli §9), and clap's `conflicts_with` makes
+    // `--no-filter` with an intent an error rather than a silent no-op — so
+    // by the time we get here, `--no-filter` and "no intent" are the same
+    // state and the pipeline sees exactly one code path.
     run_filter(
         "grep",
-        project,
+        a.project,
         json!({
             "pattern": pattern,
-            "intent": intent,
-            "regex": regex,
+            "intent": a.intent,
+            "regex": a.regex,
             "max_hits": max_hits,
             "context_lines": context_lines,
+            "types": a.r#type,
+            "types_not": a.type_not,
+            "globs": globs,
         }),
         Some(GrepOutput {
-            format: format.unwrap_or(Format::Human),
+            format,
             color: color.enabled(),
             context_lines,
             // `grep::run` clamps; mirror it so "capped at top N" never claims
@@ -276,6 +319,22 @@ fn run_grep(
             max_hits_scanned: grep_cfg.max_hits_scanned,
         }),
     )
+}
+
+/// Fold `-g`, `--dir` and `--exclude-dir` into the single glob list the search
+/// layer takes.  The directory flags are pure sugar (SPEC-cli §3): `--dir X`
+/// is `-g 'X/**'`, `--exclude-dir X` is `-g '!X/**'`.  Explicit `-g` globs come
+/// first so the ordering a user typed is preserved among themselves; `ignore`
+/// resolves conflicts by last-match-wins, so a later `--exclude-dir` beats an
+/// earlier include, which is the intuitive reading.
+fn collect_globs(globs: &[String], dirs: &[String], exclude_dirs: &[String]) -> Vec<String> {
+    let trimmed = |p: &String| p.trim_end_matches('/').to_string();
+    globs
+        .iter()
+        .cloned()
+        .chain(dirs.iter().map(|d| format!("{}/**", trimmed(d))))
+        .chain(exclude_dirs.iter().map(|d| format!("!{}/**", trimmed(d))))
+        .collect()
 }
 
 fn run_filter(
@@ -377,7 +436,7 @@ fn grep_status(payload: &serde_json::Value, out: &GrepOutput) -> Vec<String> {
         return vec![if flag("none_relevant") {
             format!(
                 "local model judged none of the {hits_total} hits relevant — \
-                 rerun without an intent to see all of them"
+                 rerun with --no-filter to see all of them"
             )
         } else {
             format!("no matches for '{pattern}'")
@@ -451,5 +510,106 @@ fn run_task(prompt: &str) -> ! {
             eprintln!("scout task: {:?}", e);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Parse an argv, returning grep's flags.
+    fn grep_args(argv: &[&str]) -> GrepArgs {
+        let mut full = vec!["scout", "grep"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).expect("should parse").command {
+            Command::Grep(a) => *a,
+            _ => panic!("not the grep subcommand"),
+        }
+    }
+
+    fn grep_err(argv: &[&str]) -> clap::Error {
+        let mut full = vec!["scout", "grep"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full) {
+            Err(e) => e,
+            Ok(_) => panic!("argv {argv:?} should have been rejected"),
+        }
+    }
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        // Catches duplicate shorts/longs and bad `conflicts_with` targets,
+        // which clap only reports at runtime otherwise.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn type_and_glob_flags_are_repeatable() {
+        let a = grep_args(&["needle", "-t", "rust", "-t", "toml", "-T", "md", "-g", "src/**"]);
+        assert_eq!(a.r#type, vec!["rust", "toml"]);
+        assert_eq!(a.type_not, vec!["md"]);
+        assert_eq!(a.glob, vec!["src/**"]);
+    }
+
+    #[test]
+    fn dir_flags_are_sugar_over_globs() {
+        let a = grep_args(&["needle", "-g", "*.rs", "--dir", "src", "--exclude-dir", "vendor/"]);
+        assert_eq!(
+            collect_globs(&a.glob, &a.dir, &a.exclude_dir),
+            vec!["*.rs", "src/**", "!vendor/**"],
+            "--dir includes, --exclude-dir negates, and a trailing slash is tolerated"
+        );
+    }
+
+    #[test]
+    fn collect_globs_of_nothing_is_empty() {
+        // The no-op guarantee starts here: no glob flags means no override.
+        assert!(collect_globs(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn type_list_does_not_require_a_pattern() {
+        let a = grep_args(&["--type-list"]);
+        assert!(a.type_list && a.pattern.is_none());
+        // ...and still wins when a pattern happens to be present (rg parity).
+        assert!(grep_args(&["needle", "--type-list"]).type_list);
+    }
+
+    #[test]
+    fn a_missing_pattern_without_type_list_is_rejected() {
+        assert_eq!(grep_err(&[]).kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn no_filter_and_an_intent_are_mutually_exclusive() {
+        // Silently ignoring the intent would be the worst outcome: the caller
+        // would think the rerank ran.
+        assert_eq!(
+            grep_err(&["needle", "an intent", "--no-filter"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        // Alone, it is just the no-intent path spelled out.
+        let a = grep_args(&["needle", "--no-filter"]);
+        assert!(a.no_filter && a.intent.is_none());
+    }
+
+    #[test]
+    fn none_relevant_status_points_at_no_filter() {
+        let out = GrepOutput {
+            format: Format::Human,
+            color: false,
+            context_lines: 2,
+            max_hits: 20,
+            max_hits_scanned: 2000,
+        };
+        let payload = json!({
+            "mode": "rerank", "pattern": "needle", "intent": "something",
+            "hits_total": 214, "hits": [], "none_relevant": true,
+        });
+        let lines = grep_status(&payload, &out);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("--no-filter"), "{}", lines[0]);
+        assert!(lines[0].contains("214"), "{}", lines[0]);
     }
 }

@@ -78,12 +78,10 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         .clamp(1, MAX_HITS_CEILING);
 
     // ── 1. Run the real search engine ────────────────────────────────
-    let results = crate::source::search(
-        std::path::Path::new(&ctx.project),
-        &pattern,
-        &search_options(&cfg, use_regex),
-    )
-    .map_err(|e| fail(&format!("grep failed: {e}")))?;
+    let root = std::path::Path::new(&ctx.project);
+    let opts = search_options(&cfg, use_regex, root, args).map_err(|e| fail(&e))?;
+    let results = crate::source::search(root, &pattern, &opts)
+        .map_err(|e| fail(&format!("grep failed: {e}")))?;
     let search_truncated = results.truncated;
     let hits = parse_hits(&results, cfg.context_lines);
     let hits_total = hits.len();
@@ -191,15 +189,51 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     ))
 }
 
-/// Search knobs for one run, from the grep config plus the caller's `regex`.
-fn search_options(cfg: &GrepConfig, regex: bool) -> SearchOptions {
-    SearchOptions {
+/// Search knobs for one run: the grep config, the caller's `regex`, and the
+/// optional type/glob filters (`types`, `types_not`, `globs`).
+///
+/// The three filter args are optional everywhere — absent means `None`, which
+/// `source::search` treats as "do not touch the walker" — so an old caller
+/// gets exactly the walk it got before these fields existed.  A bad type name
+/// or malformed glob returns `Err`, which `run` turns into a fail-open error
+/// (exit 2 at the CLI) rather than a silently unfiltered search.
+pub fn search_options(
+    cfg: &GrepConfig,
+    regex: bool,
+    root: &std::path::Path,
+    args: &Value,
+) -> Result<SearchOptions, String> {
+    let types = crate::source::build_types(
+        &string_list(args, "types"),
+        &string_list(args, "types_not"),
+    )?;
+    let overrides = crate::source::build_overrides(root, &string_list(args, "globs"))?;
+    Ok(SearchOptions {
         regex,
         context_lines: cfg.context_lines,
         context_max_bytes: cfg.context_max_bytes,
         max_file_bytes: cfg.max_file_bytes,
         max_hits: cfg.max_hits_scanned,
-    }
+        types,
+        overrides,
+    })
+}
+
+/// Read an optional array-of-strings argument.  Anything else — a scalar, a
+/// null, a missing key — reads as the empty list; blank entries are dropped so
+/// a stray `-g ''` cannot turn into a match-nothing override.
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ── Payload builders (pure — unit-tested directly) ───────────────────

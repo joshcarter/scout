@@ -5,7 +5,8 @@
 # hit list and materializes the surviving hits from the original grep output,
 # so the model can drop a hit but never invent one.
 #
-# Args (caller): pattern, intent, regex, max_hits.
+# Args (caller): pattern, intent, regex, max_hits, types, types_not, globs.
+# The filter args never reach the model — they narrow the walk in source.rs.
 # Args (scout-injected): hit_list, hits_considered.
 # No context providers — the caller supplies everything.
 #
@@ -77,3 +78,20 @@ description = "Treat the pattern as a regex. Defaults to false."
 [preset.input_schema.properties.max_hits]
 type        = "integer"
 description = "Hits to return after filtering. Defaults to 10."
+
+# Search-narrowing filters (SPEC-cli §3). All optional and additive: omitting
+# them searches exactly the tree scout has always searched.
+[preset.input_schema.properties.types]
+type        = "array"
+description = "Only search these ripgrep file types, e.g. [\"rust\", \"toml\"]. Narrowing the walk beats filtering afterwards — fewer hits reach the reranker."
+items       = { type = "string" }
+
+[preset.input_schema.properties.types_not]
+type        = "array"
+description = "Exclude these ripgrep file types, e.g. [\"md\", \"lock\"]."
+items       = { type = "string" }
+
+[preset.input_schema.properties.globs]
+type        = "array"
+description = "Include/exclude by glob, ripgrep syntax; a leading '!' excludes. e.g. [\"src/**\", \"!**/tests/**\"]. Use this to scope to a subdirectory."
+items       = { type = "string" }

@@ -224,6 +224,110 @@ fn no_intent_under_the_cap_reports_no_truncation() {
     assert_eq!(hint, "no intent given — unfiltered search, no filtering applied");
 }
 
+// ── Type/glob filters (SPEC-cli §3) ──────────────────────────────────
+
+/// A mixed tree plus an offline ctx rooted at it.
+fn filter_tree() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (rel, body) in [
+        ("src/a.rs", "needle\n"),
+        ("src/b.js", "needle\n"),
+        ("docs/c.md", "needle\n"),
+        ("vendor/d.rs", "needle\n"),
+    ] {
+        let p = dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+    dir
+}
+
+fn hit_files(payload: &Value) -> Vec<String> {
+    payload["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["file"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn search_options_threads_the_filter_args_through() {
+    let cfg = GrepConfig::default();
+    let root = std::path::Path::new(".");
+    let bare = search_options(&cfg, false, root, &serde_json::json!({})).unwrap();
+    assert!(bare.types.is_none() && bare.overrides.is_none(), "absent args must stay None");
+
+    let filtered = search_options(
+        &cfg,
+        false,
+        root,
+        &serde_json::json!({"types": ["rust"], "types_not": ["md"], "globs": ["!vendor/**"]}),
+    )
+    .unwrap();
+    assert!(filtered.types.is_some(), "types/types_not must reach SearchOptions");
+    assert!(filtered.overrides.is_some(), "globs must reach SearchOptions");
+
+    // Empty arrays are the same as absent — a caller passing [] gets the
+    // untouched walk, not a match-nothing filter.
+    let empty =
+        search_options(&cfg, false, root, &serde_json::json!({"types": [], "globs": [""]})).unwrap();
+    assert!(empty.types.is_none() && empty.overrides.is_none());
+}
+
+#[test]
+fn a_bad_type_name_fails_open_rather_than_searching_nothing() {
+    let ctx = offline_ctx(".");
+    let err =
+        run(&ctx, &serde_json::json!({"pattern": "needle", "types": ["rustt"]})).unwrap_err();
+    let text = assert_fails_open(&err);
+    assert!(text.contains("invalid file type"), "text: {text}");
+}
+
+#[test]
+fn a_malformed_glob_fails_open() {
+    let ctx = offline_ctx(".");
+    let err =
+        run(&ctx, &serde_json::json!({"pattern": "needle", "globs": ["src/**/["]})).unwrap_err();
+    let text = assert_fails_open(&err);
+    assert!(text.contains("invalid glob"), "text: {text}");
+}
+
+#[test]
+fn type_and_glob_args_narrow_a_real_search() {
+    let dir = filter_tree();
+    let ctx = offline_ctx(&dir.path().to_string_lossy());
+    let base = |extra: Value| {
+        let mut args = serde_json::json!({"pattern": "needle", "max_hits": 100});
+        for (k, v) in extra.as_object().unwrap() {
+            args[k] = v.clone();
+        }
+        run(&ctx, &args).unwrap()
+    };
+
+    assert_eq!(
+        hit_files(&base(serde_json::json!({}))),
+        vec!["docs/c.md", "src/a.rs", "src/b.js", "vendor/d.rs"],
+        "unfiltered baseline"
+    );
+    assert_eq!(
+        hit_files(&base(serde_json::json!({"types": ["rust"]}))),
+        vec!["src/a.rs", "vendor/d.rs"]
+    );
+    assert_eq!(
+        hit_files(&base(serde_json::json!({"types_not": ["js", "md"]}))),
+        vec!["src/a.rs", "vendor/d.rs"]
+    );
+    assert_eq!(
+        hit_files(&base(serde_json::json!({"globs": ["src/**"]}))),
+        vec!["src/a.rs", "src/b.js"]
+    );
+    assert_eq!(
+        hit_files(&base(serde_json::json!({"globs": ["!vendor/**"], "types": ["rust"]}))),
+        vec!["src/a.rs"]
+    );
+}
+
 // ── Rerank payload ───────────────────────────────────────────────────
 
 #[test]

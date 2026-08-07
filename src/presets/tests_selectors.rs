@@ -122,9 +122,19 @@ fn grep_input_schema_advertises_only_caller_args() {
     let props = preset.input_schema["properties"].as_object().expect("properties object");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["intent", "max_hits", "pattern", "regex"]);
+    assert_eq!(
+        keys,
+        vec!["globs", "intent", "max_hits", "pattern", "regex", "types", "types_not"]
+    );
     assert!(!props.contains_key("hit_list"), "caller-injected arg must not be advertised");
     assert!(!props.contains_key("hits_considered"));
+
+    // The filter args are arrays of strings — Claude sending a bare string
+    // must be a schema violation, not a silently-empty filter.
+    for key in ["types", "types_not", "globs"] {
+        assert_eq!(props[key]["type"], "array", "{key}");
+        assert_eq!(props[key]["items"]["type"], "string", "{key}");
+    }
 }
 
 #[test]
