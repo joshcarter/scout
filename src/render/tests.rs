@@ -288,14 +288,14 @@ fn only_the_matched_line_of_a_block_is_highlighted() {
             "col": 2, "col_end": 8
         }]
     });
-    let out = render_human(&payload, &RenderOpts { color: true, context_lines: 1, max_columns: 150 });
+    let out = render_human(&payload, &RenderOpts { color: true, context_lines: 1, ..plain() });
     assert_eq!(out.matches("\x1b[1;31m").count(), 1, "neighbours are not matches:\n{out:?}");
 }
 
 // ── Column cap: windowing (SPEC-cli §4) ──────────────────────────────
 
 fn capped(n: usize) -> RenderOpts {
-    RenderOpts { color: false, context_lines: 2, max_columns: n }
+    RenderOpts { max_columns: n, ..plain() }
 }
 
 #[test]
@@ -522,4 +522,49 @@ fn vimgrep_keeps_a_hit_whose_matched_line_was_cut() {
         "hits": [{"file": "min.json", "line": 1, "text": Value::Null, "context": "..."}]
     });
     assert_eq!(render_vimgrep(&payload), "min.json:1:1: (matched line unavailable)\n");
+}
+
+// ── Numbering (SPEC-cli §6, `scout edit`'s picker) ───────────────────
+
+/// `n` hits in distinct files, enough to exercise the index width.  All on
+/// line 1, so the block arithmetic stays out of the way of what is under test.
+fn many_hits(n: usize) -> Value {
+    let hits: Vec<Value> = (1..=n)
+        .map(|i| json!({"file": format!("f{i}.rs"), "line": 1, "text": "m", "context": "m"}))
+        .collect();
+    json!({"mode": "full", "hits": hits})
+}
+
+fn numbered() -> RenderOpts {
+    RenderOpts { numbered: true, ..plain() }
+}
+
+#[test]
+fn numbering_is_off_unless_asked_for() {
+    // grep/find output is not something you answer a prompt about.
+    assert_eq!(render_human(&many_hits(2), &plain()), "f1.rs:1\n▶ 1 │ m\n\nf2.rs:1\n▶ 1 │ m\n");
+}
+
+#[test]
+fn numbered_hits_get_a_one_based_index() {
+    assert_eq!(
+        render_human(&many_hits(2), &numbered()),
+        "1. f1.rs:1\n▶ 1 │ m\n\n2. f2.rs:1\n▶ 1 │ m\n"
+    );
+}
+
+#[test]
+fn the_index_is_right_aligned_to_the_widest_one() {
+    // Otherwise every header from hit 10 on would step one column right.
+    let out = render_human(&many_hits(10), &numbered());
+    assert!(out.starts_with(" 1. f1.rs:1\n"), "{out}");
+    assert!(out.contains("\n 9. f9.rs:1\n"), "{out}");
+    assert!(out.contains("\n10. f10.rs:1\n"), "{out}");
+}
+
+#[test]
+fn the_index_survives_a_why_note_and_colour() {
+    let out = render_human(&rerank_payload(), &RenderOpts { color: true, ..numbered() });
+    assert!(out.starts_with("\x1b[1m1. \x1b[0m\x1b[35msrc/select.rs\x1b[0m"), "{out:?}");
+    assert!(out.contains("· validates keep-ids"), "{out:?}");
 }

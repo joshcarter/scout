@@ -2,6 +2,7 @@ mod check_output;
 mod classify_command;
 mod client;
 mod config;
+mod edit;
 mod extract;
 mod filter_config;
 mod find;
@@ -90,6 +91,19 @@ struct GrepOutput {
     max_hits_scanned: usize,
 }
 
+impl GrepOutput {
+    /// The renderer's slice of these options.  `numbered` is off here — only
+    /// `scout edit`'s picker turns it on, on its own copy.
+    fn render_opts(&self) -> render::RenderOpts {
+        render::RenderOpts {
+            color: self.color,
+            context_lines: self.context_lines,
+            max_columns: self.max_columns,
+            numbered: false,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "scout",
@@ -130,6 +144,14 @@ enum Command {
     /// Requires a configured local model (unlike `grep`, which degrades to a
     /// plain structured search).
     Find(Box<FindArgs>),
+    /// Search, then open the result in $EDITOR.
+    ///
+    /// Fronts both search pipelines, chosen by how many positionals you give:
+    /// `scout edit "<question>"` runs `find`, `scout edit <pattern> "<intent>"`
+    /// runs the reranked `grep`, and `scout edit -p <pattern>` runs a plain
+    /// pattern search. One hit opens straight away; several are listed and
+    /// numbered for a one-keystroke pick.
+    Edit(Box<EditArgs>),
     /// Targeted file Q&A: answer a question with the file's relevant line ranges.
     Extract {
         /// Path to the file (absolute, or relative to the project root).
@@ -169,10 +191,14 @@ enum Command {
     Stats,
 }
 
-/// The flags `grep` and `find` share: what to search (SPEC-cli §3) and how to
-/// print it (§1–2).  Flattened into both verbs so the dialect can never drift
+/// The flags every search verb shares: what to search (SPEC-cli §3) and how to
+/// style it (§1–2).  Flattened into all three so the dialect can never drift
 /// between them — SPEC §5 requires `find`'s filter flags to be *identical* to
 /// grep's, and one struct is the only way to keep that true.
+///
+/// `--format` is deliberately *not* here.  `grep` and `find` declare it
+/// themselves, because `edit` must not have it: its output is a picker, and
+/// "render this as JSON, then ask me which one to open" is not a thing.
 #[derive(clap::Args)]
 struct SearchFlags {
     /// Only search these file types (repeatable), e.g. -t rust -t toml.
@@ -205,9 +231,6 @@ struct SearchFlags {
     /// 0 disables). An over-long matched line shows a window around the match.
     #[arg(short = 'M', long, value_name = "N")]
     max_columns: Option<usize>,
-    /// Output format (default: human text, colored only on a terminal).
-    #[arg(long, value_enum)]
-    format: Option<Format>,
     /// When to colorize human output (default: `[cli] color`, `auto`).
     #[arg(long, value_enum)]
     color: Option<ColorWhen>,
@@ -238,6 +261,9 @@ struct GrepArgs {
     /// --max-hits. Works with no model configured.
     #[arg(long, conflicts_with = "intent")]
     no_filter: bool,
+    /// Output format (default: human text, colored only on a terminal).
+    #[arg(long, value_enum)]
+    format: Option<Format>,
     #[command(flatten)]
     flags: SearchFlags,
 }
@@ -258,6 +284,37 @@ struct FindArgs {
     /// 2). 1 disables the retry.
     #[arg(long, value_name = "N")]
     attempts: Option<u64>,
+    /// Output format (default: human text, colored only on a terminal).
+    #[arg(long, value_enum)]
+    format: Option<Format>,
+    #[command(flatten)]
+    flags: SearchFlags,
+}
+
+/// `scout edit`'s flags: the two search verbs' positionals, plus their
+/// verb-specific extras, and no `--format` (SPEC-cli §6).
+///
+/// Both positionals are optional at the clap level and the arity rule lives in
+/// `edit::dispatch`; see that function for why.
+#[derive(clap::Args)]
+struct EditArgs {
+    /// A question for the find pipeline — or, when an intent follows it,
+    /// a search pattern for grep.
+    #[arg(value_name = "QUESTION|PATTERN")]
+    query: Option<String>,
+    /// What you are actually looking for. Its presence is what makes the first
+    /// positional a pattern rather than a question.
+    intent: Option<String>,
+    /// Search this pattern with no rerank: a plain structured search, no model.
+    #[arg(short = 'p', long = "pattern", value_name = "PATTERN")]
+    pattern: Option<String>,
+    /// Treat the pattern as a regex (grep pipeline only).
+    #[arg(long)]
+    regex: bool,
+    /// Pattern-guess rounds before giving up (find pipeline only;
+    /// default: `[find] max_attempts`, 2).
+    #[arg(long, value_name = "N")]
+    attempts: Option<u64>,
     #[command(flatten)]
     flags: SearchFlags,
 }
@@ -270,6 +327,7 @@ fn main() -> anyhow::Result<()> {
         Command::Task { prompt } => run_task(&prompt),
         Command::Grep(args) => run_grep(*args),
         Command::Find(args) => run_find(*args),
+        Command::Edit(args) => run_edit(*args),
         Command::Extract { file, question, max_lines, project } => run_filter(
             "extract",
             project,
@@ -326,7 +384,7 @@ fn run_grep(a: GrepArgs) -> ! {
     }
     // clap's `required_unless_present` guarantees this.
     let pattern = a.pattern.expect("clap requires a pattern unless --type-list");
-    let (mut args, out, project) = resolve_flags(a.flags);
+    let (mut args, out, project) = resolve_flags(a.flags, a.format);
     args["pattern"] = json!(pattern);
     args["intent"] = json!(a.intent);
     args["regex"] = json!(a.regex);
@@ -345,10 +403,61 @@ fn run_grep(a: GrepArgs) -> ! {
 /// lines, same exit codes (SPEC-cli §5) — so the only find-specific work here
 /// is the question and the attempt budget.
 fn run_find(a: FindArgs) -> ! {
-    let (mut args, out, project) = resolve_flags(a.flags);
+    let (mut args, out, project) = resolve_flags(a.flags, a.format);
     args["question"] = json!(a.question);
     args["attempts"] = json!(a.attempts);
     run_filter("find", project, args, Some(out))
+}
+
+/// Run whichever pipeline `scout edit`'s positionals selected, then hand the
+/// result to the picker (SPEC-cli §6).
+///
+/// The two checks that can fail without searching anything — the arity rule and
+/// `$EDITOR` — run first, deliberately: a rerank takes seconds, and finding out
+/// afterwards that there was never an editor to open would waste all of them.
+fn run_edit(a: EditArgs) -> ! {
+    let bail = |msg: String| -> ! {
+        eprintln!("scout edit: {msg}");
+        std::process::exit(2);
+    };
+    let pipeline = match edit::dispatch(a.query, a.intent, a.pattern, a.regex, a.attempts) {
+        Ok(p) => p,
+        Err(msg) => bail(msg),
+    };
+    let editor = match edit::editor_words() {
+        Ok(words) => words,
+        Err(msg) => bail(msg),
+    };
+
+    // `--format` does not exist on this verb; the picker is human output.
+    let (mut args, out, project) = resolve_flags(a.flags, None);
+    let tool = match pipeline {
+        edit::Pipeline::Find { question, attempts } => {
+            args["question"] = json!(question);
+            args["attempts"] = json!(attempts);
+            "find"
+        }
+        edit::Pipeline::Grep { pattern, intent, regex } => {
+            args["pattern"] = json!(pattern);
+            args["intent"] = json!(intent);
+            args["regex"] = json!(regex);
+            "grep"
+        }
+    };
+
+    // The editor inherits the project root as its cwd, so the payload's
+    // project-relative paths resolve — and the paths the picker printed are the
+    // ones the editor opens.
+    let project = resolve_project(project);
+    let payload = match run_pipeline(tool, project.clone(), &args, true) {
+        Ok(payload) => payload,
+        Err(e) => {
+            eprintln!("{}", e.text());
+            std::process::exit(2);
+        }
+    };
+    let status = grep_status(&payload, &out);
+    edit::run(&payload, &out.render_opts(), &status, &project, &editor)
 }
 
 /// Turn the shared flag set into the pipeline's argument object plus the
@@ -357,7 +466,10 @@ fn run_find(a: FindArgs) -> ! {
 ///
 /// It lives here rather than in `grep.rs`/`find.rs` so the MCP path never sees
 /// a terminal-only default.
-fn resolve_flags(f: SearchFlags) -> (serde_json::Value, GrepOutput, Option<String>) {
+fn resolve_flags(
+    f: SearchFlags,
+    format: Option<Format>,
+) -> (serde_json::Value, GrepOutput, Option<String>) {
     let (_, grep_cfg) = filter_config::load();
     let cli_cfg = filter_config::load_cli();
 
@@ -373,7 +485,7 @@ fn resolve_flags(f: SearchFlags) -> (serde_json::Value, GrepOutput, Option<Strin
         "globs": collect_globs(&f.glob, &f.dir, &f.exclude_dir),
     });
     let out = GrepOutput {
-        format: f.format.unwrap_or(Format::Human),
+        format: format.unwrap_or(Format::Human),
         color: color.enabled(),
         context_lines,
         max_columns: f.max_columns.unwrap_or(cli_cfg.max_columns),
@@ -401,18 +513,27 @@ fn collect_globs(globs: &[String], dirs: &[String], exclude_dirs: &[String]) -> 
         .collect()
 }
 
-fn run_filter(
-    tool: &str,
-    project: Option<String>,
-    args: serde_json::Value,
-    grep_out: Option<GrepOutput>,
-) -> ! {
-    let project = project.unwrap_or_else(|| {
+/// `--project`, or `$PWD`.
+fn resolve_project(project: Option<String>) -> String {
+    project.unwrap_or_else(|| {
         std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string())
-    });
+    })
+}
 
+/// Build the invocation context and run one filter, returning its payload.
+///
+/// The one place the CLI enters a pipeline.  Split out of `run_filter` so
+/// `scout edit` can reach a payload without also inheriting `run_filter`'s
+/// "print it and exit" ending — everything about *how* the pipeline runs stays
+/// identical for every verb.
+fn run_pipeline(
+    tool: &str,
+    project: String,
+    args: &serde_json::Value,
+    progress: bool,
+) -> select::ToolResult {
     let (client, client_error) = match config::load_config(&config::config_path()) {
         Ok(c) => (Some(LlmClient::new(c)), None),
         Err(e) => (None, Some(e)),
@@ -423,19 +544,27 @@ fn run_filter(
         client_error,
         presets: &presets,
         project,
-        // Only the terminal path wants progress chatter, and only ever on
+        // Only the terminal paths want progress chatter, and only ever on
         // stderr — stdout carries the result and may be piped.
-        progress: grep_out
-            .as_ref()
-            .map(|_| Box::new(|msg: &str| eprintln!("{msg}")) as select::ProgressSink),
+        progress: progress.then(|| Box::new(|msg: &str| eprintln!("{msg}")) as select::ProgressSink),
     };
 
-    let result = match tool {
-        "grep" => grep::run(&ctx, &args),
-        "find" => find::run(&ctx, &args),
-        "extract" => extract::run(&ctx, &args),
-        _ => check_output::run(&ctx, &args),
-    };
+    match tool {
+        "grep" => grep::run(&ctx, args),
+        "find" => find::run(&ctx, args),
+        "extract" => extract::run(&ctx, args),
+        _ => check_output::run(&ctx, args),
+    }
+}
+
+fn run_filter(
+    tool: &str,
+    project: Option<String>,
+    args: serde_json::Value,
+    grep_out: Option<GrepOutput>,
+) -> ! {
+    let project = resolve_project(project);
+    let result = run_pipeline(tool, project, &args, grep_out.is_some());
 
     match result {
         Ok(payload) => match &grep_out {
@@ -468,17 +597,7 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
     match out.format {
         Format::Json => println!("{}", pretty_json(payload)),
         Format::Vimgrep => print!("{}", render::render_vimgrep(payload)),
-        Format::Human => print!(
-            "{}",
-            render::render_human(
-                payload,
-                &render::RenderOpts {
-                    color: out.color,
-                    context_lines: out.context_lines,
-                    max_columns: out.max_columns,
-                },
-            )
-        ),
+        Format::Human => print!("{}", render::render_human(payload, &out.render_opts())),
     }
     for line in grep_status(payload, out) {
         eprintln!("{line}");
@@ -710,6 +829,7 @@ mod tests {
             "--format",
             "vimgrep",
         ]);
+        assert!(matches!(a.format, Some(Format::Vimgrep)));
         assert_eq!(a.question, "where is config parsed?");
         assert_eq!(a.flags.r#type, vec!["rust"]);
         assert_eq!(a.flags.type_not, vec!["md"]);
@@ -718,7 +838,6 @@ mod tests {
         assert_eq!(a.flags.max_hits, Some(5));
         assert_eq!(a.flags.context, Some(1));
         assert_eq!(a.flags.max_columns, Some(80));
-        assert!(matches!(a.flags.format, Some(Format::Vimgrep)));
     }
 
     #[test]
@@ -780,6 +899,48 @@ mod tests {
         assert!(line.contains("none of the 31 hits relevant"), "{line}");
         assert!(line.contains("scout grep"), "{line}");
         assert!(!line.contains("--no-filter"), "{line}");
+    }
+
+    /// Parse an argv, returning edit's flags.
+    fn edit_args(argv: &[&str]) -> EditArgs {
+        let mut full = vec!["scout", "edit"];
+        full.extend_from_slice(argv);
+        match Cli::try_parse_from(full).expect("should parse").command {
+            Command::Edit(a) => *a,
+            _ => panic!("not the edit subcommand"),
+        }
+    }
+
+    #[test]
+    fn edit_takes_the_same_filter_flags_as_grep() {
+        // The shared `SearchFlags` makes this structural; this pins it, and
+        // pins that the arity positionals still land where they should.
+        let a = edit_args(&["load_config", "the toml parse", "-t", "rust", "--dir", "src", "-n", "5"]);
+        assert_eq!(a.query.as_deref(), Some("load_config"));
+        assert_eq!(a.intent.as_deref(), Some("the toml parse"));
+        assert_eq!(a.flags.r#type, vec!["rust"]);
+        assert_eq!(a.flags.dir, vec!["src"]);
+        assert_eq!(a.flags.max_hits, Some(5));
+    }
+
+    #[test]
+    fn edit_has_no_format_flag() {
+        // SPEC §6: the output is a picker.  "Render this as JSON, then ask me
+        // which one to open" is not a thing, so the flag must not exist —
+        // and it must not silently parse as something else either.
+        match Cli::try_parse_from(["scout", "edit", "a question", "--format", "json"]) {
+            Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument),
+            Ok(_) => panic!("edit must not accept --format"),
+        }
+    }
+
+    #[test]
+    fn edit_positionals_are_optional_at_the_clap_level() {
+        // The arity rule lives in `edit::dispatch`, which owns the error text;
+        // clap must therefore let all three shapes through to it.
+        assert!(edit_args(&[]).query.is_none(), "bare `scout edit` reaches dispatch");
+        assert_eq!(edit_args(&["-p", "needle"]).pattern.as_deref(), Some("needle"));
+        assert_eq!(edit_args(&["a question"]).query.as_deref(), Some("a question"));
     }
 
     fn test_output() -> GrepOutput {

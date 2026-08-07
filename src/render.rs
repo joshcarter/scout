@@ -67,11 +67,15 @@ pub struct RenderOpts {
     /// payload untouched, and the payload itself is already bounded by the
     /// search layer's `context_max_bytes`.
     pub max_columns: usize,
+    /// Prefix each hit's header with its 1-based index (`scout edit`'s picker,
+    /// SPEC-cli §6).  Off for `grep`/`find`, whose output is not something you
+    /// answer a prompt about.
+    pub numbered: bool,
 }
 
 impl Default for RenderOpts {
     fn default() -> Self {
-        RenderOpts { color: false, context_lines: 2, max_columns: 150 }
+        RenderOpts { color: false, context_lines: 2, max_columns: 150, numbered: false }
     }
 }
 
@@ -85,21 +89,36 @@ pub fn render_human(payload: &Value, opts: &RenderOpts) -> String {
     let hits = payload.get("hits").and_then(Value::as_array);
     let Some(hits) = hits else { return String::new() };
 
+    // Right-aligned to the widest index, so a 12-hit list's headers all start
+    // in the same column instead of stepping right at hit 10.
+    let width = hits.len().to_string().len();
+
     let mut out = String::new();
     for (i, hit) in hits.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        render_hit(&mut out, hit, opts);
+        render_hit(&mut out, hit, if opts.numbered { Some((i + 1, width)) } else { None }, opts);
     }
     out
 }
 
 /// One hit: header line, then its gutter-numbered context block.
-fn render_hit(out: &mut String, hit: &Value, opts: &RenderOpts) {
+///
+/// `index` is `Some((n, width))` only for `scout edit`'s picker, where each hit
+/// needs a name the caller can type back.
+fn render_hit(out: &mut String, hit: &Value, index: Option<(usize, usize)>, opts: &RenderOpts) {
     let file = hit.get("file").and_then(Value::as_str).unwrap_or("<unknown>");
     let line = hit.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
 
+    if let Some((n, width)) = index {
+        let label = format!("{n:>width$}. ");
+        if opts.color {
+            out.push_str(&format!("{BOLD}{label}{RESET}"));
+        } else {
+            out.push_str(&label);
+        }
+    }
     if opts.color {
         out.push_str(&format!("{MAGENTA}{file}{RESET}:{GREEN}{line}{RESET}"));
     } else {

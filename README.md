@@ -22,9 +22,9 @@ toward them land next.
   tools.
 - **CLI**: first-class human surface, same code path as the MCP tools:
   `scout grep <pattern> "<intent>"`, `scout find "<question>"`,
-  `scout extract <file> "<question>"`, `scout check "<build cmd>"`,
-  `scout task "<prompt>"`, plus `scout run --preset ...` for hooks and
-  `scout stats`.
+  `scout edit "<question>"`, `scout extract <file> "<question>"`,
+  `scout check "<build cmd>"`, `scout task "<prompt>"`, plus
+  `scout run --preset ...` for hooks and `scout stats`.
 
 `find` is the intent-only end of the search spectrum: state what you
 want and the local model guesses the patterns, scout runs every guess
@@ -32,6 +32,17 @@ itself and reranks the union against your question. It is CLI-only for
 now and needs a configured model; `grep` covers pattern-only and
 pattern-plus-intent, and degrades to a plain search with no model at
 all.
+
+`edit` fronts both pipelines and ends in `$EDITOR`, choosing which one
+by how many arguments you give it: `scout edit "<question>"` runs
+`find`, `scout edit <pattern> "<intent>"` runs the reranked `grep`, and
+`scout edit -p <pattern>` runs a plain search. A single hit opens
+straight away, positioned at the match; several are listed with numbers
+and a `[1-n, a=all, q=quit]` prompt. `a` opens every file at once — or,
+for the vi family, a real quickfix list (`vim -q`) so `:cn` walks the
+hits. Positioning follows the editor: vi/vim/nvim, emacs/emacsclient,
+helix, VS Code and its forks, and zed are known by name; anything else
+is opened plainly with the line number printed first.
 
 Search is self-contained: gitignore-aware walking and matching come
 from ripgrep's libraries, so there is no dependency on an installed
