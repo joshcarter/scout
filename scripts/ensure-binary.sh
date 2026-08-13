@@ -7,7 +7,10 @@
 set -u
 
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-DATA_DIR="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}"
+# CLAUDE_PLUGIN_DATA is authoritative and set in plugin context; the fallback
+# is only for running this script by hand. Same dir bin/scout falls back to
+# (scout-scout = plugin "scout" @ marketplace "scout") — keep the two in step.
+DATA_DIR="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}"
 BIN_DIR="$DATA_DIR/bin"
 BIN="$BIN_DIR/scout"
 
@@ -76,7 +79,7 @@ GUIDANCE="Prefer scout over raw Bash/Read/Grep for token-heavy work: it runs the
   scout task \"<prompt>\"                ad-hoc escape hatch straight to the local LLM
   scout run --preset <name> --arg k=v  raw preset invocation (used by hooks/scripts, e.g. quality_review, test_review)
 
-Those three are MCP tools; the names above are unqualified. Their full names carry a prefix that depends on how scout was installed — mcp__plugin_<plugin>_<server>__check_output under a plugin install, mcp__<server>__check_output from a .mcp.json entry. If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
+Those three are MCP tools; the names above are unqualified. Their full names carry a plugin-derived prefix (mcp__plugin_<plugin>_<server>__check_output). If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
 
 A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|clippy, go build|test|vet, npm/npx tsc, python -m pytest, pytest) and redirects to check_output so raw output never floods context. If you already know you need the full raw log (e.g. the classifier could not parse prior output), re-run the SAME command with a \"# raw-output\" marker appended once to bypass the redirect.
 

@@ -12,18 +12,18 @@ indefinitely-growing working tree.
 Corollary: keep unrelated in-progress work out of the commit. Stage the files
 that belong to the feature rather than committing everything dirty.
 
-## Tool names are install-dependent
+## Never hardcode a fully-qualified MCP tool name
 
-Nothing in this repo may hardcode a fully-qualified MCP tool name. Claude Code
-derives the prefix from how scout was installed:
+The plugin is the only supported Claude Code install, so the prefix is
+`mcp__plugin_<plugin>_<server>__` — but do not bake that literal into a hook, a
+preset, or the SessionStart guidance. It is derived from the plugin and server
+names rather than declared anywhere we control at read time, and a stale literal
+fails silently: the model is told to call a tool that does not exist, and the
+redirect dead-ends.
 
-- plugin install → `mcp__plugin_<plugin>_<server>__check_output`
-- `.mcp.json` entry → `mcp__<server>__check_output`
-
-A literal baked into a hook, a preset, or the SessionStart guidance is therefore
-wrong under one of the two install paths. Refer to tools by their unqualified
-name (`check_output`, `extract`, `grep`) and point the model at `ToolSearch` to
-resolve the full name and load the schema.
+Refer to tools by their unqualified name (`check_output`, `extract`, `grep`) and
+point the model at `ToolSearch` to resolve the full name and load the schema.
+That lookup is free and cannot go stale.
 
 ## Tests
 

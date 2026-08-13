@@ -2,17 +2,15 @@
 # PATH shim: the plugin's bin/ dir is added to the Bash tool's PATH, so
 # scripts (e.g. claude-review's horde) can call `scout` without knowing
 # where the real binary lives. In plugin context CLAUDE_PLUGIN_DATA is
-# authoritative; outside it, try the marketplace-install data dir
-# (scout-scout = plugin "scout" @ marketplace "scout"), then the legacy
-# bare-name dir. No PATH fallback here — this shim may itself be the
-# `scout` on PATH, and that way lies recursion.
+# authoritative; outside it, fall back to the marketplace-install data dir
+# (scout-scout = plugin "scout" @ marketplace "scout"), which is also what
+# scripts/ensure-binary.sh falls back to. No PATH fallback here — this shim
+# may itself be the `scout` on PATH, and that way lies recursion.
 if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
   exec "$CLAUDE_PLUGIN_DATA/bin/scout" "$@"
 fi
-for dir in "$HOME/.claude/plugins/data/scout-scout" "$HOME/.claude/plugins/data/scout"; do
-  if [ -x "$dir/bin/scout" ]; then
-    exec "$dir/bin/scout" "$@"
-  fi
-done
+if [ -x "$HOME/.claude/plugins/data/scout-scout/bin/scout" ]; then
+  exec "$HOME/.claude/plugins/data/scout-scout/bin/scout" "$@"
+fi
 echo "scout shim: no installed binary found (is the scout plugin installed?)" >&2
 exit 127

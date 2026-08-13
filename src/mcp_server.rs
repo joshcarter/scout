@@ -3,9 +3,9 @@
 // Four tools: `ping` (wiring check), plus the three that do the work —
 // `check_output`, `extract`, `grep`.  Short names on purpose: Claude Code
 // prefixes them with the server namespace on its own, so what the model sees is
-// `mcp__<server>__check_output` from a .mcp.json entry, or
-// `mcp__plugin_<plugin>_<server>__check_output` under a plugin install.  Nothing
-// on this side should hardcode either form (PLAN §3).
+// `mcp__plugin_<plugin>_<server>__check_output`.  Nothing on this side should
+// hardcode that qualified form (PLAN §3) — it is derived from names this code
+// never reads, and the model resolves it via `ToolSearch` anyway.
 //
 // `ServerHandler` is implemented by hand rather than via `#[tool_router]` /
 // `#[tool_handler]`: the three real tools advertise the `description` and

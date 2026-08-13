@@ -35,10 +35,11 @@ AUDIT_LOG="${HOME}/.claude/scout-shell-safety.jsonl"
 LLM_TIMEOUT_SECS=5
 
 # The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and .mcp.json use. Standalone installs
-# (make install, hooks registered in settings.json rather than plugin mode)
-# have no plugin-data dir — fall back to scout on PATH.
-SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout"
+# Same resolution order that script and bin/scout use. The PATH fallback is
+# load-bearing even though the plugin is the only Claude Code install: it covers
+# a CLI install (make install) and any context where CLAUDE_PLUGIN_DATA is not
+# exported — running this hook by hand, or from a test harness.
+SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 
 # Wrapper: use timeout/gtimeout if available, otherwise run bare (the LLM

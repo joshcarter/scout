@@ -1,18 +1,19 @@
 # scout — build and install.
 #
-# Two install paths, sharing one config ($XDG_CONFIG_HOME/scout/):
+# Two surfaces, one shared config ($XDG_CONFIG_HOME/scout/):
 #
-#   Plugin (recommended): in Claude Code, run
+#   Claude Code: the plugin, and only the plugin. In Claude Code, run
 #       /plugin marketplace add joshcarter/scout
 #       /plugin install scout@scout
-#   scripts/ensure-binary.sh then installs the binary into
+#   That brings the MCP server, the hooks, and binary bootstrap in one
+#   piece — scripts/ensure-binary.sh installs the binary into
 #   $CLAUDE_PLUGIN_DATA on SessionStart and seeds the default config.
-#   Add the CLI on top with `make install-cli` (binary + config only —
-#   no MCP registration; the plugin already provides the server).
+#   Nothing here registers an MCP server; there is no `make` path into
+#   Claude Code.
 #
-#   Standalone (`make install`, no plugin): binary on PATH, config,
-#   plus MCP server registered with Claude Code at user scope. Do not
-#   combine with the plugin or the server registers twice.
+#   Terminal: `make install` puts the binary on $PREFIX/bin and seeds
+#   the same config. Independent of the plugin — run both, or either.
+#   (Other MCP clients: point them at `scout mcp` yourself.)
 
 PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
@@ -26,11 +27,8 @@ CONFIG_DIR := $(XDG_CONFIG_HOME)/scout
 CONFIG     := $(CONFIG_DIR)/config.toml
 CONFIG_SRC := config.example.toml
 
-MCP_NAME  := scout
-MCP_SCOPE := user
-
 .DEFAULT_GOAL := help
-.PHONY: help build test install install-cli install-bin install-config register-mcp uninstall
+.PHONY: help build test install install-bin install-config uninstall
 
 help: ## Print available targets
 	@echo 'scout — make targets:'
@@ -47,19 +45,15 @@ build: ## Build the release binary
 test: ## Run the test suite
 	cargo test
 
-install-cli: install-bin install-config ## Binary + config only — CLI alongside the plugin (no MCP registration)
+install: install-bin install-config ## Install the CLI: binary to $PREFIX/bin, config if missing
 	@echo
-	@echo 'scout CLI installed. (MCP server + hooks come from the plugin.)'
-
-install: install-bin install-config register-mcp ## Standalone: binary + config + user-scope MCP server (skip if using the plugin)
-	@echo
-	@echo 'scout installed.'
+	@echo 'scout CLI installed.'
 	@case ":$$PATH:" in \
 	  *":$(BINDIR):"*) ;; \
 	  *) echo "  note: $(BINDIR) is not on your PATH — add it to use \`scout\` directly" ;; \
 	esac
-	@echo '  note: Claude Code picks up the MCP server on the next session,'
-	@echo '        not in any session already running.'
+	@echo '  note: in Claude Code, install the plugin — it carries the MCP'
+	@echo '        server and hooks, which this does not.'
 
 install-bin: build ## Install the binary to $PREFIX/bin
 	@mkdir -p $(BINDIR)
@@ -76,26 +70,8 @@ install-config: ## Install the default config, never overwriting an existing one
 	  echo '  edit [llm].endpoint and [llm].model to match your local LLM host'; \
 	fi
 
-# `claude mcp add` writes to config files directly, so no session is
-# needed. Remove-then-add keeps this idempotent: plain `add` fails when
-# the name is already registered.
-register-mcp: ## Register the MCP server with Claude Code (user scope)
-	@if ! command -v claude >/dev/null 2>&1; then \
-	  echo 'claude CLI not found — register scout yourself with:'; \
-	  echo '    claude mcp add $(MCP_NAME) -s $(MCP_SCOPE) -- $(BIN) mcp'; \
-	elif claude mcp remove $(MCP_NAME) -s $(MCP_SCOPE) >/dev/null 2>&1 || true && \
-	     claude mcp add $(MCP_NAME) -s $(MCP_SCOPE) -- $(BIN) mcp >/dev/null 2>&1; then \
-	  echo 'registered MCP server: $(MCP_NAME) ($(MCP_SCOPE) scope) -> $(BIN) mcp'; \
-	else \
-	  echo 'could not register the MCP server — do it yourself with:'; \
-	  echo '    claude mcp add $(MCP_NAME) -s $(MCP_SCOPE) -- $(BIN) mcp'; \
-	fi
-
-uninstall: ## Remove the installed binary and MCP registration (keeps your config)
+uninstall: ## Remove the installed CLI binary (keeps your config)
 	@rm -f $(BIN) && echo 'removed binary: $(BIN)'
-	@if command -v claude >/dev/null 2>&1; then \
-	  claude mcp remove $(MCP_NAME) -s $(MCP_SCOPE) >/dev/null 2>&1 \
-	    && echo 'unregistered MCP server: $(MCP_NAME)' \
-	    || echo 'no $(MCP_SCOPE)-scope MCP registration to remove'; \
-	fi
 	@echo 'left in place: $(CONFIG)'
+	@echo '  note: the plugin manages its own binary copy — remove it with'
+	@echo '        /plugin uninstall scout@scout in Claude Code.'

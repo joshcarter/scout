@@ -5,10 +5,10 @@
 # Emits a deny when the Bash command matches a known build/test verb, carrying a
 # permissionDecisionReason that names the check_output tool and its call
 # pattern. The reason deliberately does NOT hardcode a fully-qualified tool
-# name: the prefix depends on the install method (mcp__plugin_<plugin>_<server>__
-# under a plugin, mcp__<server>__ from a .mcp.json entry), so a literal name is
-# wrong half the time. It names the unqualified tool and points at ToolSearch to
-# resolve it. Deny (not advisory allow) because raw build output flooding the
+# name: the prefix (mcp__plugin_<plugin>_<server>__) is derived from the plugin
+# and server names rather than declared where this hook can read it, and a stale
+# literal would deny into a dead end. It names the unqualified tool and points at
+# ToolSearch to resolve it. Deny (not advisory allow) because raw build output flooding the
 # conversation context is the failure mode to prevent, not merely a suboptimal
 # choice. NOTE: the redirect text MUST ride in permissionDecisionReason — Claude
 # Code silently drops a field named "reason", leaving only a bare "denied".
@@ -83,10 +83,11 @@ set -euo pipefail
 INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 
 # The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and .mcp.json use. Standalone installs
-# (make install, hooks registered in settings.json rather than plugin mode)
-# have no plugin-data dir — fall back to scout on PATH.
-SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout}/bin/scout"
+# Same resolution order that script and bin/scout use. The PATH fallback is
+# load-bearing even though the plugin is the only Claude Code install: it covers
+# a CLI install (make install) and any context where CLAUDE_PLUGIN_DATA is not
+# exported — running this hook by hand, or from a test harness.
+SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 SUBPROCESS_TIMEOUT_SECS=6
 
@@ -199,6 +200,6 @@ jq -n --arg cmd "$COMMAND" '{
   hookSpecificOutput: {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",
-    permissionDecisionReason: ("Build/test output floods conversation context. Use the scout check_output MCP tool instead, with:\n\n  command=\"" + $cmd + "\"\n\nIts fully-qualified name depends on how scout was installed — mcp__plugin_<plugin>_<server>__check_output under a plugin install, mcp__<server>__check_output from a .mcp.json entry. If it is not already in your loaded toolset, run ToolSearch for \"check_output\" to resolve the name and load its schema, then call it.\n\nReturns: {ok: bool, summary: string, first_error: {...}|null, suggested_next_step: string}\n\nNeed the full raw log — e.g. ok=false AND first_error=null (the classifier could not parse the output), or detail it dropped? Re-run the SAME command with a \"# raw-output\" marker appended to bypass this redirect:\n\n  " + $cmd + " # raw-output")
+    permissionDecisionReason: ("Build/test output floods conversation context. Use the scout check_output MCP tool instead, with:\n\n  command=\"" + $cmd + "\"\n\nIts fully-qualified name carries a plugin-derived prefix (mcp__plugin_<plugin>_<server>__check_output). If it is not already in your loaded toolset, run ToolSearch for \"check_output\" to resolve the name and load its schema, then call it.\n\nReturns: {ok: bool, summary: string, first_error: {...}|null, suggested_next_step: string}\n\nNeed the full raw log — e.g. ok=false AND first_error=null (the classifier could not parse the output), or detail it dropped? Re-run the SAME command with a \"# raw-output\" marker appended to bypass this redirect:\n\n  " + $cmd + " # raw-output")
   }
 }'

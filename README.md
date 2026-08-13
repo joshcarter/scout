@@ -9,8 +9,8 @@ context.
 
 **Status: in progress.** Extraction from [ct] is underway — see
 `PLAN.md`. The MCP server exposes `check_output`, `extract` and `grep`
-(plus `ping` for wiring checks); the hooks that steer Claude Code
-toward them land next.
+(plus `ping` for wiring checks), and the PreToolUse hooks that steer
+Claude Code toward them are in place.
 
 ## Shape
 
@@ -18,8 +18,8 @@ toward them land next.
   `scout` crate name is an unrelated fuzzy finder).
 - **Claude Code plugin**: `.claude-plugin/plugin.json`, an MCP stdio
   server (`scout mcp`), SessionStart bootstrap + guidance injection,
-  and (coming) PreToolUse hooks that steer the agent toward the local
-  tools.
+  and PreToolUse hooks that steer the agent toward the local tools.
+  This is the only supported way into Claude Code.
 - **CLI**: first-class human surface, same code path as the MCP tools:
   `scout grep <pattern> "<intent>"`, `scout find "<question>"`,
   `scout edit "<question>"`, `scout extract <file> "<question>"`,
@@ -60,8 +60,8 @@ and `[find]`.
 
 ## Install
 
-**As a Claude Code plugin** (recommended — hooks, MCP server, and
-binary bootstrap in one step):
+**As a Claude Code plugin** — the one way in, carrying hooks, MCP
+server, and binary bootstrap together:
 
 ```
 /plugin marketplace add joshcarter/scout
@@ -76,18 +76,19 @@ your local LLM host.
 **The CLI** (use scout from a terminal, like a smarter `ack`):
 
 ```sh
-make install-cli    # binary to ~/.local/bin, config if missing
+make install    # binary to ~/.local/bin, config if missing
 ```
 
-Plugin and CLI share everything that matters: config and presets live
-in `${XDG_CONFIG_HOME:-~/.config}/scout/` (`config.toml`, `presets/`),
-and both surfaces run the same code path. Only the binary is
-duplicated (the plugin manages its own copy in `CLAUDE_PLUGIN_DATA` so
-it can keep it current without touching your PATH).
+Plugin and CLI are independent — install either, or both. They share
+everything that matters: config and presets live in
+`${XDG_CONFIG_HOME:-~/.config}/scout/` (`config.toml`, `presets/`), and
+both surfaces run the same code path. Only the binary is duplicated
+(the plugin manages its own copy in `CLAUDE_PLUGIN_DATA` so it can keep
+it current without touching your PATH).
 
-**Standalone** (no plugin — e.g. for other MCP clients): `make install`
-additionally registers the MCP server with Claude Code at user scope.
-Don't combine it with the plugin, or the server registers twice.
+**Other MCP clients**: the binary is a stdio MCP server — run
+`scout mcp` and point your client at it. There's no install wrapper for
+this; in Claude Code, use the plugin.
 
 ## Development
 
@@ -101,8 +102,9 @@ into `${CLAUDE_PLUGIN_DATA}/bin/scout`, preferring a local
 `target/release/scout` in a dev checkout, falling back to
 `cargo install scout-llm`. The MCP server declaration in
 `.claude-plugin/plugin.json` and the `bin/scout` PATH shim both point
-at that installed copy. (Repo-root `.mcp.json` is dev tooling for this
-checkout, not part of the plugin.) Note: in a brand-new install the MCP
+at that installed copy. (Repo-root `.mcp.json` is unrelated — it holds
+a `ct` entry for working on this checkout, nothing of scout's.) Note:
+in a brand-new install the MCP
 server may fail to start on the very first session (the bootstrap hook
 hasn't run yet); it comes up on the next session.
 

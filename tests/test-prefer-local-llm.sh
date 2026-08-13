@@ -151,10 +151,10 @@ last_log_reason() {
 
 # ── Tests: intercepted verbs → deny whose permissionDecisionReason names check_output ─
 #
-# Asserts the UNQUALIFIED tool name: the fully-qualified name carries an
-# install-dependent prefix (mcp__plugin_<plugin>_<server>__ under a plugin,
-# mcp__<server>__ from .mcp.json), so pinning a literal here would pin the
-# hook to one install method.
+# Asserts the UNQUALIFIED tool name: the fully-qualified name carries a
+# plugin-derived prefix (mcp__plugin_<plugin>_<server>__) that neither the hook
+# nor this test can read at run time, so pinning a literal here would pin both
+# to a name that can drift out from under them.
 
 for cmd in \
   "cargo build" \
