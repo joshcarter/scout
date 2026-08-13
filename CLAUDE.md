@@ -25,6 +25,24 @@ Refer to tools by their unqualified name (`check_output`, `extract`, `grep`) and
 point the model at `ToolSearch` to resolve the full name and load the schema.
 That lookup is free and cannot go stale.
 
+## What a session actually picks up after you edit
+
+Installed from a **directory** marketplace (`extraKnownMarketplaces` → `source:
+directory`, path = this repo), `CLAUDE_PLUGIN_ROOT` resolves to the working tree
+itself. So hooks, `scripts/`, and `presets/` are read live from the checkout —
+edit, restart the session, done. There is a snapshot under
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, but it is not what
+runs; `installed_plugins.json`'s `installPath` points there and is misleading.
+
+The **binary** is the exception: it is a copy in `$CLAUDE_PLUGIN_DATA/bin`, so
+`cargo build --release` has to be followed by a restart for
+`scripts/ensure-binary.sh` to re-copy it. That refresh is mtime-driven — see the
+comment there for why a version compare alone silently keeps a stale binary.
+
+To confirm which copy ran, `claude --debug-file <path> -p hi` then grep for
+`ensure-binary`; the char count of the reported `additionalContext` distinguishes
+repo from snapshot when they differ.
+
 ## Tests
 
 `make test` runs `cargo test` only — the shell suites are not wired into it, so

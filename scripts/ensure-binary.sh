@@ -20,26 +20,48 @@ plugin_version() {
 }
 
 WANT="$(plugin_version)"
+LOCAL_BUILD="$PLUGIN_ROOT/target/release/scout"
 HAVE=""
 if [ -x "$BIN" ]; then
   HAVE="$("$BIN" --version 2>/dev/null | awk '{print $2}')"
 fi
 
+# Why an mtime check and not a version compare alone: in a dev checkout the
+# plugin version and the built binary sit at the same in-progress version
+# across many rebuilds, so a version-only gate never fires and the session
+# silently keeps running a stale binary. Comparing against the local build's
+# mtime is what makes `cargo build --release` land on the next session.
+#
+# `-nt` is fine under POSIX sh (dash, busybox ash, and macOS's bash 3.2 all
+# have it), and false when LOCAL_BUILD is absent — a released install with no
+# checkout simply never takes this branch.
+#
+# No churn: `cp` below stamps the copy with the current time, so the copy is
+# newer than its source and this will not fire again until the next rebuild.
+REASON=""
+if [ -z "$HAVE" ]; then
+  REASON="first install"
+elif [ "$HAVE" != "$WANT" ]; then
+  REASON="binary $HAVE, plugin wants $WANT"
+elif [ -x "$LOCAL_BUILD" ] && [ "$LOCAL_BUILD" -nt "$BIN" ]; then
+  REASON="rebuilt since last install"
+fi
+
 STATUS="ok ($HAVE)"
-if [ -z "$HAVE" ] || [ "$HAVE" != "$WANT" ]; then
+if [ -n "$REASON" ]; then
   mkdir -p "$BIN_DIR"
-  if [ -x "$PLUGIN_ROOT/target/release/scout" ]; then
+  if [ -x "$LOCAL_BUILD" ]; then
     # Dev checkout: use the locally built binary.
-    if cp "$PLUGIN_ROOT/target/release/scout" "$BIN"; then
-      STATUS="installed from local build"
+    if cp "$LOCAL_BUILD" "$BIN"; then
+      STATUS="installed from local build ($REASON)"
     else
-      STATUS="error: copy from local build failed"
+      STATUS="error: copy from local build failed ($REASON)"
     fi
   elif command -v cargo >/dev/null 2>&1; then
     # TODO: prefer prebuilt GitHub release binaries once releases exist;
     # cargo install is the fallback (crate is scout-llm, binary is scout).
     if cargo install scout-llm --quiet --root "$DATA_DIR" >/dev/null 2>&1; then
-      STATUS="installed via cargo install scout-llm"
+      STATUS="installed via cargo install scout-llm ($REASON)"
     else
       STATUS="missing: no local build and cargo install scout-llm failed"
     fi
