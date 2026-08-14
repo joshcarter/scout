@@ -1019,6 +1019,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "rmcp",
  "serde",
  "serde_json",

@@ -2,6 +2,7 @@ mod check_output;
 mod classify_command;
 mod client;
 mod config;
+mod dashboard;
 mod edit;
 mod extract;
 mod filter_config;
@@ -189,6 +190,12 @@ enum Command {
     ClassifyCommand,
     /// Print the call log report (presets/tasks run so far).
     Stats,
+    /// Serve the local web view of the call log on 127.0.0.1:13001.
+    ///
+    /// Starts a detached daemon and prints the URL. Idempotent: if one is
+    /// already up it prints that URL and exits 0, which is what makes it safe
+    /// to call from a shell profile.
+    Dashboard(dashboard::Args),
 }
 
 /// The flags every search verb shares: what to search (SPEC-cli §3) and how to
@@ -343,6 +350,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Command::ClassifyCommand => classify_command::run_subcommand(),
         Command::Stats => stats::print_report(),
+        Command::Dashboard(args) => dashboard::run(args),
     }
 }
 

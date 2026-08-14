@@ -39,6 +39,9 @@
 // degenerate_hit_cap = 300
 // tree_max_bytes     = 8192
 // reflect            = true
+//
+// [dashboard]                # `scout dashboard` only
+// port = 13001
 // ```
 //
 // Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
@@ -176,6 +179,24 @@ impl Default for FindConfig {
     }
 }
 
+/// Tunables for `scout dashboard` (SPEC-dashboard §5).
+///
+/// Only the port, deliberately.  The bind *address* is 127.0.0.1 and is not
+/// configurable at all — ct has `CT_WEB_BIND`, but scout's payloads carry file
+/// contents from every repo the user works in, so there is no other address
+/// worth supporting and no knob to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardConfig {
+    /// Alongside ct's 13000.
+    pub port: u16,
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        DashboardConfig { port: 13001 }
+    }
+}
+
 /// Load both filter configs, applying any overrides found in scout's config
 /// file.  Any read/parse problem silently yields defaults.
 pub fn load() -> (ExtractConfig, GrepConfig) {
@@ -200,6 +221,15 @@ pub fn load_find() -> FindConfig {
     match read_config() {
         Some(text) => parse_find_overrides(&text),
         None => FindConfig::default(),
+    }
+}
+
+/// Load the `[dashboard]` table.  Separate from `load` for the same reason
+/// `load_cli` is.
+pub fn load_dashboard() -> DashboardConfig {
+    match read_config() {
+        Some(text) => parse_dashboard_overrides(&text),
+        None => DashboardConfig::default(),
     }
 }
 
@@ -260,6 +290,25 @@ pub fn parse_find_overrides(toml_text: &str) -> FindConfig {
         find.reflect = v;
     }
     find
+}
+
+/// Parse `[dashboard]` overrides out of a scout config file body.
+///
+/// A port outside 1..=65535 keeps the default rather than wrapping: `port = 0`
+/// would ask the OS for a random one, which a daemon on a well-known port that
+/// clients probe by number cannot use.
+pub fn parse_dashboard_overrides(toml_text: &str) -> DashboardConfig {
+    let mut dash = DashboardConfig::default();
+    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
+        return dash;
+    };
+    let Some(t) = root.get("dashboard") else { return dash };
+    if let Some(v) = t.get("port").and_then(toml::Value::as_integer) {
+        if (1..=65535).contains(&v) {
+            dash.port = v as u16;
+        }
+    }
+    dash
 }
 
 /// Parse `[extract]` / `[grep]` overrides out of a scout config file body.
@@ -480,6 +529,27 @@ context_lines = 4
     }
 
     #[test]
+    fn dashboard_defaults_and_overrides() {
+        assert_eq!(DashboardConfig::default().port, 13001, "alongside ct's 13000");
+        assert_eq!(parse_dashboard_overrides("[dashboard]\nport = 8080\n").port, 8080);
+    }
+
+    #[test]
+    fn dashboard_junk_ports_keep_the_default() {
+        // 0 would mean "any free port", which nothing could then probe for.
+        for text in [
+            "[dashboard]\nport = 0\n",
+            "[dashboard]\nport = -1\n",
+            "[dashboard]\nport = 70000\n",
+            "[dashboard]\nport = \"13001\"\n",
+            "not = = toml",
+            "",
+        ] {
+            assert_eq!(parse_dashboard_overrides(text), DashboardConfig::default(), "{text:?}");
+        }
+    }
+
+    #[test]
     fn llm_only_config_yields_defaults() {
         // The common case: a config file that configures the endpoint and
         // nothing else must not disturb the filter tunables.
@@ -489,5 +559,6 @@ context_lines = 4
         assert_eq!(g, GrepConfig::default());
         assert_eq!(parse_cli_overrides(text), CliConfig::default());
         assert_eq!(parse_find_overrides(text), FindConfig::default());
+        assert_eq!(parse_dashboard_overrides(text), DashboardConfig::default());
     }
 }

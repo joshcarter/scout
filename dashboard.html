@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>scout Dashboard</title>
+<style>
+  /* Deliberately ct's palette, type and density (SPEC-dashboard §4): the two
+     dashboards are read by the same person minutes apart, and the muscle
+     memory transferring is the point. */
+  :root {
+    --bg: #1a1b26; --bg2: #24283b; --bg3: #292e42;
+    --fg: #c0caf5; --fg2: #a9b1d6; --dim: #565f89;
+    --green: #9ece6a; --red: #f7768e; --blue: #7aa2f7;
+    --yellow: #e0af68; --cyan: #7dcfff; --orange: #ff9e64;
+    --purple: #bb9af7; --border: #3b4261;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+    background: var(--bg); color: var(--fg);
+    font-size: 13px; line-height: 1.5;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 10px 20px; background: var(--bg2); border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  header h1 span { color: var(--blue); }
+  .header-right {
+    display: flex; gap: 18px; align-items: center; color: var(--dim); font-size: 12px;
+    flex-wrap: wrap; justify-content: flex-end;
+  }
+  .endpoint { color: var(--fg2); }
+  .endpoint b { color: var(--cyan); font-weight: 500; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--dim); }
+  .dot.ok { background: var(--green); }
+  .dot.err { background: var(--red); }
+
+  main {
+    flex: 1 1 auto; min-height: 0;
+    display: grid; grid-template-columns: 300px minmax(0, 1fr) 420px;
+  }
+  .col { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
+  .col:last-child { border-right: none; }
+  .pane { display: flex; flex-direction: column; min-height: 0; }
+  .pane-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 7px 14px; background: var(--bg2); border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  .pane-head h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+    font-weight: 600; white-space: nowrap;
+  }
+  .pane-body { overflow: auto; padding: 10px 14px; }
+
+  .stat-row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+  .stat-label { color: var(--fg2); white-space: nowrap; }
+  .stat-value { color: var(--cyan); font-weight: 500; text-align: right; }
+  .stat-sub { color: var(--dim); font-size: 11px; text-align: right; padding-bottom: 4px; }
+  .headline {
+    border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px;
+    margin: 4px 0 10px; background: var(--bg2);
+  }
+  .headline .k { font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+  .headline .v { font-size: 15px; color: var(--green); font-weight: 600; margin-top: 2px; }
+  .headline .n { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .rule { border-top: 1px solid var(--bg3); margin: 8px 0; }
+  .warn { color: var(--orange); }
+
+  .fail-row {
+    display: flex; justify-content: space-between; gap: 8px; padding: 2px 4px;
+    margin: 0 -4px; border-radius: 3px; cursor: pointer;
+  }
+  .fail-row:hover { background: var(--bg3); }
+  .fail-kind { color: var(--red); }
+  .fail-count { color: var(--fg2); }
+
+  .filter-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .filter-bar select, .filter-bar input[type=text] {
+    background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+    padding: 2px 6px; border-radius: 3px; font-family: inherit; font-size: 11px;
+    max-width: 150px;
+  }
+  .toggle {
+    background: var(--bg3); color: var(--dim); border: 1px solid var(--border);
+    padding: 2px 8px; border-radius: 3px; font-family: inherit; font-size: 11px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .toggle:hover { color: var(--fg); border-color: var(--dim); }
+  .toggle.on { color: var(--bg); background: var(--blue); border-color: var(--blue); font-weight: 600; }
+
+  .history-list { flex: 1 1 auto; overflow-y: auto; }
+  .hrow {
+    display: flex; align-items: baseline; gap: 8px; padding: 3px 14px;
+    border-bottom: 1px solid var(--bg3); cursor: pointer; font-size: 12px;
+    white-space: nowrap;
+  }
+  .hrow:hover { background: var(--bg3); }
+  .hrow.selected { background: var(--bg3); box-shadow: inset 2px 0 0 var(--blue); }
+  .hrow.sub { padding-left: 46px; background: rgba(0,0,0,0.18); font-size: 11px; }
+  .h-check { flex: 0 0 auto; display: flex; align-items: center; }
+  .h-check input[type=checkbox] {
+    appearance: none; -webkit-appearance: none;
+    width: 13px; height: 13px; border: 1px solid var(--border); border-radius: 2px;
+    background: var(--bg); cursor: pointer; position: relative;
+  }
+  .h-check input[type=checkbox]:checked { background: var(--blue); border-color: var(--blue); }
+  .h-check input[type=checkbox]:checked::after {
+    content: '\2713'; position: absolute; top: -2px; left: 1px; font-size: 11px;
+    color: #fff; font-weight: 700;
+  }
+  .h-time { color: var(--dim); flex: 0 0 62px; }
+  .h-via {
+    flex: 0 0 38px; font-size: 10px; text-transform: uppercase; letter-spacing: .5px;
+    text-align: center; border-radius: 2px; padding: 0 3px; color: var(--bg); font-weight: 700;
+  }
+  .via-mcp { background: var(--blue); }
+  .via-cli { background: var(--cyan); }
+  .via-hook { background: var(--orange); }
+  .via-run { background: var(--yellow); }
+  .via-none { background: var(--bg3); color: var(--dim); }
+  .h-tool { color: var(--yellow); flex: 0 0 100px; overflow: hidden; text-overflow: ellipsis; }
+  .h-more { color: var(--purple); flex: 0 0 auto; font-size: 11px; }
+  .h-proj { color: var(--purple); flex: 0 0 auto; font-size: 11px; opacity: .8; }
+  .h-input { color: var(--fg2); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; min-width: 40px; }
+  .h-outcome { flex: 0 0 auto; max-width: 210px; overflow: hidden; text-overflow: ellipsis; }
+  .h-ms { color: var(--green); flex: 0 0 62px; text-align: right; }
+  .h-tok { color: var(--dim); flex: 0 0 92px; text-align: right; }
+  .ok { color: var(--green); }
+  .err { color: var(--red); }
+  .muted { color: var(--dim); }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; cursor: default;
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px;
+    font-size: 11px; color: var(--dim); background: var(--bg3);
+  }
+  .chip.live { color: var(--green); border-color: rgba(158,206,106,.4); }
+  .chip.pinned { color: var(--bg); background: var(--yellow); border-color: var(--yellow); cursor: pointer; font-weight: 600; }
+  .chip.pinned:hover { filter: brightness(1.08); }
+  .chip .hint { font-weight: 400; opacity: .8; }
+
+  .tabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 6px 0 10px; }
+  .tab {
+    background: var(--bg3); border: 1px solid var(--border); border-radius: 3px;
+    color: var(--fg2); font-family: inherit; font-size: 11px; padding: 2px 8px; cursor: pointer;
+  }
+  .tab.on { background: var(--blue); border-color: var(--blue); color: var(--bg); font-weight: 600; }
+  .block { margin-bottom: 12px; }
+  .block-head {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+    margin-bottom: 3px;
+  }
+  .copy {
+    background: none; border: 1px solid var(--border); color: var(--dim);
+    border-radius: 3px; font-family: inherit; font-size: 10px; padding: 0 6px; cursor: pointer;
+  }
+  .copy:hover { color: var(--fg); border-color: var(--dim); }
+  pre.body {
+    white-space: pre-wrap; word-break: break-word; color: var(--fg2);
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+    padding: 6px 8px; font-size: 11.5px; max-height: 320px; overflow: auto;
+  }
+  pre.body.placeholder { color: var(--dim); font-style: italic; }
+  .kv { display: grid; grid-template-columns: 96px minmax(0,1fr); gap: 0 8px; font-size: 11.5px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { color: var(--fg2); overflow-wrap: anywhere; }
+  .no-data { color: var(--dim); padding: 18px 14px; text-align: center; font-style: italic; }
+
+  #copy-selected {
+    position: fixed; bottom: 18px; right: 18px; z-index: 100;
+    background: var(--blue); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 16px; font-family: inherit; font-size: 12px; font-weight: 600;
+    cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.45); display: none;
+  }
+  #copy-selected .n { background: rgba(255,255,255,.25); padding: 1px 6px; border-radius: 3px; margin-left: 6px; }
+  #toast {
+    position: fixed; bottom: 62px; right: 18px; z-index: 101;
+    background: var(--green); color: #000; border-radius: 6px; padding: 6px 14px;
+    font-size: 12px; font-weight: 600; opacity: 0; transition: opacity .3s;
+    pointer-events: none; box-shadow: 0 4px 16px rgba(0,0,0,.45);
+  }
+  @media (max-width: 1100px) {
+    body { height: auto; overflow: auto; }
+    main { grid-template-columns: 1fr; }
+    .col { border-right: none; border-bottom: 1px solid var(--border); }
+    .history-list { max-height: 50vh; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>scout</span> Dashboard</h1>
+  <div class="header-right">
+    <span class="endpoint"><span class="dot" id="llm-dot"></span> <b id="llm-model">--</b> <span id="llm-endpoint" class="muted"></span></span>
+    <span id="llm-note" class="muted"></span>
+    <span id="version" class="muted"></span>
+    <span><span class="dot" id="conn-dot"></span> <span id="uptime">--</span></span>
+  </div>
+</header>
+
+<main>
+  <div class="col">
+    <div class="pane" style="flex:0 0 auto">
+      <div class="pane-head"><h2>Overview</h2><span class="muted" id="ov-span"></span></div>
+      <div class="pane-body" id="overview">
+        <div class="headline">
+          <div class="k">Context saved</div>
+          <div class="v" id="ov-saved">--</div>
+          <div class="n" id="ov-saved-tokens"></div>
+        </div>
+        <div class="stat-row"><span class="stat-label">Calls 1h / 24h</span><span class="stat-value" id="ov-calls">--</span></div>
+        <div class="stat-row"><span class="stat-label">Calls total</span><span class="stat-value" id="ov-total">--</span></div>
+        <div class="stat-row"><span class="stat-label">Operations</span><span class="stat-value" id="ov-ops">--</span></div>
+        <div class="stat-row"><span class="stat-label">Success rate</span><span class="stat-value" id="ov-success">--</span></div>
+        <div class="rule"></div>
+        <div class="stat-row"><span class="stat-label">Tokens in / out</span><span class="stat-value" id="ov-tokens">--</span></div>
+        <div class="stat-row"><span class="stat-label">Latency p50 / p95</span><span class="stat-value" id="ov-latency">--</span></div>
+        <div class="stat-row"><span class="stat-label">Bypassed</span><span class="stat-value" id="ov-bypassed">--</span></div>
+        <div class="rule"></div>
+        <div class="stat-row"><span class="stat-label">Log size</span><span class="stat-value" id="ov-log">--</span></div>
+        <div class="stat-sub" id="ov-log-hint"></div>
+      </div>
+    </div>
+    <div class="pane" style="flex:1 1 auto">
+      <div class="pane-head"><h2>Failures</h2><span class="muted" id="fail-total"></span></div>
+      <div class="pane-body" id="failures"><div class="no-data">none</div></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="pane" style="flex:1 1 auto">
+      <div class="pane-head">
+        <h2>Command history</h2>
+        <div class="filter-bar">
+          <button class="toggle" id="f-hooks" title="shell_safety fires on every Bash tool call and dominates by volume">hook traffic</button>
+          <button class="toggle" id="f-failed">failures only</button>
+          <select id="f-tool"><option value="">all tools</option></select>
+          <select id="f-via"><option value="">all via</option></select>
+          <select id="f-project"><option value="">all projects</option></select>
+          <button class="toggle" id="f-selmode" title="Select rows to copy">select</button>
+        </div>
+      </div>
+      <div class="history-list" id="history"><div class="no-data">waiting for the first poll…</div></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="pane" style="flex:1 1 auto">
+      <div class="pane-head">
+        <h2>Detail</h2>
+        <span id="chip" class="chip live">&#9679; Live</span>
+      </div>
+      <div class="pane-body" id="detail"><div class="no-data">no calls yet</div></div>
+    </div>
+  </div>
+</main>
+
+<button id="copy-selected">Copy selected <span class="n" id="copy-n">0</span></button>
+<div id="toast">Copied</div>
+
+<script>
+(function () {
+  'use strict';
+  const $ = id => document.getElementById(id);
+
+  // ── State ────────────────────────────────────────────────────────────
+  const ops = [];                 // oldest → newest
+  const byId = new Map();         // op id → op
+  let cursor = '';                // opaque server cursor (a row id)
+  let pinnedId = null;            // null ⇒ Live
+  let missedWhilePinned = 0;
+  let renderedDetailId = null;    // what the detail pane currently shows
+  let renderedRound = 0;
+  let historySig = '';            // re-render guard for the history list
+  let backfilled = false;         // the first page has landed
+  const expanded = new Set();     // op ids whose rounds are shown
+  const checked = new Set();      // op ids ticked for copy
+  let selectMode = false;
+
+  const filters = {
+    // shell_safety fires on every Bash tool call and will dominate by
+    // volume, so the view opens on what Claude deliberately did.
+    hooks: false, failed: false, tool: '', via: '', project: '',
+  };
+
+  // ── Formatting ───────────────────────────────────────────────────────
+  // Escapes quotes as well as markup: half of these values are interpolated
+  // into attributes (`title=`, `data-id=`), and a log record carries arbitrary
+  // shell commands and file contents.
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    const d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML.replace(/'/g, '&#x27;').replace(/"/g, '&quot;');
+  }
+  function fmtBytes(n) {
+    n = n || 0;
+    if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + ' GB';
+    if (n >= 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB';
+    if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+    return n + ' B';
+  }
+  function fmtMs(ms) {
+    if (!ms) return '\u2014';
+    if (ms >= 10000) return (ms / 1000).toFixed(0) + 's';
+    if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+    return ms + 'ms';
+  }
+  function fmtTok(n) {
+    if (!n) return '0';
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+  function fmtTime(ts) {
+    if (!ts) return '--:--:--';
+    return new Date(ts * 1000).toLocaleTimeString('en-GB', { hour12: false });
+  }
+  function fmtDate(ts) {
+    return ts ? new Date(ts * 1000).toLocaleString() : '\u2014';
+  }
+  // A rough token estimate: ~4 characters per token. Stated as an estimate in
+  // the label because it is one — nothing here counts the real tokenizer.
+  function estTokens(bytes) {
+    const t = Math.round((bytes || 0) / 4);
+    return t >= 1e6 ? (t / 1e6).toFixed(1) + 'M' : t >= 1000 ? (t / 1000).toFixed(0) + 'k' : String(t);
+  }
+  const GLYPHS = {
+    ok: ['\u2713', 'ok'], bypassed: ['\u2298', 'muted'], none_relevant: ['\u2205', 'muted'],
+  };
+  function glyph(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[0]; }
+  function glyphClass(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[1]; }
+  function viaClass(via) {
+    return ['mcp', 'cli', 'hook', 'run'].indexOf(via) >= 0 ? 'via-' + via : 'via-none';
+  }
+  /** The one-line input summary: the record's `input` object, flattened. */
+  function inputLine(op) {
+    const i = op.input || {};
+    const parts = [];
+    if (i.command) parts.push(i.command);
+    if (i.file) parts.push(i.file);
+    if (i.pattern) parts.push(i.pattern);
+    if (i.question) parts.push('"' + i.question + '"');
+    if (i.intent) parts.push('~ "' + i.intent + '"');
+    if (i.prompt) parts.push(i.prompt);
+    if (!parts.length && i.lines) parts.push(i.lines + ' lines');
+    if (!parts.length && i.hits_scanned) parts.push(i.hits_scanned + ' hits');
+    return parts.join(' ');
+  }
+  function outcomeText(op) {
+    if (op.summary) return op.summary;
+    if (op.kind === 'ok') return '';
+    return op.kind.replace(/_/g, ' ');
+  }
+
+  // ── Filtering ────────────────────────────────────────────────────────
+  function matches(o) {
+    // The hook toggle is a global exclusion, but an explicit `via: hook`
+    // choice is the user asking for it and wins.
+    if (!filters.hooks && filters.via !== 'hook' && o.via === 'hook') return false;
+    if (filters.failed && o.ok) return false;
+    if (filters.tool && o.tool !== filters.tool) return false;
+    if (filters.via && (o.via || '') !== filters.via) return false;
+    if (filters.project && o.project !== filters.project) return false;
+    return true;
+  }
+  function visible() { return ops.filter(matches); }
+
+  // ── Live / Pinned ────────────────────────────────────────────────────
+  //
+  // Three deliberately redundant ways back to Live: click the chip, Esc, and
+  // browser Back (pinning pushes `#call/<id>`, Live is no hash).
+  function pin(id, viaHash) {
+    if (pinnedId === id) return;
+    pinnedId = id;
+    missedWhilePinned = 0;
+    if (!viaHash) location.hash = '#call/' + encodeURIComponent(id);
+    renderChip(); renderHistory(true); renderDetail();
+  }
+  function goLive(viaHash) {
+    if (pinnedId === null) return;
+    pinnedId = null;
+    missedWhilePinned = 0;
+    if (!viaHash && location.hash) history.pushState('', '', location.pathname + location.search);
+    renderChip(); renderHistory(true); renderDetail();
+  }
+  function renderChip() {
+    const c = $('chip');
+    if (pinnedId === null) {
+      c.className = 'chip live';
+      c.innerHTML = '\u25CF Live';
+      c.title = 'The pane tracks the newest call. Click a history row to pin it.';
+      return;
+    }
+    const op = byId.get(pinnedId);
+    const when = op ? fmtTime(op.ts) + ' ' + op.tool : pinnedId;
+    const missed = missedWhilePinned ? ' \u00b7 ' + missedWhilePinned + ' new' : '';
+    c.className = 'chip pinned';
+    c.innerHTML = '\u23F8 Pinned \u00b7 ' + esc(when) + esc(missed) +
+      ' <span class="hint">\u2715 esc</span>';
+    c.title = 'Click, or press Esc, to resume live';
+  }
+  $('chip').addEventListener('click', () => goLive(false));
+  window.addEventListener('hashchange', () => {
+    const m = /^#call\/(.+)$/.exec(location.hash);
+    if (m) pin(decodeURIComponent(m[1]), true); else goLive(true);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    if (e.key === 'Escape') { goLive(false); return; }
+    if (e.key !== 'j' && e.key !== 'k' && e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const list = visible().slice().reverse();       // newest first, as rendered
+    if (!list.length) return;
+    const down = (e.key === 'j' || e.key === 'ArrowDown');
+    const at = pinnedId === null ? -1 : list.findIndex(o => o.id === pinnedId);
+    if (at < 0) { pin(list[0].id, false); return; }
+    const next = at + (down ? 1 : -1);
+    // Walking up past the newest row resumes live, which is the same gesture
+    // as scrolling to the top of a chat log.
+    if (next < 0) { goLive(false); return; }
+    if (next >= list.length) return;
+    pin(list[next].id, false);
+    const el = document.querySelector('.hrow[data-id="' + cssEsc(list[next].id) + '"]');
+    if (el) el.scrollIntoView({ block: 'nearest' });
+  });
+  function cssEsc(s) { return String(s).replace(/["\\]/g, '\\$&'); }
+
+  // ── History ──────────────────────────────────────────────────────────
+  function renderHistory(force) {
+    const list = visible().slice().reverse();
+    // Diff before touching the DOM: a poll that changed nothing must not
+    // reset scroll or drop a hover.
+    const sig = [list.length, list.length ? list[0].id : '', pinnedId, selectMode,
+      [...expanded].join(','), [...checked].join(','), JSON.stringify(filters)].join('|');
+    if (!force && sig === historySig) return;
+    historySig = sig;
+
+    if (!list.length) {
+      $('history').innerHTML = '<div class="no-data">nothing matches these filters</div>';
+      updateCopyButton();
+      return;
+    }
+    const multiProject = new Set(list.map(o => o.project || '')).size > 1;
+    let html = '';
+    for (const o of list) {
+      const sel = o.id === pinnedId ? ' selected' : '';
+      const more = o.n > 1
+        ? '<span class="h-more" data-expand="' + esc(o.id) + '">\u22EE' + o.n + '</span>' : '';
+      const proj = multiProject && o.project
+        ? '<span class="h-proj">' + esc(o.project.split('/').pop()) + '</span>' : '';
+      const check = selectMode
+        ? '<span class="h-check"><input type="checkbox" data-check="' + esc(o.id) + '"' +
+          (checked.has(o.id) ? ' checked' : '') + '></span>' : '';
+      const bytes = o.raw_bytes || o.returned_bytes
+        ? fmtBytes(o.raw_bytes) + '\u2192' + fmtBytes(o.returned_bytes)
+        : fmtTok(o.tokens_in) + '\u2192' + fmtTok(o.tokens_out);
+      html +=
+        '<div class="hrow' + sel + '" data-id="' + esc(o.id) + '" title="' + esc(fmtDate(o.ts)) + '">' +
+        check +
+        '<span class="h-time">' + esc(fmtTime(o.ts)) + '</span>' +
+        '<span class="h-via ' + viaClass(o.via) + '">' + esc(o.via || '\u2014') + '</span>' +
+        '<span class="h-tool">' + esc(o.tool) + '</span>' + more + proj +
+        '<span class="h-input">' + esc(inputLine(o)) + '</span>' +
+        '<span class="h-outcome ' + glyphClass(o.kind) + '">' + glyph(o.kind) + ' ' +
+        esc(outcomeText(o)) + '</span>' +
+        '<span class="h-ms">' + esc(fmtMs(o.ms)) + '</span>' +
+        '<span class="h-tok">' + esc(bytes) + '</span>' +
+        '</div>';
+      if (expanded.has(o.id)) {
+        for (const r of o.rows) {
+          html +=
+            '<div class="hrow sub" data-id="' + esc(o.id) + '">' +
+            '<span class="h-time">' + esc(fmtTime(r.ts)) + '</span>' +
+            '<span class="h-tool">' + esc(r.preset) + '</span>' +
+            '<span class="h-input muted">attempt ' + esc(r.attempt) + '</span>' +
+            '<span class="h-outcome ' + glyphClass(r.kind) + '">' + glyph(r.kind) + ' ' +
+            esc(r.summary || '') + '</span>' +
+            '<span class="h-ms">' + esc(fmtMs(r.ms)) + '</span>' +
+            '<span class="h-tok">' + esc(fmtTok(r.tokens_in) + '\u2192' + fmtTok(r.tokens_out)) + '</span>' +
+            '</div>';
+        }
+      }
+    }
+    $('history').innerHTML = html;
+    updateCopyButton();
+  }
+
+  // Only a history-row click pins (§4). Not scrolling, not hovering, and not
+  // a click inside the detail pane — implicit pinning is the kind of
+  // cleverness that leaves you unable to explain why the pane stopped moving.
+  $('history').addEventListener('click', e => {
+    const exp = e.target.closest('[data-expand]');
+    if (exp) {
+      const id = exp.getAttribute('data-expand');
+      expanded.has(id) ? expanded.delete(id) : expanded.add(id);
+      renderHistory(true);
+      e.stopPropagation();
+      return;
+    }
+    const box = e.target.closest('[data-check]');
+    if (box) {
+      const id = box.getAttribute('data-check');
+      box.checked ? checked.add(id) : checked.delete(id);
+      historySig = '';
+      updateCopyButton();
+      e.stopPropagation();
+      return;
+    }
+    const row = e.target.closest('.hrow');
+    if (row) pin(row.getAttribute('data-id'), false);
+  });
+
+  // ── Detail ───────────────────────────────────────────────────────────
+  function currentOp() {
+    if (pinnedId !== null) return byId.get(pinnedId) || null;
+    const v = visible();
+    return v.length ? v[v.length - 1] : null;         // the newest visible call
+  }
+  function renderDetail() {
+    const op = currentOp();
+    if (!op) {
+      if (renderedDetailId !== null) { $('detail').innerHTML = '<div class="no-data">no calls yet</div>'; }
+      renderedDetailId = null;
+      return;
+    }
+    // Diff on id, not payload: in live mode a poll that returns nothing new
+    // must not reset scroll position or drop a text selection mid-read.
+    // `mergeOps` clears `renderedDetailId` when an operation actually grew,
+    // which is the only way the same id gets repainted.
+    if (op.id === renderedDetailId) return;
+    renderedDetailId = op.id;
+    renderedRound = 0;
+    paintDetail(op);
+  }
+  // Copyable block texts, by index. Deliberately not inlined into a
+  // `data-copy` attribute: these carry JSON and shell commands, and quoting
+  // arbitrary text into an attribute is a bug waiting to happen.
+  let copyBlocks = [];
+  function paintDetail(op) {
+    copyBlocks = [];
+    const r = op.rows[Math.min(renderedRound, op.rows.length - 1)];
+    let html = '';
+    html += '<div class="block">' +
+      '<div style="font-size:14px"><span class="' + viaClass(op.via) + '" style="font-size:10px;' +
+      'padding:1px 4px;border-radius:2px;color:var(--bg);font-weight:700">' +
+      esc((op.via || '\u2014').toUpperCase()) + '</span> <b style="color:var(--yellow)">' +
+      esc(op.tool) + '</b> <span class="muted">' + esc(fmtDate(op.ts)) + '</span></div>' +
+      '<div class="' + glyphClass(op.kind) + '" style="margin-top:3px">' + glyph(op.kind) + ' ' +
+      esc(op.kind) + (op.summary ? ' \u2014 ' + esc(op.summary) : '') + '</div>' +
+      '</div>';
+
+    // The round tab strip: a `find` is three preset calls, and seeing round 1's
+    // patterns next to round 2's is the best debugging view scout has. P4 adds
+    // the per-round internals; P2 shows the calls themselves.
+    if (op.rows.length > 1) {
+      html += '<div class="tabs">';
+      op.rows.forEach((row, i) => {
+        html += '<button class="tab' + (i === renderedRound ? ' on' : '') + '" data-round="' + i + '">' +
+          esc(row.preset) + (row.attempt > 1 ? ' #' + esc(row.attempt) : '') + '</button>';
+      });
+      html += '</div>';
+    }
+
+    html += block('input', JSON.stringify(op.input, null, 2), false);
+    html += block('resolved prompt',
+      'The fully resolved system and user prompt arrive over the live channel\n' +
+      '(SPEC-dashboard \u00a72.5, phase P3). Bodies are deliberately not written\n' +
+      'to the call log: at ~80 calls/day they would cut its ~7-month window to\n' +
+      'about two days.', true);
+    html += block('model response',
+      'Also live-channel only (P3). The log records the outcome and the usage,\n' +
+      'not the text.', true);
+
+    const kv = [
+      ['preset', r.preset], ['attempt', r.attempt], ['outcome', r.kind],
+      ['round ms', fmtMs(r.ms)], ['operation ms', fmtMs(op.ms)],
+      ['tokens', fmtTok(r.tokens_in) + ' in / ' + fmtTok(r.tokens_out) + ' out'],
+      ['op tokens', fmtTok(op.tokens_in) + ' in / ' + fmtTok(op.tokens_out) + ' out'],
+      // Summed over the operation, never per row: P1's ledger lets the first
+      // row claim `raw_bytes` and stamps `returned_bytes` on the last.
+      ['context', fmtBytes(op.raw_bytes) + ' \u2192 ' + fmtBytes(op.returned_bytes) +
+        (op.returned_bytes ? ' (' + Math.round(op.raw_bytes / op.returned_bytes) + '\u00d7)' : '')],
+      ['model', op.model || '\u2014'], ['endpoint', op.endpoint || '\u2014'],
+      ['project', op.project || '\u2014'], ['run', op.run], ['id', r.id],
+    ];
+    html += '<div class="block"><div class="block-head"><span>call</span></div><dl class="kv">' +
+      kv.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl></div>';
+    $('detail').innerHTML = html;
+  }
+  function block(title, text, placeholder) {
+    const idx = copyBlocks.push(text) - 1;
+    return '<div class="block"><div class="block-head"><span>' + esc(title) + '</span>' +
+      '<button class="copy" data-copy="' + idx + '">copy</button></div>' +
+      '<pre class="body' + (placeholder ? ' placeholder' : '') + '">' + esc(text) + '</pre></div>';
+  }
+  $('detail').addEventListener('click', e => {
+    const tab = e.target.closest('[data-round]');
+    if (tab) {
+      renderedRound = parseInt(tab.getAttribute('data-round'), 10) || 0;
+      const op = currentOp();
+      if (op) paintDetail(op);
+      return;
+    }
+    const c = e.target.closest('[data-copy]');
+    if (c) copyText(copyBlocks[parseInt(c.getAttribute('data-copy'), 10)] || '');
+  });
+
+  // ── Copy ─────────────────────────────────────────────────────────────
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (_) {
+      // Fallback for non-HTTPS contexts, which loopback often is.
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (_) { /* nothing more to try */ }
+      document.body.removeChild(ta);
+    }
+    const t = $('toast');
+    t.style.opacity = '1';
+    setTimeout(() => { t.style.opacity = '0'; }, 1600);
+  }
+  function updateCopyButton() {
+    const btn = $('copy-selected');
+    btn.style.display = checked.size ? 'inline-block' : 'none';
+    $('copy-n').textContent = checked.size;
+  }
+  $('copy-selected').addEventListener('click', () => {
+    const parts = ops.filter(o => checked.has(o.id)).map(o => {
+      const head = fmtDate(o.ts) + '  ' + (o.via || '-') + '  ' + o.tool +
+        '  ' + inputLine(o) + '\n  ' + o.kind + (o.summary ? ' \u2014 ' + o.summary : '') +
+        '  ' + fmtMs(o.ms) + '  ' + fmtTok(o.tokens_in) + '\u2192' + fmtTok(o.tokens_out) +
+        '  ' + fmtBytes(o.raw_bytes) + '\u2192' + fmtBytes(o.returned_bytes);
+      const rows = o.rows.map(r =>
+        '    ' + r.preset + ' #' + r.attempt + '  ' + r.kind + '  ' + fmtMs(r.ms) +
+        (r.summary ? '  ' + r.summary : '')).join('\n');
+      return head + '\n' + rows + '\n  input: ' + JSON.stringify(o.input);
+    });
+    copyText(parts.join('\n\n'));
+  });
+
+  // ── Filter controls ──────────────────────────────────────────────────
+  function bindToggle(id, key) {
+    const el = $(id);
+    const sync = () => el.classList.toggle('on', !!filters[key]);
+    el.addEventListener('click', () => { filters[key] = !filters[key]; sync(); afterFilterChange(); });
+    sync();
+  }
+  bindToggle('f-hooks', 'hooks');
+  bindToggle('f-failed', 'failed');
+  for (const [id, key] of [['f-tool', 'tool'], ['f-via', 'via'], ['f-project', 'project']]) {
+    $(id).addEventListener('change', e => { filters[key] = e.target.value; afterFilterChange(); });
+  }
+  $('f-selmode').addEventListener('click', () => {
+    selectMode = !selectMode;
+    $('f-selmode').classList.toggle('on', selectMode);
+    if (!selectMode) checked.clear();
+    renderHistory(true);
+  });
+  function afterFilterChange() {
+    // A filtered-out call must not hold the live pane either, so live
+    // re-resolves against the new visible set.
+    renderedDetailId = null;
+    renderHistory(true);
+    renderDetail();
+  }
+  function refreshOptions() {
+    const fill = (id, values, key) => {
+      const sel = $(id);
+      const have = new Set([...sel.options].map(o => o.value));
+      for (const v of [...values].sort()) {
+        if (v && !have.has(v)) {
+          const o = document.createElement('option');
+          o.value = v;
+          o.textContent = id === 'f-project' ? v.split('/').pop() : v;
+          o.title = v;
+          sel.appendChild(o);
+        }
+      }
+      sel.value = filters[key];
+    };
+    fill('f-tool', new Set(ops.map(o => o.tool)), 'tool');
+    fill('f-via', new Set(ops.map(o => o.via).filter(Boolean)), 'via');
+    fill('f-project', new Set(ops.map(o => o.project).filter(Boolean)), 'project');
+  }
+
+  // ── Polling ──────────────────────────────────────────────────────────
+  function mergeOps(fresh) {
+    let changed = false;
+    for (const op of fresh.slice().reverse()) {       // server sends newest first
+      const known = byId.get(op.id);
+      if (known) {
+        // A growing operation is resent whole; replace it in place.
+        ops[ops.indexOf(known)] = op;
+        byId.set(op.id, op);
+        if (renderedDetailId === op.id) renderedDetailId = null;
+        changed = true;
+        continue;
+      }
+      ops.push(op);
+      byId.set(op.id, op);
+      changed = true;
+      // Only what the pane would actually have shown counts as missed: the
+      // backfill on first load is not "new", and neither is a filtered-out
+      // call — those must not steal the live pane, so they cannot advertise
+      // themselves as something you are behind on either.
+      if (pinnedId !== null && backfilled && matches(op)) missedWhilePinned++;
+    }
+    return changed;
+  }
+
+  function pollHistory() {
+    const url = '/api/history?limit=500' + (cursor ? '&since=' + encodeURIComponent(cursor) : '');
+    fetch(url).then(r => r.json()).then(d => {
+      $('conn-dot').className = 'dot ok';
+      if (d.resynced) { ops.length = 0; byId.clear(); renderedDetailId = null; backfilled = false; }
+      const changed = mergeOps(d.ops || []);
+      backfilled = true;
+      cursor = d.cursor || cursor;
+      if (changed) {
+        refreshOptions();
+        renderChip();
+        renderHistory(false);
+        renderDetail();
+      }
+    }).catch(() => { $('conn-dot').className = 'dot err'; });
+  }
+
+  function pollStatus() {
+    fetch('/api/status').then(r => r.json()).then(d => {
+      $('conn-dot').className = 'dot ok';
+      const llm = d.llm || {}, o = d.overview || {};
+      $('llm-model').textContent = llm.model || 'no model configured';
+      $('llm-endpoint').textContent = llm.endpoint || '';
+      $('llm-dot').className = 'dot ' + (llm.reachable ? 'ok' : 'err');
+      $('llm-note').textContent = llm.error ? llm.error
+        : (llm.reachable ? '' : 'endpoint not responding');
+      $('llm-note').className = llm.error || !llm.reachable ? 'err' : 'muted';
+      $('version').textContent = 'v' + (d.version || '?');
+      $('uptime').textContent = 'up ' + fmtDur(d.uptime_secs || 0);
+
+      const saved = (o.raw_bytes || 0) - (o.returned_bytes || 0);
+      const ratio = o.returned_bytes ? Math.round(o.raw_bytes / o.returned_bytes) : 0;
+      $('ov-saved').textContent = fmtBytes(o.raw_bytes) + ' \u2192 ' + fmtBytes(o.returned_bytes) +
+        (ratio ? '  (' + ratio + '\u00d7)' : '');
+      $('ov-saved-tokens').textContent = saved > 0
+        ? '\u2248 ' + estTokens(saved) + ' tokens kept out of context'
+        : 'nothing measured yet';
+      $('ov-calls').textContent = (o.calls_1h || 0) + ' / ' + (o.calls_24h || 0);
+      $('ov-total').textContent = (o.calls || 0).toLocaleString();
+      $('ov-ops').textContent = (o.operations || 0).toLocaleString();
+      const pct = o.calls ? (o.ok / o.calls * 100) : 0;
+      $('ov-success').textContent = o.calls ? pct.toFixed(1) + '%' : '\u2014';
+      $('ov-success').className = 'stat-value ' + (o.calls && pct < 90 ? 'warn' : '');
+      $('ov-tokens').textContent = fmtTok(o.tokens_in) + ' / ' + fmtTok(o.tokens_out);
+      $('ov-latency').textContent = fmtMs(o.p50_ms) + ' / ' + fmtMs(o.p95_ms);
+      $('ov-bypassed').textContent = (o.bypassed || 0).toLocaleString();
+      $('ov-log').textContent = fmtBytes(o.log_bytes) + ' / ' + fmtBytes(o.log_max_bytes);
+      const frac = o.log_max_bytes ? o.log_bytes / o.log_max_bytes : 0;
+      const hints = [];
+      if (frac > 0.8) hints.push('rotation is close \u2014 the older generation is kept as calls.jsonl.1');
+      if (o.log_rotated) hints.push('spanning calls.jsonl.1 + calls.jsonl');
+      if (o.parse_errors) hints.push(o.parse_errors + ' unreadable line(s) skipped');
+      $('ov-log-hint').innerHTML = hints.map(esc).join('<br>');
+      $('ov-log-hint').className = 'stat-sub' + (frac > 0.8 ? ' warn' : '');
+      $('ov-span').textContent = o.span_secs > 3600 ? fmtDur(o.span_secs) + ' of history' : '';
+
+      const fails = o.failures || [];
+      $('fail-total').textContent = fails.length
+        ? fails.reduce((a, f) => a + f.count, 0) + ' failed' : '';
+      $('failures').innerHTML = fails.length
+        ? fails.map(f =>
+            '<div class="fail-row" data-kind="' + esc(f.kind) + '" title="show only these">' +
+            '<span class="fail-kind">' + esc(f.kind.replace(/_/g, ' ')) + '</span>' +
+            '<span class="fail-count">' + f.count + '</span></div>').join('')
+        : '<div class="no-data">none</div>';
+    }).catch(() => { $('conn-dot').className = 'dot err'; });
+  }
+  function fmtDur(s) {
+    if (s < 60) return Math.round(s) + 's';
+    if (s < 3600) return Math.round(s / 60) + 'm';
+    if (s < 86400) return (s / 3600).toFixed(1) + 'h';
+    return (s / 86400).toFixed(1) + 'd';
+  }
+  // The failures pane is the first place to look on a bad day, so a kind is a
+  // filter: click it and the history shows only failures.
+  $('failures').addEventListener('click', e => {
+    const row = e.target.closest('[data-kind]');
+    if (!row) return;
+    filters.failed = true;
+    filters.hooks = true;      // a failure is worth seeing wherever it came from
+    $('f-failed').classList.add('on');
+    $('f-hooks').classList.add('on');
+    afterFilterChange();
+  });
+
+  // ── Boot ─────────────────────────────────────────────────────────────
+  const m = /^#call\/(.+)$/.exec(location.hash);
+  if (m) { pinnedId = decodeURIComponent(m[1]); }
+  pollStatus();
+  pollHistory();
+  renderChip();
+  setInterval(pollHistory, 2000);
+  setInterval(pollStatus, 15000);
+})();
+</script>
+</body>
+</html>

@@ -21,6 +21,10 @@ grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+# The dashboard daemon only: `setsid` for the detach (without it a ^C in the
+# launching shell kills the daemon) and SO_REUSEADDR so a well-known port
+# rebinds through TIME_WAIT on `--restart`. Nothing else in scout uses it.
+libc = "0.2"
 rmcp = { version = "3.1", features = ["server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

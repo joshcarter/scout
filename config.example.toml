@@ -103,6 +103,16 @@ model = "qwen3:27b"
 # skip the stage entirely.
 # reflect = true
 
+# `scout dashboard` — the local web view of the call log. Start it with
+# `scout dashboard` (idempotent, detaches), stop it with `--stop`.
+
+# [dashboard]
+# Port for the dashboard, alongside ct's 13000. The bind *address* is
+# 127.0.0.1 and is deliberately not configurable: the payloads carry file
+# contents from every repo you work in, so loopback is the only address
+# worth serving them on.
+# port = 13001
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.
