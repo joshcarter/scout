@@ -112,6 +112,11 @@ model = "qwen3:27b"
 # contents from every repo you work in, so loopback is the only address
 # worth serving them on.
 # port = 13001
+#
+# Prompt and response bodies travel the live channel (unix datagram + SSE)
+# and are held in the daemon's memory only. They are not written to the
+# call log. A daemon restart loses them; that is accepted. The persist_bodies
+# sidecar is a later, opt-in phase.
 
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by

@@ -8,9 +8,9 @@
 // the tail delta.  A pleasant consequence is that the view works retroactively
 // over calls made before it was started, and survives its own restart.
 //
-// P2 is the log alone.  The live channel (§2.5) that carries prompt bodies,
-// token streams and `find`'s internal rounds is P3, so `/api/stream` answers
-// 501 rather than 404 — the route exists, the transport does not.
+// P3 adds the live channel (§2.5): a unix datagram the writers sendto, an
+// in-memory body cache, in-flight rows overlaid on the log, and `/api/stream`
+// as SSE. Token streams (P5) and `find` internals (P4) reuse the same pipe.
 
 use crate::stats::{self, Outcome};
 use serde_json::{json, Value};
@@ -605,6 +605,7 @@ fn check_reachability() -> Reach {
 
 struct State {
     tail: Mutex<Tail>,
+    live: Arc<crate::live::LiveStore>,
     reach: Mutex<Reach>,
     started: SystemTime,
     port: u16,
@@ -617,6 +618,7 @@ impl State {
         let overview = overview(&tail);
         drop(tail);
         let reach = self.reach.lock().unwrap_or_else(|e| e.into_inner());
+        let (inflight, bodies, streams) = self.live.snapshot();
         json!({
             // The marker a liveness probe looks for (§5): a pidfile surviving
             // `kill -9` is common, so the port answering *as scout* is what
@@ -637,6 +639,12 @@ impl State {
                 "checked": reach.checked,
             },
             "overview": overview,
+            "live": {
+                "bound": self.live.bound(),
+                "inflight": inflight,
+                "bodies": bodies,
+                "streams": streams,
+            },
         })
     }
 }
@@ -758,8 +766,82 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 /// has.  An id that is no longer in the log — the caller slept through a
 /// rotation — falls back to a full page rather than an error, which is the only
 /// behavior that lets a browser tab recover on its own.
+fn row_from_live(r: &crate::live::LiveRow) -> Row {
+    Row {
+        id: r.id.clone(),
+        op: r.op.clone(),
+        run: r.run.clone(),
+        ts: r.ts,
+        via: r.via.clone(),
+        tool: r.tool.clone(),
+        preset: r.preset.clone(),
+        attempt: r.attempt,
+        project: r.project.clone(),
+        model: r.model.clone(),
+        endpoint: r.endpoint.clone(),
+        input: r.input.clone(),
+        kind: r.kind.clone(),
+        summary: r.summary.clone(),
+        raw_bytes: r.raw_bytes,
+        returned_bytes: r.returned_bytes,
+        tokens_in: r.tokens_in,
+        tokens_out: r.tokens_out,
+        ms: r.ms,
+        ok: r.ok,
+    }
+}
+
+/// Log rows plus any inflight rows the log has not yet absorbed.
+fn merged_rows(tail: &Tail, live: &crate::live::LiveStore) -> Vec<Row> {
+    live.reap(tail.rows.iter().map(|r| r.id.as_str()));
+    let mut rows = tail.rows.clone();
+    let have: std::collections::HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+    for r in live.inflight_rows() {
+        if !have.contains(&r.id) {
+            rows.push(row_from_live(&r));
+        }
+    }
+    rows
+}
+
+fn attach_bodies(op: &mut Value, live: &crate::live::LiveStore) {
+    let Some(rows) = op.get_mut("rows").and_then(Value::as_array_mut) else { return };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        if let Some(b) = live.bodies_of(&id) {
+            if let Some(s) = b.system {
+                row["system"] = Value::from(s);
+            }
+            if let Some(s) = b.user {
+                row["user"] = Value::from(s);
+            }
+            if let Some(s) = b.response {
+                row["response"] = Value::from(s);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
-    let rows = &tail.rows;
+    history_with_live(tail, None, params)
+}
+
+fn history_with_live(
+    tail: &Tail,
+    live: Option<&crate::live::LiveStore>,
+    params: &HashMap<String, String>,
+) -> Value {
+    let overlay;
+    let rows: &[Row] = match live {
+        Some(live) => {
+            overlay = merged_rows(tail, live);
+            &overlay
+        }
+        None => &tail.rows,
+    };
     let ops = group_ops(rows);
     let limit: usize = params
         .get("limit")
@@ -807,10 +889,10 @@ fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
 
     json!({
         "ops": page,
-        // The cursor to pass back as `since`: the newest row in the log, not
-        // the newest row returned, so filters cannot strand the caller behind
-        // rows it will never be shown.
-        "cursor": rows.last().map(|r| r.id.clone()),
+        // The cursor to pass back as `since`: the newest row in the *log*,
+        // never an inflight id. An inflight cursor that then vanishes would
+        // `resynced: true` and wipe the tab.
+        "cursor": tail.rows.last().map(|r| r.id.clone()),
         "total_ops": ops.len(),
         "matched": selected.len(),
         "resynced": known && since_idx.is_none(),
@@ -818,16 +900,26 @@ fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
 }
 
 /// `/api/call/<id>` — one operation, by the id of any row in it.
+#[cfg(test)]
 fn call_json(tail: &Tail, id: &str) -> Option<Value> {
-    let rows = &tail.rows;
-    let idx = rows.iter().position(|r| r.id == id)?;
+    call_with_live(tail, None, id)
+}
+
+fn call_with_live(tail: &Tail, live: Option<&crate::live::LiveStore>, id: &str) -> Option<Value> {
+    let overlay;
+    let rows: &[Row] = match live {
+        Some(live) => {
+            overlay = merged_rows(tail, live);
+            &overlay
+        }
+        None => &tail.rows,
+    };
+    let idx = rows.iter().position(|r| r.id == id || r.op == id)?;
     let op = group_ops(rows).into_iter().find(|op| op.contains(&idx))?;
     let mut v = op_json(rows, &op);
-    // P3 carries prompt and response bodies over the live channel; the route
-    // exists now so a pinned `#call/<id>` is reloadable, and says plainly that
-    // the bodies are not here yet.
-    v["bodies"] = Value::Null;
-    v["bodies_note"] = json!("prompt and response bodies arrive with the live channel (P3)");
+    if let Some(live) = live {
+        attach_bodies(&mut v, live);
+    }
     Some(v)
 }
 
@@ -838,6 +930,7 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8])
         404 => "Not Found",
         405 => "Method Not Allowed",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let header = format!(
@@ -851,6 +944,41 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8])
 
 fn respond_json(stream: &mut TcpStream, status: u16, body: &Value) {
     respond(stream, status, "application/json", body.to_string().as_bytes());
+}
+
+/// SSE: hold the connection, `data: {...}\n\n` per event, comment keepalives.
+///
+/// This is the one route that must not go through `respond` / `HTTP/1.0
+/// Connection: close`. The handler thread lives as long as the tab.
+fn handle_stream(state: &Arc<State>, mut stream: TcpStream) {
+    if !state.live.try_acquire_stream() {
+        respond_json(&mut stream, 503, &json!({"error": "too many live streams"}));
+        return;
+    }
+    let rx = state.live.subscribe();
+    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                  Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+    if stream.write_all(header.as_bytes()).is_err() || stream.flush().is_err() {
+        state.live.release_stream();
+        return;
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(ev) => {
+                let line = format!("data: {ev}\n\n");
+                if stream.write_all(line.as_bytes()).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    state.live.release_stream();
 }
 
 /// One connection: request line, discard headers, route, close.
@@ -897,7 +1025,7 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
         "/api/history" => {
             let mut tail = state.tail.lock().unwrap_or_else(|e| e.into_inner());
             tail.refresh();
-            let body = history_json(&tail, &params);
+            let body = history_with_live(&tail, Some(state.live.as_ref()), &params);
             drop(tail);
             respond_json(&mut stream, 200, &body);
         }
@@ -908,16 +1036,15 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
             drop(tail);
             respond_json(&mut stream, 200, &body);
         }
-        "/api/stream" => respond_json(
-            &mut stream,
-            501,
-            &json!({"error": "the live channel is not built yet (SPEC-dashboard P3)"}),
-        ),
+        "/api/stream" => {
+            handle_stream(state, stream);
+            return;
+        }
         p if p.starts_with("/api/call/") => {
             let id = url_decode(&p["/api/call/".len()..]);
             let mut tail = state.tail.lock().unwrap_or_else(|e| e.into_inner());
             tail.refresh();
-            let found = call_json(&tail, &id);
+            let found = call_with_live(&tail, Some(state.live.as_ref()), &id);
             drop(tail);
             match found {
                 Some(v) => respond_json(&mut stream, 200, &v),
@@ -933,6 +1060,7 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
 /// The pidfile path, as a `CString`, so the signal handler can `unlink` it
 /// without allocating.  See `on_terminate`.
 static PIDFILE_C: OnceLock<CString> = OnceLock::new();
+static SOCKET_C: OnceLock<CString> = OnceLock::new();
 
 /// SIGTERM/SIGINT: remove the pidfile and go.
 ///
@@ -942,6 +1070,9 @@ static PIDFILE_C: OnceLock<CString> = OnceLock::new();
 /// flush; the daemon only reads.
 extern "C" fn on_terminate(_sig: libc::c_int) {
     if let Some(p) = PIDFILE_C.get() {
+        unsafe { libc::unlink(p.as_ptr()) };
+    }
+    if let Some(p) = SOCKET_C.get() {
         unsafe { libc::unlink(p.as_ptr()) };
     }
     unsafe { libc::_exit(0) };
@@ -970,12 +1101,32 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
     let mut tail = Tail::new(log);
     tail.reload();
 
+    let live = Arc::new(crate::live::LiveStore::new());
+    let live_sock = match crate::live::bind_socket() {
+        Ok(sock) => {
+            live.set_bound(true);
+            if let Some(c) = crate::live::socket_cstring() {
+                let _ = SOCKET_C.set(c);
+            }
+            Some(sock)
+        }
+        Err(e) => {
+            eprintln!("scout dashboard: live socket not bound: {e}");
+            None
+        }
+    };
+
     let state = Arc::new(State {
         tail: Mutex::new(tail),
+        live: Arc::clone(&live),
         reach: Mutex::new(Reach::default()),
         started: SystemTime::now(),
         port,
     });
+
+    if let Some(sock) = live_sock {
+        std::thread::spawn(move || crate::live::recv_loop(sock, live));
+    }
 
     if let Some(pidfile) = pid_path_for(port) {
         install_signal_handlers(&pidfile);
@@ -1630,9 +1781,74 @@ mod tests {
             let v = call_json(&t, id).expect("both rows reach the same operation");
             assert_eq!(v["id"], "r-1");
             assert_eq!(v["n"], 2);
-            assert!(v["bodies"].is_null(), "bodies are P3");
+            assert!(v["rows"][0].get("system").is_none(), "no live cache in this test");
         }
         assert!(call_json(&t, "nope").is_none());
+    }
+
+    #[test]
+    fn inflight_rows_overlay_the_history_and_do_not_become_the_cursor() {
+        let t = tail_of(&[v2("a-1", "a", 100.0, r#","op":"a-op""#)]);
+        let live = crate::live::LiveStore::new();
+        live.apply_json(
+            &serde_json::json!({
+                "v": 1, "id": "b-1", "run": "b", "op": "b-op",
+                "kind": "call.start", "ts": 200.0, "tool": "grep", "preset": "grep",
+                "via": "mcp", "system": "S", "user": "U",
+            })
+            .to_string(),
+        );
+        let h = history_with_live(&t, Some(&live), &q(&[]));
+        let ops = h["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(h["cursor"], "a-1", "cursor stays on the log, never inflight");
+        assert!(ops.iter().any(|o| o["id"] == "b-1" && o["kind"] == "running"));
+    }
+
+    #[test]
+    fn a_live_round_joins_its_logged_siblings_by_op() {
+        let t = tail_of(&[v2("r-1", "r", 100.0, r#","op":"r-op","tool":"find""#)]);
+        let live = crate::live::LiveStore::new();
+        live.apply_json(
+            &serde_json::json!({
+                "v": 1, "id": "r-2", "run": "r", "op": "r-op",
+                "kind": "call.start", "ts": 101.0, "tool": "find", "preset": "grep",
+            })
+            .to_string(),
+        );
+        let h = history_with_live(&t, Some(&live), &q(&[]));
+        let ops = h["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 1, "same op is one history row");
+        assert_eq!(ops[0]["n"], 2);
+    }
+
+    #[test]
+    fn a_logged_id_reaps_inflight_and_keeps_bodies() {
+        let t = tail_of(&[v2("r-1", "r", 100.0, r#","op":"r-op""#)]);
+        let live = crate::live::LiveStore::new();
+        live.apply_json(
+            &serde_json::json!({
+                "v": 1, "id": "r-1", "run": "r", "op": "r-op",
+                "kind": "call.start", "ts": 99.0, "tool": "find", "preset": "find_patterns",
+                "system": "SYS", "user": "USR",
+            })
+            .to_string(),
+        );
+        live.apply_json(
+            &serde_json::json!({
+                "v": 1, "id": "r-1", "run": "r", "op": "r-op",
+                "kind": "call.end", "response": "OK",
+                "outcome": {"kind": "ok"},
+            })
+            .to_string(),
+        );
+        let h = history_with_live(&t, Some(&live), &q(&[]));
+        assert_eq!(h["ops"].as_array().unwrap().len(), 1);
+        let v = call_with_live(&t, Some(&live), "r-1").unwrap();
+        assert_eq!(v["rows"][0]["system"], "SYS");
+        assert_eq!(v["rows"][0]["user"], "USR");
+        assert_eq!(v["rows"][0]["response"], "OK");
+        assert!(live.inflight_rows().is_empty(), "reaped once the log has the id");
     }
 
     // ── The tailing reader ───────────────────────────────────────────────
@@ -1787,6 +2003,7 @@ mod tests {
     fn the_status_marker_is_what_a_probe_looks_for() {
         let state = State {
             tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
+            live: Arc::new(crate::live::LiveStore::new()),
             reach: Mutex::new(Reach::default()),
             started: SystemTime::now(),
             port: 13001,
@@ -1796,6 +2013,37 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert!(v["overview"].is_object());
         assert!(v["llm"].is_object());
+        assert_eq!(v["live"]["bound"], false);
+        assert_eq!(v["live"]["streams"], 0);
+    }
+
+    #[test]
+    fn stream_is_sse_not_501() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(State {
+            tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
+            live: Arc::new(crate::live::LiveStore::new()),
+            reach: Mutex::new(Reach::default()),
+            started: SystemTime::now(),
+            port: addr.port(),
+        });
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle(&state, s);
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(b"GET /api/stream HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 256];
+        let n = c.read(&mut buf).unwrap_or(0);
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(text.contains("text/event-stream"), "{text}");
+        assert!(!text.contains("501"), "{text}");
+        // The handler thread is released by the 15s keepalive write failing
+        // after we drop the client; that bound is the leak test. Asserting it
+        // here would stall the suite for a quarter of a minute.
+        drop(c);
     }
 
     #[test]

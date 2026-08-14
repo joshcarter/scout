@@ -174,29 +174,32 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
     // from a shell: `run_cmd` cannot tell, so the caller says so through
     // `$SCOUT_VIA` (hooks/shell-safety.sh sets it).
     let prompt_bytes = (system.len() + user.len()) as u64;
-    let record = || {
-        crate::stats::CallRecord::new(&preset_name, &preset_name)
-            .via(&crate::stats::via_from_env(crate::stats::VIA_RUN))
-            .project(&project)
-            .endpoint(client.model(), client.endpoint())
-            .input(crate::stats::input_summary(&preset_name, &args_value))
-            .raw_bytes(prompt_bytes)
-    };
+    // One record for the whole invocation so `call.start` and the log line
+    // share an `id` (SPEC-dashboard P3). The old closure reminted on every
+    // arm and would have broken reconciliation.
+    let mut rec = crate::stats::CallRecord::new(&preset_name, &preset_name)
+        .via(&crate::stats::via_from_env(crate::stats::VIA_RUN))
+        .project(&project)
+        .endpoint(client.model(), client.endpoint())
+        .input(crate::stats::input_summary(&preset_name, &args_value))
+        .raw_bytes(prompt_bytes);
 
     let messages = vec![
         json!({"role": "system", "content": system}),
         json!({"role": "user",   "content": user}),
     ];
 
+    crate::live::emit_start(&rec, &system, &user);
     let start = std::time::Instant::now();
     let (text, usage) = match client.complete(messages, None) {
         Ok(r) => r,
         Err(e) => {
-            record()
+            rec = rec
                 .ms(start.elapsed().as_millis() as u64)
                 .outcome(e.outcome())
-                .summary(e.to_string())
-                .log();
+                .summary(e.to_string());
+            crate::live::emit_end(&rec, None);
+            rec.log();
             eprintln!("scout run: LLM call failed: {:?}", e);
             std::process::exit(1);
         }
@@ -204,20 +207,19 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
     let duration_ms = start.elapsed().as_millis() as u64;
 
     if text.trim().is_empty() {
-        record()
+        rec = rec
             .ms(duration_ms)
             .outcome(crate::stats::Outcome::EmptyResponse)
-            .summary("the model returned nothing")
-            .log();
+            .summary("the model returned nothing");
+        crate::live::emit_end(&rec, None);
+        rec.log();
         eprintln!("scout run: LLM returned empty response");
         std::process::exit(1);
     }
 
-    record()
-        .usage(&usage)
-        .ms(duration_ms)
-        .returned_bytes(text.len() as u64)
-        .log();
+    rec = rec.usage(&usage).ms(duration_ms).returned_bytes(text.len() as u64);
+    crate::live::emit_end(&rec, Some(&text));
+    rec.log();
 
     print!("{text}");
     std::process::exit(0);

@@ -1,16 +1,16 @@
 # Spec: `scout dashboard` — a local web view of local-LLM traffic
 
-**Status:** **P1 and P2 shipped — the dashboard runs and is useful
-today.** No open design questions remain; §7 records the decisions and
-§6 the remaining phases. Streaming behavior in §5.5 is measured against
-the configured endpoint, not assumed.
+**Status:** **P1–P3 shipped — the dashboard shows the call, not just
+metadata about it.** No open design questions remain; §7 records the
+decisions and §6 the remaining phases. Streaming behavior in §5.5 is
+measured against the configured endpoint, not assumed.
 
 | Phase | State | What it delivers |
 |---|---|---|
 | **P1** — enrich the record | ✅ `a16b7fb` | `op`/`run`/`id`, `via`, `tool`, `input`, `outcome`, byte accounting, rotation |
 | **P2** — daemon + server | ✅ `1d99442` | `scout dashboard` on 13001; all §4 panes but bodies and live views |
 | — op grouping fix | ✅ `cee6d14` | recorded `op` replaces P2's idle-gap heuristic |
-| **P3** — live channel | ⬜ next | unix datagram socket, SSE, prompt/response bodies, in-flight calls |
+| **P3** — live channel | ✅ | unix datagram socket, SSE, prompt/response bodies, in-flight calls |
 | **P4** — `find` refinement events | ⬜ | per-round internals: patterns, hits, rerank, reflect |
 | **P5** — token streaming | ⬜ | `call.token` deltas; cleared by measurement (§5.5) |
 | **P6** — bodies sidecar | ⬜ optional | retroactive bodies on disk; build only if missed |
@@ -21,12 +21,12 @@ the configured endpoint, not assumed.
 context-saved ratio sums per-operation, failures break out by kind,
 p50/p95 latency, the Live/Pinned detail pane with three ways back, and
 filters by tool/via/project/failed. The reader survives log rotation.
+The live channel carries resolved prompts and responses: in-flight rows
+appear in history, `/api/stream` is SSE, and the detail pane shows
+bodies while the daemon is up.
 
-**What is missing until P3:** the detail pane has no prompt or response
-bodies — the single most valuable thing the dashboard could show — no
-in-flight indicator, and no `find` round detail. `/api/stream` answers
-`501` with a note rather than 404, so the route exists and the transport
-is the only missing piece.
+**What is missing until P4:** `find` round internals (guessed patterns,
+degenerate drops, rerank `why`, reflect verdict). Token streaming is P5.
 
 **One operational note:** per `CLAUDE.md`, the plugin's binary is a copy
 in `$CLAUDE_PLUGIN_DATA/bin` refreshed on session restart. Until a
@@ -637,7 +637,7 @@ Endpoints:
 | `GET /api/history?since=<id>&limit=&tool=&via=&project=&failed=` | operations with their rows inlined | ✅ P2 |
 | `GET /api/call/<id>` | one operation, resolved from *any* of its row ids | ✅ P2 |
 | `GET /api/stats` | the `scout stats` table as JSON | ✅ P2 |
-| `GET /api/stream` | **SSE** — live events from the channel (§2.5) | ⬜ P3 — currently `501` |
+| `GET /api/stream` | **SSE** — live events from the channel (§2.5) | ✅ P3 |
 
 Two P2 choices that the routes above encode:
 
@@ -781,7 +781,7 @@ running daemon.
 `cee6d14` replaced P2's idle-gap grouping heuristic with the recorded
 `op` — see §3.
 
-### ⬜ P3 — the live channel (next, and the one that matters)
+### ✅ P3 — the live channel
 
 **Why it is next:** the detail pane currently shows metadata about a
 call but not the call. "Show me the exact resolved prompt" was the

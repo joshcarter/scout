@@ -117,6 +117,11 @@ impl Ctx<'_> {
         if let Some(c) = self.client {
             rec = rec.endpoint(c.model(), c.endpoint());
         }
+        // Stamp the ledger's op now, not when the row is parked: `call.start`
+        // is emitted before `complete` returns, and must share the grouping
+        // key the log line will carry.
+        rec.op = self.ledger.op().to_string();
+        rec.silent = self.ledger.is_silent();
         rec
     }
 
@@ -479,11 +484,14 @@ pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String,
     ];
 
     let rec = ctx.record(preset_name, args);
+    crate::live::emit_start(&rec, &system, &user);
     let start = std::time::Instant::now();
     match client.complete(messages, None) {
         Ok((text, usage)) => {
             let ms = start.elapsed().as_millis() as u64;
-            ctx.ledger.record(rec.usage(&usage).ms(ms));
+            let rec = rec.usage(&usage).ms(ms);
+            crate::live::emit_end(&rec, Some(&text));
+            ctx.ledger.record(rec);
             Ok(text)
         }
         Err(e) => {
@@ -492,7 +500,9 @@ pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String,
             // false` and very different problems.  `scout stats` still averages
             // successes only, so this changes no existing number.
             let ms = start.elapsed().as_millis() as u64;
-            ctx.ledger.record(rec.ms(ms).outcome(e.outcome()).summary(e.to_string()));
+            let rec = rec.ms(ms).outcome(e.outcome()).summary(e.to_string());
+            crate::live::emit_end(&rec, None);
+            ctx.ledger.record(rec);
             Err(format!("local LLM call failed: {e}"))
         }
     }

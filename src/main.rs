@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod dashboard;
 mod edit;
+mod live;
 mod extract;
 mod filter_config;
 mod find;
@@ -720,29 +721,31 @@ fn run_task(prompt: &str) -> ! {
         local-LLM escape hatch. Answer the user's request directly.";
     let params = json!({"system": system, "user": prompt});
 
-    // Everything the record needs that is the same either way.
-    let record = || {
-        stats::CallRecord::new("task", "task")
-            .via(stats::VIA_CLI)
-            .project(&resolve_project(None))
-            .endpoint(client.model(), client.endpoint())
-            .input(stats::input_summary("task", &json!({ "prompt": prompt })))
-            .raw_bytes(prompt.len() as u64)
-    };
+    // One record so start and end share an `id` with the log line.
+    let rec = stats::CallRecord::new("task", "task")
+        .via(stats::VIA_CLI)
+        .project(&resolve_project(None))
+        .endpoint(client.model(), client.endpoint())
+        .input(stats::input_summary("task", &json!({ "prompt": prompt })))
+        .raw_bytes(prompt.len() as u64);
 
+    crate::live::emit_start(&rec, system, prompt);
     match task::handle(&client, &params) {
         Ok(result) => {
             let text = result["text"].as_str().unwrap_or("");
-            record()
+            let rec = rec
                 .usage(&result["usage"])
                 .ms(result["duration_ms"].as_u64().unwrap_or(0))
-                .returned_bytes(text.len() as u64)
-                .log();
+                .returned_bytes(text.len() as u64);
+            crate::live::emit_end(&rec, Some(text));
+            rec.log();
             println!("{text}");
             std::process::exit(0);
         }
         Err(e) => {
-            record().outcome(e.outcome()).summary(e.to_string()).log();
+            let rec = rec.outcome(e.outcome()).summary(e.to_string());
+            crate::live::emit_end(&rec, None);
+            rec.log();
             eprintln!("scout task: {:?}", e);
             std::process::exit(1);
         }

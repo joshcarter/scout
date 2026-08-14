@@ -5,15 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>scout Dashboard</title>
 <style>
-  /* Deliberately ct's palette, type and density (SPEC-dashboard §4): the two
-     dashboards are read by the same person minutes apart, and the muscle
-     memory transferring is the point. */
+  /* Same density and type as ct's dashboard (SPEC-dashboard §4), retinted
+     to a dark-purple scout identity so the two are cousins rather than twins. */
   :root {
-    --bg: #1a1b26; --bg2: #24283b; --bg3: #292e42;
-    --fg: #c0caf5; --fg2: #a9b1d6; --dim: #565f89;
-    --green: #9ece6a; --red: #f7768e; --blue: #7aa2f7;
+    --bg: #16121c; --bg2: #1f1a28; --bg3: #2a2336;
+    --fg: #cfc6e0; --fg2: #b3a8c6; --dim: #6d627e;
+    --green: #9ece6a; --red: #f7768e; --blue: #8b6cc7;
     --yellow: #e0af68; --cyan: #7dcfff; --orange: #ff9e64;
-    --purple: #bb9af7; --border: #3b4261;
+    --purple: #c4a6f5; --border: #3c3450;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -41,7 +40,7 @@
 
   main {
     flex: 1 1 auto; min-height: 0;
-    display: grid; grid-template-columns: 300px minmax(0, 1fr) 420px;
+    display: grid; grid-template-columns: 300px minmax(0, 1fr) minmax(0, 1fr);
   }
   .col { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); }
   .col:last-child { border-right: none; }
@@ -101,7 +100,11 @@
   }
   .hrow:hover { background: var(--bg3); }
   .hrow.selected { background: var(--bg3); box-shadow: inset 2px 0 0 var(--blue); }
+  .hrow.running { box-shadow: inset 2px 0 0 var(--green); }
+  .hrow.running.selected { box-shadow: inset 2px 0 0 var(--green); }
   .hrow.sub { padding-left: 46px; background: rgba(0,0,0,0.18); font-size: 11px; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .hrow.running .h-outcome { animation: pulse 1.4s ease-in-out infinite; }
   .h-check { flex: 0 0 auto; display: flex; align-items: center; }
   .h-check input[type=checkbox] {
     appearance: none; -webkit-appearance: none;
@@ -133,6 +136,7 @@
   .ok { color: var(--green); }
   .err { color: var(--red); }
   .muted { color: var(--dim); }
+  .running { color: var(--cyan); }
 
   .chip {
     display: inline-flex; align-items: center; gap: 6px; cursor: default;
@@ -273,6 +277,7 @@
   // ── State ────────────────────────────────────────────────────────────
   const ops = [];                 // oldest → newest
   const byId = new Map();         // op id → op
+  const bodiesByRowId = new Map(); // row id → {system, user, response}
   let cursor = '';                // opaque server cursor (a row id)
   let pinnedId = null;            // null ⇒ Live
   let missedWhilePinned = 0;
@@ -332,6 +337,7 @@
   }
   const GLYPHS = {
     ok: ['\u2713', 'ok'], bypassed: ['\u2298', 'muted'], none_relevant: ['\u2205', 'muted'],
+    running: ['\u25CF', 'running'],
   };
   function glyph(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[0]; }
   function glyphClass(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[1]; }
@@ -353,6 +359,7 @@
     return parts.join(' ');
   }
   function outcomeText(op) {
+    if (op.kind === 'running') return 'in flight';
     if (op.summary) return op.summary;
     if (op.kind === 'ok') return '';
     return op.kind.replace(/_/g, ' ');
@@ -449,7 +456,7 @@
     const multiProject = new Set(list.map(o => o.project || '')).size > 1;
     let html = '';
     for (const o of list) {
-      const sel = o.id === pinnedId ? ' selected' : '';
+      const sel = (o.id === pinnedId ? ' selected' : '') + (o.kind === 'running' ? ' running' : '');
       const more = o.n > 1
         ? '<span class="h-more" data-expand="' + esc(o.id) + '">\u22EE' + o.n + '</span>' : '';
       const proj = multiProject && o.project
@@ -469,7 +476,8 @@
         '<span class="h-input">' + esc(inputLine(o)) + '</span>' +
         '<span class="h-outcome ' + glyphClass(o.kind) + '">' + glyph(o.kind) + ' ' +
         esc(outcomeText(o)) + '</span>' +
-        '<span class="h-ms">' + esc(fmtMs(o.ms)) + '</span>' +
+        '<span class="h-ms"' + (o.kind === 'running' ? ' data-ts="' + esc(o.ts) + '"' : '') + '>' +
+        esc(o.kind === 'running' ? fmtMs((Date.now() / 1000 - o.ts) * 1000) : fmtMs(o.ms)) + '</span>' +
         '<span class="h-tok">' + esc(bytes) + '</span>' +
         '</div>';
       if (expanded.has(o.id)) {
@@ -537,6 +545,7 @@
     renderedDetailId = op.id;
     renderedRound = 0;
     paintDetail(op);
+    ensureBodies(op);
   }
   // Copyable block texts, by index. Deliberately not inlined into a
   // `data-copy` attribute: these carry JSON and shell commands, and quoting
@@ -568,14 +577,27 @@
     }
 
     html += block('input', JSON.stringify(op.input, null, 2), false);
-    html += block('resolved prompt',
-      'The fully resolved system and user prompt arrive over the live channel\n' +
-      '(SPEC-dashboard \u00a72.5, phase P3). Bodies are deliberately not written\n' +
-      'to the call log: at ~80 calls/day they would cut its ~7-month window to\n' +
-      'about two days.', true);
-    html += block('model response',
-      'Also live-channel only (P3). The log records the outcome and the usage,\n' +
-      'not the text.', true);
+    const bodies = bodiesByRowId.get(r.id) || {};
+    if (bodies.system || bodies.user) {
+      html += block('system prompt', bodies.system || '', false);
+      html += block('user prompt', bodies.user || '', false);
+    } else {
+      html += block('resolved prompt',
+        r.kind === 'running'
+          ? 'waiting for the live channel\u2026'
+          : 'not captured \u2014 the dashboard was not listening when this call ran.\n' +
+            'Bodies travel the live channel (SPEC-dashboard \u00a72.5) and are not written to the log.',
+        true);
+    }
+    if (bodies.response != null && bodies.response !== '') {
+      html += block('model response', bodies.response, false);
+    } else if (r.kind === 'running') {
+      html += block('model response', 'waiting for the model\u2026', true);
+    } else {
+      html += block('model response',
+        'not captured \u2014 the dashboard was not listening when this call finished.',
+        true);
+    }
 
     const kv = [
       ['preset', r.preset], ['attempt', r.attempt], ['outcome', r.kind],
@@ -690,6 +712,130 @@
     fill('f-via', new Set(ops.map(o => o.via).filter(Boolean)), 'via');
     fill('f-project', new Set(ops.map(o => o.project).filter(Boolean)), 'project');
   }
+
+  // ── Live channel ─────────────────────────────────────────────────────
+  function ingestBodies(row) {
+    if (!row || !row.id) return;
+    if (row.system == null && row.user == null && row.response == null) return;
+    const prev = bodiesByRowId.get(row.id) || {};
+    bodiesByRowId.set(row.id, {
+      system: row.system != null ? row.system : prev.system,
+      user: row.user != null ? row.user : prev.user,
+      response: row.response != null ? row.response : prev.response,
+    });
+  }
+  function liveRowFromEvent(ev) {
+    const kind = ev.kind === 'call.end'
+      ? ((ev.outcome && ev.outcome.kind) || 'ok')
+      : 'running';
+    return {
+      id: ev.id, op: ev.op, run: ev.run, ts: ev.ts, via: ev.via || '',
+      tool: ev.tool || '', preset: ev.preset || '', attempt: ev.attempt || 1,
+      project: ev.project || null, model: ev.model || null, input: ev.input || {},
+      kind: kind, summary: (ev.outcome && ev.outcome.summary) || null,
+      raw_bytes: 0, returned_bytes: 0,
+      tokens_in: (ev.usage && ev.usage.prompt_tokens) || 0,
+      tokens_out: (ev.usage && ev.usage.completion_tokens) || 0,
+      ms: ev.ms || 0, ok: kind !== 'running' ? (kind === 'ok' || kind === 'bypassed' || kind === 'none_relevant') : true,
+    };
+  }
+  function findOpByOpId(opId) {
+    for (const o of ops) { if (o.op === opId) return o; }
+    return null;
+  }
+  function applyLiveEvent(ev) {
+    if (!ev || !ev.id || !ev.kind) return;
+    ingestBodies(ev);
+    if (ev.kind === 'call.start') {
+      upsertLiveRow(ev);
+    } else if (ev.kind === 'call.end') {
+      const op = findOpByOpId(ev.op) || byId.get(ev.id);
+      if (op) {
+        const row = op.rows.find(r => r.id === ev.id);
+        if (row) {
+          const fresh = liveRowFromEvent(ev);
+          Object.assign(row, fresh);
+        }
+        if (op.kind === 'running') {
+          op.kind = (ev.outcome && ev.outcome.kind) || op.kind;
+          op.summary = (ev.outcome && ev.outcome.summary) || op.summary;
+          op.ms = (op.ms || 0) + (ev.ms || 0);
+        }
+        if (renderedDetailId === op.id) renderedDetailId = null;
+      } else {
+        upsertLiveRow(ev);
+      }
+      renderChip();
+      renderHistory(true);
+      renderDetail();
+    }
+  }
+  function upsertLiveRow(ev) {
+    let op = ev.op ? findOpByOpId(ev.op) : null;
+    const row = liveRowFromEvent(ev);
+    if (op) {
+      const i = op.rows.findIndex(r => r.id === ev.id);
+      if (i >= 0) op.rows[i] = Object.assign(op.rows[i], row);
+      else op.rows.push(row);
+      op.n = op.rows.length;
+      op.last_id = ev.id;
+      if (op.kind === 'running' || row.kind === 'running') {
+        // keep the operation marked in-flight until the log poll replaces it
+        if (row.kind === 'running') op.kind = 'running';
+      }
+      if (renderedDetailId === op.id) renderedDetailId = null;
+      byId.set(op.id, op);
+    } else {
+      op = {
+        id: ev.id, last_id: ev.id, op: ev.op, run: ev.run, ts: ev.ts,
+        via: ev.via || '', tool: ev.tool || '', project: ev.project || null,
+        model: ev.model || null, endpoint: ev.endpoint || null,
+        input: ev.input || {}, kind: row.kind, summary: row.summary,
+        ok: row.ok, n: 1, ms: row.ms,
+        tokens_in: row.tokens_in, tokens_out: row.tokens_out,
+        raw_bytes: 0, returned_bytes: 0, rows: [row],
+      };
+      ops.push(op);
+      byId.set(op.id, op);
+      if (pinnedId !== null && backfilled && matches(op)) missedWhilePinned++;
+    }
+    refreshOptions();
+    renderChip();
+    renderHistory(true);
+    renderDetail();
+  }
+  function ensureBodies(op) {
+    if (!op || !op.rows || !op.rows.length) return;
+    const missing = op.rows.filter(r => !bodiesByRowId.has(r.id));
+    if (!missing.length) return;
+    const id = op.rows[0].id;
+    fetch('/api/call/' + encodeURIComponent(id)).then(r => r.json()).then(d => {
+      for (const r of (d.rows || [])) ingestBodies(r);
+      // Remember a miss so we do not refetch every paint of an old row.
+      for (const r of missing) {
+        if (!bodiesByRowId.has(r.id)) bodiesByRowId.set(r.id, {});
+      }
+      const cur = currentOp();
+      if (cur && cur.id === op.id) {
+        renderedDetailId = null;
+        renderDetail();
+      }
+    }).catch(() => {});
+  }
+  function startLiveStream() {
+    if (typeof EventSource === 'undefined') return;
+    const es = new EventSource('/api/stream');
+    es.onmessage = e => {
+      try { applyLiveEvent(JSON.parse(e.data)); } catch (_) { /* drop a bad frame */ }
+    };
+  }
+  setInterval(() => {
+    const now = Date.now() / 1000;
+    document.querySelectorAll('.hrow.running .h-ms[data-ts]').forEach(el => {
+      const ts = parseFloat(el.getAttribute('data-ts') || '0');
+      if (ts) el.textContent = fmtMs((now - ts) * 1000);
+    });
+  }, 1000);
 
   // ── Polling ──────────────────────────────────────────────────────────
   function mergeOps(fresh) {
@@ -807,6 +953,7 @@
   pollStatus();
   pollHistory();
   renderChip();
+  startLiveStream();
   setInterval(pollHistory, 2000);
   setInterval(pollStatus, 15000);
 })();

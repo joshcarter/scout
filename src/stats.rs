@@ -212,6 +212,10 @@ pub fn input_summary(preset: &str, args: &Value) -> Value {
 pub struct CallRecord {
     pub tool: String,
     pub preset: String,
+    /// Minted at construction, not at write time: `call.start` has to carry
+    /// the same `id` the log line will, or the daemon cannot reconcile the
+    /// two arrivals (SPEC-dashboard P3).
+    pub id: String,
     /// The user-facing operation this row belongs to — the grouping key the
     /// dashboard reads.  A record built on its own is its own operation; a
     /// record parked with a `Ledger` takes the ledger's.
@@ -229,6 +233,9 @@ pub struct CallRecord {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub ms: u64,
+    /// Set when the record is built from a silent ledger so the live channel
+    /// does not fire from unit tests into a developer dashboard.
+    pub(crate) silent: bool,
 }
 
 impl CallRecord {
@@ -240,6 +247,7 @@ impl CallRecord {
         CallRecord {
             tool: tool.to_string(),
             preset: preset.to_string(),
+            id: next_id(),
             op: next_id(),
             via: VIA_CLI.to_string(),
             attempt: 1,
@@ -254,6 +262,7 @@ impl CallRecord {
             tokens_in: 0,
             tokens_out: 0,
             ms: 0,
+            silent: false,
         }
     }
 
@@ -337,7 +346,7 @@ impl CallRecord {
             .unwrap_or(0.0);
         let mut m = Map::new();
         m.insert("v".into(), Value::from(2));
-        m.insert("id".into(), Value::from(next_id()));
+        m.insert("id".into(), Value::from(self.id.clone()));
         m.insert("run".into(), Value::from(run_id()));
         m.insert("op".into(), Value::from(self.op.clone()));
         m.insert("ts".into(), Value::from(ts));
@@ -459,6 +468,16 @@ impl Ledger {
         if !self.silent {
             rec.log();
         }
+    }
+
+    /// The operation id every row of this ledger carries.  Exposed so
+    /// `call.start` can stamp it before `record` parks the row.
+    pub fn op(&self) -> &str {
+        &self.op
+    }
+
+    pub(crate) fn is_silent(&self) -> bool {
+        self.silent
     }
 
     /// Milliseconds since the operation began.  This is what a bypassed row
@@ -969,6 +988,16 @@ mod tests {
             v["id"].as_str().unwrap().rsplit('-').next().unwrap().parse::<u64>().unwrap()
         };
         assert!(seq(&rows[1]) > seq(&rows[0]), "the counter only goes up");
+    }
+
+    #[test]
+    fn a_records_id_is_stable_across_serialisations() {
+        let rec = CallRecord::new("grep", "grep");
+        let a = rec.to_json();
+        let b = rec.to_json();
+        assert_eq!(a["id"], b["id"], "id is minted once, at construction");
+        assert_eq!(a["id"], rec.id);
+        assert_ne!(a["id"], a["op"], "id and op are distinct next_id() calls");
     }
 
     #[test]
