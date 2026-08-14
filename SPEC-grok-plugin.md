@@ -15,9 +15,11 @@ capable of delivering — without breaking the Claude plugin.
 
 **The short version:** the packaging problem is solved and the fix is smaller
 than expected — one MCP command spelling works in both harnesses, and Grok's
-copy-on-install will carry the binary. The steering problem is worse than
-expected: Grok does not run plugin hooks at all, so two of scout's three
-delivery mechanisms have to move somewhere else.
+copy-on-install will carry the binary. The steering problem is half solved:
+Grok does not run plugin hooks at all and no packaging change reaches them, so
+the build/test redirect and shell-safety screening are permanently Claude-only.
+Guidance does have a route — a `skills/` entry in the payload, which loads and
+which the model quotes back.
 
 ---
 
@@ -160,6 +162,31 @@ This is not a substitution failure — Grok expanded the *same*
 parses `hooks/hooks.json` (`grok inspect` reports the plugin as providing a
 file hook) but does not execute it.
 
+A second probe (`hookprobe`) then tried every plausible declaration site at
+once, each pointing at one recorder with a distinct site name:
+
+| Site | Fired? |
+|---|---|
+| `.grok-plugin/plugin.json`, inline `hooks` object | no |
+| payload-root `plugin.json`, `"hooks": "./hooks/alt-hooks.json"` path string | no |
+| `.claude-plugin/plugin.json`, inline `hooks` object | no |
+| `.grok-plugin/hooks.json`, PascalCase events | no |
+| `.grok-plugin/hooks.json`, `session_start` / `pre_tool_use` | no |
+| payload-root `hooks.json` | no |
+| `hooks/hooks.json` (what scout ships) | no |
+
+Six locations, both event-name casings, both the inline-object and the
+path-string manifest forms. The plugin installed cleanly and its MCP server
+spawned five times in the same session, so the payload was live throughout.
+**Nothing fired.**
+
+This closes the question: it is not a shape problem. Grok Build 1.0.3 does not
+execute plugin hooks, and no packaging change reaches them. That xAI's own
+marketplace `CONTRIBUTING.md` lists hooks as a reviewable component and warns
+against "lifecycle hooks that run shell on `Bash`/`Write` with no matcher"
+suggests the feature is intended and not yet wired up, so this is worth
+retesting on a later Grok release — but nothing in scout can move it.
+
 Previous speculation about matcher names (`Bash` vs `run_terminal_command`) is
 untestable until hooks run at all. The union matcher is still the right shape
 and costs nothing, but do not expect it to do anything on Grok today.
@@ -203,6 +230,19 @@ different versions. `registry.json` recorded:
 `plugins/probe/.claude-plugin/plugin.json` (`0.0.1`), which is the only
 location Claude accepts. Two manifest copies are required. See §3.3.
 
+`hookprobe` extended this to three candidates, each declaring a differently
+named MCP server so the winner is visible in `grok mcp doctor`. Payload-root
+won again — registry version `0.0.2`, and `hp-root` was the **only** server
+registered (`plugin: hookprobe — 1 server`). Neither `.grok-plugin/plugin.json`
+(`0.0.3`, `hp-grokdir`) nor `.claude-plugin/plugin.json` (`0.0.1`,
+`hp-claudedir`) contributed anything.
+
+So Grok reads exactly one manifest and payload-root outranks
+`.grok-plugin/`, even though `.grok-plugin/plugin.json` is what the one
+official Grok-native plugin in the xAI marketplace (`neon`) uses — presumably
+it works when it is the only manifest present. scout does not need a
+`.grok-plugin/` directory: payload-root for Grok, `.claude-plugin/` for Claude.
+
 ### 2.8 Project `.mcp.json` is attributed to the plugin — CONFIRMED
 
 Repo-root `.mcp.json` holds a `ct` entry for working *on* this checkout.
@@ -243,6 +283,21 @@ schemas, while MCP tools are a second hop (`search_tool` then `use_tool`).
 Combined with a dead or undiscovered scout server, the model uses built-in
 search. Packaging plus guidance, not a model-preference mystery.
 
+### 2.11 Plugin skills DO load — NEW, and this is the way in
+
+`hookprobe` shipped `skills/hookprobe/SKILL.md` carrying its own sentinel. The
+Grok session reported the skill **listed in the available-skills inventory it
+was given**, and quoted the sentinel back. The SKILL.md itself insists on that
+distinction, because an agent that greps the filesystem for a sentinel proves
+nothing.
+
+So a Grok plugin can deliver instructions to the model. Not through
+`additionalContext` (§2.10) and not through hooks (§2.5) — through `skills/`.
+That is also what `neon`, the one official Grok-native plugin in the xAI
+marketplace, ships instead of hooks.
+
+This is the channel scout's delegation table has to travel down. See §3.6.
+
 ---
 
 ## 3. Resolution
@@ -261,9 +316,13 @@ plugins/scout/
   hooks/shell-safety.sh
   hooks/prefer-local-llm.sh
   scripts/ensure-binary.sh             # shrinks — see §3.5
+  skills/scout/SKILL.md                # the only guidance channel Grok has (§3.6)
   bin/scout                            # the real binary, put there by `make`
   bin/.gitkeep
 ```
+
+No `.grok-plugin/` directory: Grok reads the payload-root `plugin.json` and
+only ever reads one manifest (§2.7).
 
 Claude accepts a subdirectory source — that is the ordinary multi-plugin
 marketplace shape; `source: "./"` is the special case and the one Grok drops.
@@ -370,12 +429,17 @@ wearing the same name. Rename it, or fold it into a small
 `scripts/session-context.sh`, and delete the version compare, the mtime check,
 and the `cargo install scout-llm` fallback.
 
-### 3.6 Guidance: `AGENTS.md` is the only Grok channel
+### 3.6 Guidance: ship a `SKILL.md` in the payload
 
-`additionalContext` reaches Claude and nothing else (§2.10). Put the delegation
-table in an `AGENTS.md` at repo root, which Grok auto-loads. Keep the
-`additionalContext` copy for Claude — it is the only channel that works
-in sessions outside this repo.
+`additionalContext` reaches Claude and nothing else (§2.10); hooks reach
+nothing at all under Grok (§2.5). Skills load (§2.11), so the payload gets
+`plugins/scout/skills/scout/SKILL.md` carrying the delegation table.
+
+A skill is strictly better than the `AGENTS.md` alternative for this: it
+travels with the plugin, so it works in any Grok session rather than only in
+sessions whose cwd is this repo. Add `AGENTS.md` too if you want the table
+present when working *on* scout — it is cheap — but the skill is the one that
+matters.
 
 Content is the table that already exists in `ensure-binary.sh`: prefer
 `check_output` / `extract` / `grep(pattern, intent)` for token-heavy work; the
@@ -384,20 +448,30 @@ names. Per `CLAUDE.md`, do not bake a fully-qualified MCP tool name into it.
 Do not tell the model to use scout for every identifier search — the Claude
 guidance does not say that either.
 
-Two copies of this text now exist. Generate one from the other, or accept the
-duplication and note it in both.
+The skill's `description` frontmatter is what decides whether it ever gets
+invoked, so it should name the triggering situations (large file, noisy grep,
+build or test output) rather than describe scout.
 
-### 3.7 Hooks: Claude-only, pending one more probe
+Two copies of this text now exist — `ensure-binary.sh` for Claude, `SKILL.md`
+for Grok. Generate one from the other, or accept the duplication and note it in
+both.
 
-Ship `hooks/hooks.json` with the union matcher `Bash|run_terminal_command`. It
-is correct for Claude, costs nothing, and is inert on Grok (§2.5).
+Worth noting the layer that does *not* transfer: under Claude, scout's steering
+is three layers (guidance, MCP tool descriptions, PreToolUse hooks) and the
+hooks are the only one that fires without the model choosing to cooperate.
+Grok gets the two passive layers. Expect weaker routing there, and do not read
+a Grok session's preference for native `grep` as a scout bug.
 
-Whether Grok's hooks are recoverable is worth one narrow probe: try hooks
-declared inline in `plugin.json` rather than a sibling `hooks/hooks.json`, a
-`.grok-plugin/hooks.json`, and Grok's own documented event names if they differ
-from Claude's. Grok parses the file today but does not execute it, so the shape
-is the most likely culprit. Until that resolves, treat the redirect and
-shell-safety layers as Claude-only features and say so in the README.
+### 3.7 Hooks: Claude-only, settled
+
+Keep `hooks/hooks.json` exactly where it is, with the union matcher
+`Bash|run_terminal_command`. It is correct for Claude, costs nothing, and is
+inert on Grok — and per §2.5 no other location or spelling changes that.
+
+The build/test redirect and shell-safety auto-allow are therefore **Claude-only
+features**. Say so plainly in the README rather than letting a Grok user infer
+that scout is misbehaving. Retest on a future Grok release; the feature looks
+intended, not rejected.
 
 ### 3.8 Local workaround until the above ships
 
@@ -428,17 +502,20 @@ Once §3.1–3.3 are in:
    `grep` / `ping`, not ct's 46 tools.
 7. A scout MCP call succeeds on a machine with no `~/.config/scout/config.toml`
    (§3.4).
+8. The Grok session lists a `scout` skill in its available-skills inventory
+   without being asked to search for it (§3.6), and routes a large-file
+   question to `extract` rather than `read_file`.
 
 Claude Code smoke:
 
-8. `/plugin install scout@scout` from the directory marketplace still resolves
+9. `/plugin install scout@scout` from the directory marketplace still resolves
    against the new `source: "./plugins/scout"`.
-9. MCP spawns on the **first** session (no plugin-data bootstrap).
-10. `make build` leaves `plugins/scout/bin/scout` current; a rebuild is picked
+10. MCP spawns on the **first** session (no plugin-data bootstrap).
+11. `make build` leaves `plugins/scout/bin/scout` current; a rebuild is picked
     up after a restart.
-11. Both PreToolUse hooks still fire; `ct` still comes from project `.mcp.json`
+12. Both PreToolUse hooks still fire; `ct` still comes from project `.mcp.json`
     when the cwd is this repo.
-12. Does Claude accept the payload-root `plugin.json`? If yes, drop
+13. Does Claude accept the payload-root `plugin.json`? If yes, drop
     `.claude-plugin/plugin.json` from the payload (§3.3).
 
 ---
@@ -458,10 +535,16 @@ Closed by measurement:
 - **Will Grok carry a 12M binary in the payload?** Yes, exec bit intact, and it
   runs (§2.2).
 
+- **Are Grok's plugin hooks recoverable?** No. Six declaration sites, two event
+  vocabularies, two manifest forms — all silent (§2.5). Not a packaging
+  problem, so not scout's to fix.
+- **How does guidance reach a Grok session?** A `skills/` entry in the payload.
+  Proven loaded and quoted back (§2.11).
+- **Does scout need a `.grok-plugin/` directory?** No. Payload-root
+  `plugin.json` outranks it, and only one manifest is ever read (§2.7).
+
 Still open:
 
-- **Are Grok's plugin hooks recoverable at all?** §3.7. Determines whether the
-  redirect and shell-safety layers are Claude-only permanently.
 - **Does Claude accept a payload-root `plugin.json`?** If so, one manifest
   instead of two (§3.3).
 - **Prebuilt release binaries.** Deferred, but it is what makes scout
