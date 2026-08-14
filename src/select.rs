@@ -62,8 +62,9 @@ pub struct Ctx<'a> {
     pub via: &'static str,
     /// The user-facing operation this context belongs to (`find`, `edit`),
     /// which is not the preset a given round-trip sends (`find_patterns`).
-    /// One `find` writes three or four rows; they share this and a `run` id,
-    /// which is what lets the log group them back into one operation.
+    /// One `find` writes three or four rows; they share this and the `op` id
+    /// minted by `ledger`, which is what lets the log group them back into one
+    /// operation.
     pub tool: String,
     /// `find`'s round counter, read by every record written during that round.
     pub attempt: std::cell::Cell<u64>,

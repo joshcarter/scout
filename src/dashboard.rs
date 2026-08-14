@@ -124,6 +124,10 @@ fn resolve_port(flag: Option<u16>) -> u16 {
 #[derive(Debug, Clone)]
 struct Row {
     id: String,
+    /// The operation this row belongs to — the grouping key, stamped by the
+    /// writer's ledger.  A row from before `op` was recorded falls back to its
+    /// own `id`, which makes it an operation of one; see `group_ops`.
+    op: String,
     run: String,
     ts: f64,
     via: String,
@@ -159,6 +163,7 @@ impl Row {
             .map(str::to_string)
             .unwrap_or_else(|| if ok { "ok" } else { "unknown" }.to_string());
         Some(Row {
+            op: s("op").unwrap_or_else(|| id.clone()),
             run: s("run").unwrap_or_else(|| id.clone()),
             id,
             ts: v.get("ts").and_then(Value::as_f64).unwrap_or(0.0),
@@ -185,16 +190,10 @@ impl Row {
         self.kind == Outcome::Bypassed.as_str()
     }
 
-    /// When the round-trip *began* — the log stamps `ts` as the row is written,
-    /// which is the end.  Used to tell an operation's own rounds from two
-    /// unrelated calls of one long-lived process; see `group_ops`.
-    fn started(&self) -> f64 {
-        self.ts - self.ms as f64 / 1000.0
-    }
-
     fn to_json(&self) -> Value {
         json!({
             "id": self.id,
+            "op": self.op,
             "run": self.run,
             "ts": self.ts,
             "via": self.via,
@@ -326,31 +325,34 @@ impl Tail {
 
 // ── Operations ──────────────────────────────────────────────────────────────
 
-/// Consecutive rows of one `run` written without an idle gap between them.
+/// Row indices grouped by `op`, one entry per user-facing operation, ordered by
+/// where each operation first appears in the log.
 ///
-/// The gap test is not decoration.  §3 mints `run` once per *process*, which
-/// groups `find`'s three or four rounds exactly as intended — but `scout mcp`
-/// is one process for a whole Claude Code session (§1's own table says so), so
-/// `run` alone would collapse every MCP call of a session into a single
-/// history row.  Within one operation the rounds are back-to-back: the model
-/// answers, scout does a little local work, the next round starts.  Between two
-/// tool calls of a session there is a human and a cloud model in the way.
+/// `op` is ground truth, not an inference: the writer's `Ledger` is constructed
+/// once per MCP dispatch and once per CLI invocation, and stamps its id on
+/// every row it parks — so the three or four rows one `scout find` writes carry
+/// the same `op`, and two tool calls of one long-lived `scout mcp` do not.
+/// `run` cannot stand in for it; it names the *process*, and an MCP server's
+/// process is a whole Claude Code session (§1's own table says so).
 ///
-/// Biased toward splitting: over-splitting a `find` costs a ⋮ marker, while
-/// over-grouping costs the history pane its entire meaning.
-const OP_GAP_SECS: f64 = 5.0;
-
-/// Index ranges into `rows`, in log order, one per user-facing operation.
-fn group_ops(rows: &[Row]) -> Vec<(usize, usize)> {
-    let mut ops: Vec<(usize, usize)> = Vec::new();
+/// Deliberately not "consecutive rows of one `op`": `mcp_server` dispatches on
+/// `spawn_blocking`, so two parallel tool calls interleave their rows in the
+/// log, and an operation that straddles a rotation is read from two files.
+/// Identity does not care about position, so neither does this.
+///
+/// A row written before `op` was recorded falls back to its own `id` in
+/// `Row::parse`, so it is an operation of one — which is also what a v1 row,
+/// carrying no identity at all, degrades to.
+fn group_ops(rows: &[Row]) -> Vec<Vec<usize>> {
+    let mut ops: Vec<Vec<usize>> = Vec::new();
+    let mut slot: HashMap<&str, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        let joins = ops.last().is_some_and(|&(start, end)| {
-            let prev = &rows[end];
-            prev.run == row.run && row.started() - prev.ts <= OP_GAP_SECS && start <= end
-        });
-        match (joins, ops.last_mut()) {
-            (true, Some(last)) => last.1 = i,
-            _ => ops.push((i, i)),
+        match slot.get(row.op.as_str()) {
+            Some(&at) => ops[at].push(i),
+            None => {
+                slot.insert(row.op.as_str(), ops.len());
+                ops.push(vec![i]);
+            }
         }
     }
     ops
@@ -361,13 +363,13 @@ fn group_ops(rows: &[Row]) -> Vec<(usize, usize)> {
 ///
 /// Summing is the whole point.  P1's ledger parks the newest record and lets
 /// the *first* row of an operation claim `raw_bytes` while the *last* one
-/// carries `returned_bytes` — so a per-row ratio is meaningless and a per-run
+/// carries `returned_bytes` — so a per-row ratio is meaningless and a per-`op`
 /// ratio is the metric.
-fn op_json(rows: &[Row], (start, end): (usize, usize)) -> Value {
-    let slice = &rows[start..=end];
-    let first = &slice[0];
-    let last = &slice[slice.len() - 1];
-    let sum = |f: fn(&Row) -> u64| slice.iter().map(f).sum::<u64>();
+fn op_json(rows: &[Row], op: &[usize]) -> Value {
+    let slice: Vec<&Row> = op.iter().map(|i| &rows[*i]).collect();
+    let first = slice[0];
+    let last = slice[slice.len() - 1];
+    let sum = |f: fn(&Row) -> u64| slice.iter().map(|r| f(r)).sum::<u64>();
 
     // A failure is the interesting thing about an operation that had one;
     // otherwise the last row's verdict wins, because `none_relevant` and the
@@ -387,6 +389,7 @@ fn op_json(rows: &[Row], (start, end): (usize, usize)) -> Value {
     json!({
         "id": first.id,
         "last_id": last.id,
+        "op": first.op,
         "run": first.run,
         "ts": first.ts,
         "end_ts": last.ts,
@@ -405,7 +408,7 @@ fn op_json(rows: &[Row], (start, end): (usize, usize)) -> Value {
         "tokens_out": sum(|r| r.tokens_out),
         "raw_bytes": sum(|r| r.raw_bytes),
         "returned_bytes": sum(|r| r.returned_bytes),
-        "rows": slice.iter().map(Row::to_json).collect::<Vec<_>>(),
+        "rows": slice.iter().map(|r| r.to_json()).collect::<Vec<_>>(),
     })
 }
 
@@ -770,36 +773,36 @@ fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
         .and_then(|id| rows.iter().position(|r| &r.id == id));
     let known = params.get("since").is_some_and(|s| !s.is_empty());
 
-    let want = |op: &(usize, usize)| -> bool {
+    let want = |op: &Vec<usize>| -> bool {
         if let Some(cut) = since_idx {
-            if op.1 <= cut {
+            if op.iter().all(|i| *i <= cut) {
                 return false;
             }
         }
         let matches = |key: &str, value: &str| {
             params.get(key).is_none_or(|want| want.is_empty() || want == value)
         };
-        let first = &rows[op.0];
+        let first = &rows[op[0]];
         if !matches("tool", &first.tool) || !matches("via", &first.via) {
             return false;
         }
         if let Some(want) = params.get("project").filter(|p| !p.is_empty()) {
-            if !rows[op.0..=op.1].iter().any(|r| r.project.as_deref() == Some(want.as_str())) {
+            if !op.iter().any(|i| rows[*i].project.as_deref() == Some(want.as_str())) {
                 return false;
             }
         }
         if params.get("failed").is_some_and(|v| v == "1" || v == "true") {
-            return rows[op.0..=op.1].iter().any(|r| !r.ok);
+            return op.iter().any(|i| !rows[*i].ok);
         }
         true
     };
 
-    let selected: Vec<&(usize, usize)> = ops.iter().filter(|op| want(op)).collect();
+    let selected: Vec<&Vec<usize>> = ops.iter().filter(|op| want(op)).collect();
     let page: Vec<Value> = selected
         .iter()
         .rev()
         .take(limit)
-        .map(|op| op_json(rows, **op))
+        .map(|op| op_json(rows, op))
         .collect();
 
     json!({
@@ -818,8 +821,8 @@ fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
 fn call_json(tail: &Tail, id: &str) -> Option<Value> {
     let rows = &tail.rows;
     let idx = rows.iter().position(|r| r.id == id)?;
-    let op = group_ops(rows).into_iter().find(|(s, e)| *s <= idx && idx <= *e)?;
-    let mut v = op_json(rows, op);
+    let op = group_ops(rows).into_iter().find(|op| op.contains(&idx))?;
+    let mut v = op_json(rows, &op);
     // P3 carries prompt and response bodies over the live channel; the route
     // exists now so a pinned `#call/<id>` is reloadable, and says plainly that
     // the bodies are not here yet.
@@ -1279,7 +1282,8 @@ mod tests {
             r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#,
         );
         assert_eq!(r.id, "fallback", "a v1 row has no id of its own");
-        assert_eq!(r.run, "fallback", "...so it is its own operation");
+        assert_eq!(r.op, "fallback", "...so it is its own operation");
+        assert_eq!(r.run, "fallback");
         assert_eq!(r.tool, "grep", "the preset is the only name it has");
         assert_eq!(r.kind, "ok");
         assert_eq!(r.ts, 1_770_000_000.0, "an integer ts must not read as 0");
@@ -1297,13 +1301,14 @@ mod tests {
     #[test]
     fn a_v2_row_keeps_every_field_the_panes_read() {
         let r = row(
-            r#"{"v":2,"id":"abc-1","run":"abc","ts":1770000000.482,"via":"mcp","tool":"find",
+            r#"{"v":2,"id":"abc-1","run":"abc","op":"abc-op","ts":1770000000.482,"via":"mcp","tool":"find",
                 "preset":"find_patterns","attempt":2,"project":"/p","model":"m","endpoint":"e",
                 "input":{"question":"where"},"outcome":{"kind":"ok","summary":"8 patterns"},
                 "raw_bytes":184320,"returned_bytes":1180,"tokens_in":1840,"tokens_out":210,
                 "ms":3100,"ok":true}"#,
         );
         assert_eq!(r.id, "abc-1");
+        assert_eq!(r.op, "abc-op");
         assert_eq!(r.run, "abc");
         assert_eq!(r.via, "mcp");
         assert_eq!(r.tool, "find");
@@ -1324,55 +1329,91 @@ mod tests {
     // ── Grouping ─────────────────────────────────────────────────────────
 
     #[test]
-    fn rows_of_one_run_collapse_into_one_operation() {
+    fn rows_of_one_op_collapse_into_one_operation() {
         // A `find` is three preset calls and one operation to a human.
         let rows: Vec<Row> = [
-            v2("r-1", "r", 100.0, r#","preset":"find_patterns""#),
-            v2("r-2", "r", 101.0, r#","preset":"grep""#),
-            v2("r-3", "r", 102.0, r#","preset":"find_reflect""#),
+            v2("r-1", "r", 100.0, r#","op":"r-op","preset":"find_patterns""#),
+            v2("r-2", "r", 101.0, r#","op":"r-op","preset":"grep""#),
+            v2("r-3", "r", 102.0, r#","op":"r-op","preset":"find_reflect""#),
         ]
         .iter()
         .map(|s| row(s))
         .collect();
         let ops = group_ops(&rows);
-        assert_eq!(ops, vec![(0, 2)]);
-        let v = op_json(&rows, ops[0]);
+        assert_eq!(ops, vec![vec![0, 1, 2]]);
+        let v = op_json(&rows, &ops[0]);
         assert_eq!(v["n"], 3, "the ⋮n marker");
+        assert_eq!(v["op"], "r-op");
         assert_eq!(v["rows"].as_array().unwrap().len(), 3);
     }
 
     #[test]
-    fn an_idle_gap_splits_one_process_into_two_operations() {
-        // `scout mcp` is one process for a whole Claude Code session, so `run`
-        // alone would collapse a session's every tool call into one row.
-        let rows: Vec<Row> = [v2("s-1", "s", 100.0, ""), v2("s-2", "s", 400.0, "")]
-            .iter()
-            .map(|s| row(s))
-            .collect();
-        assert_eq!(group_ops(&rows), vec![(0, 0), (1, 1)]);
-    }
-
-    #[test]
-    fn a_long_round_trip_does_not_split_its_own_operation() {
-        // The gap is measured from the previous row's end to this row's
-        // *start*, so a 40s call inside one operation stays inside it.
+    fn two_operations_of_one_process_stay_apart() {
+        // `scout mcp` is one process — one `run` — for a whole Claude Code
+        // session, so `run` alone would collapse a session's every tool call
+        // into one history row.  `op` is what keeps them apart.
         let rows: Vec<Row> = [
-            v2("s-1", "s", 100.0, ""),
-            v2("s-2", "s", 141.0, r#","ms":40000"#),
+            v2("s-1", "s", 100.0, r#","op":"s-op1""#),
+            v2("s-2", "s", 100.2, r#","op":"s-op2""#),
         ]
         .iter()
         .map(|s| row(s))
         .collect();
-        assert_eq!(group_ops(&rows), vec![(0, 1)]);
+        assert_eq!(group_ops(&rows), vec![vec![0], vec![1]]);
     }
 
     #[test]
-    fn different_runs_never_merge() {
+    fn one_operation_holds_together_across_any_wall_clock_gap() {
+        // The record says these rows are one operation, so no elapsed time
+        // between them — a slow model, a long local walk — can split them.
+        let rows: Vec<Row> = [
+            v2("s-1", "s", 100.0, r#","op":"s-op""#),
+            v2("s-2", "s", 4000.0, r#","op":"s-op","ms":40000"#),
+        ]
+        .iter()
+        .map(|s| row(s))
+        .collect();
+        assert_eq!(group_ops(&rows), vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn interleaved_rows_of_two_concurrent_operations_still_sort_themselves_out() {
+        // `mcp_server` dispatches on `spawn_blocking`, so two parallel tool
+        // calls write into the log turn by turn.  Identity does not care.
+        let rows: Vec<Row> = [
+            v2("x-1", "s", 100.0, r#","op":"x""#),
+            v2("y-1", "s", 100.1, r#","op":"y""#),
+            v2("x-2", "s", 100.2, r#","op":"x""#),
+            v2("y-2", "s", 100.3, r#","op":"y""#),
+        ]
+        .iter()
+        .map(|s| row(s))
+        .collect();
+        assert_eq!(group_ops(&rows), vec![vec![0, 2], vec![1, 3]], "first seen, first listed");
+    }
+
+    #[test]
+    fn a_row_with_no_op_is_an_operation_of_one() {
+        // History written before `op` existed — and every v1 row, which has no
+        // identity at all.  Each stands alone rather than being guessed at.
+        let rows: Vec<Row> = [
+            v2("a-1", "a", 100.0, ""),
+            v2("a-2", "a", 100.1, ""),
+            r#"{"ts":1770000000,"preset":"grep","ok":true}"#.to_string(),
+        ]
+        .iter()
+        .map(|s| row(s))
+        .collect();
+        assert_eq!(group_ops(&rows), vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn different_ops_never_merge() {
         let rows: Vec<Row> = [v2("a-1", "a", 100.0, ""), v2("b-1", "b", 100.5, "")]
             .iter()
             .map(|s| row(s))
             .collect();
-        assert_eq!(group_ops(&rows), vec![(0, 0), (1, 1)]);
+        assert_eq!(group_ops(&rows), vec![vec![0], vec![1]]);
     }
 
     #[test]
@@ -1381,13 +1422,13 @@ mod tests {
         // claim `raw_bytes` and stamps `returned_bytes` on the *last*, so a
         // per-row ratio is meaningless and a per-run ratio is the metric.
         let rows: Vec<Row> = [
-            v2("r-1", "r", 100.0, r#","raw_bytes":100000,"tokens_in":10,"ms":900"#),
-            v2("r-2", "r", 101.0, r#","returned_bytes":1000,"tokens_in":5,"ms":800"#),
+            v2("r-1", "r", 100.0, r#","op":"r-op","raw_bytes":100000,"tokens_in":10,"ms":900"#),
+            v2("r-2", "r", 101.0, r#","op":"r-op","returned_bytes":1000,"tokens_in":5,"ms":800"#),
         ]
         .iter()
         .map(|s| row(s))
         .collect();
-        let v = op_json(&rows, group_ops(&rows)[0]);
+        let v = op_json(&rows, &group_ops(&rows)[0]);
         assert_eq!(v["raw_bytes"], 100_000);
         assert_eq!(v["returned_bytes"], 1000);
         assert_eq!(v["tokens_in"], 15);
@@ -1397,15 +1438,15 @@ mod tests {
     #[test]
     fn a_failed_row_names_the_operations_outcome() {
         let rows: Vec<Row> = [
-            v2("r-1", "r", 100.0, ""),
-            r#"{"v":2,"id":"r-2","run":"r","ts":101,"preset":"grep","ok":false,
+            v2("r-1", "r", 100.0, r#","op":"r-op""#),
+            r#"{"v":2,"id":"r-2","run":"r","op":"r-op","ts":101,"preset":"grep","ok":false,
                 "outcome":{"kind":"endpoint_unreachable","summary":"down"}}"#
                 .replace('\n', ""),
         ]
         .iter()
         .map(|s| row(s))
         .collect();
-        let v = op_json(&rows, group_ops(&rows)[0]);
+        let v = op_json(&rows, &group_ops(&rows)[0]);
         assert_eq!(v["ok"], false);
         assert_eq!(v["kind"], "endpoint_unreachable");
         assert_eq!(v["summary"], "down");
@@ -1414,13 +1455,13 @@ mod tests {
     #[test]
     fn an_operations_input_comes_from_whichever_row_carries_one() {
         let rows: Vec<Row> = [
-            v2("r-1", "r", 100.0, r#","input":{}"#),
-            v2("r-2", "r", 101.0, r#","input":{"question":"where does it bind"}"#),
+            v2("r-1", "r", 100.0, r#","op":"r-op","input":{}"#),
+            v2("r-2", "r", 101.0, r#","op":"r-op","input":{"question":"where does it bind"}"#),
         ]
         .iter()
         .map(|s| row(s))
         .collect();
-        let v = op_json(&rows, group_ops(&rows)[0]);
+        let v = op_json(&rows, &group_ops(&rows)[0]);
         assert_eq!(v["input"]["question"], "where does it bind");
     }
 
@@ -1581,7 +1622,10 @@ mod tests {
 
     #[test]
     fn a_call_lookup_finds_the_operation_from_any_of_its_rows() {
-        let t = tail_of(&[v2("r-1", "r", 100.0, ""), v2("r-2", "r", 101.0, "")]);
+        let t = tail_of(&[
+            v2("r-1", "r", 100.0, r#","op":"r-op""#),
+            v2("r-2", "r", 101.0, r#","op":"r-op""#),
+        ]);
         for id in ["r-1", "r-2"] {
             let v = call_json(&t, id).expect("both rows reach the same operation");
             assert_eq!(v["id"], "r-1");

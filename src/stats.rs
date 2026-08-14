@@ -43,9 +43,13 @@ pub fn log_path() -> Option<PathBuf> {
 /// This process's `run` id, minted once.
 ///
 /// A pid is unique among *live* processes and the millisecond separates the
-/// reuses, which is all this has to do: it groups the three or four rows one
-/// `scout find` writes into one user-facing operation.  No uuid dependency,
-/// and no way for two concurrent scout processes to collide.
+/// reuses, which is all this has to do: it names the process every row of the
+/// log was written by.  No uuid dependency, and no way for two concurrent
+/// scout processes to collide.
+///
+/// Deliberately *not* the grouping key for a user-facing operation — `scout
+/// mcp` is one process for a whole Claude Code session (SPEC-dashboard §1), so
+/// a whole session shares one `run`.  That is `op`; see `Ledger`.
 pub fn run_id() -> &'static str {
     static RUN: OnceLock<String> = OnceLock::new();
     RUN.get_or_init(|| {
@@ -60,6 +64,9 @@ pub fn run_id() -> &'static str {
 /// `run` plus a per-process counter: monotonic within a run, so a `find`'s
 /// rounds sort into the order they were actually made even when two land in
 /// the same millisecond.
+///
+/// The one source of ids in this module — a row's `id` and an operation's `op`
+/// both come from here, so no two of either can collide inside a process.
 fn next_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     format!("{}-{}", run_id(), SEQ.fetch_add(1, Ordering::Relaxed) + 1)
@@ -205,6 +212,10 @@ pub fn input_summary(preset: &str, args: &Value) -> Value {
 pub struct CallRecord {
     pub tool: String,
     pub preset: String,
+    /// The user-facing operation this row belongs to — the grouping key the
+    /// dashboard reads.  A record built on its own is its own operation; a
+    /// record parked with a `Ledger` takes the ledger's.
+    pub op: String,
     pub via: String,
     pub attempt: u64,
     pub project: Option<String>,
@@ -229,6 +240,7 @@ impl CallRecord {
         CallRecord {
             tool: tool.to_string(),
             preset: preset.to_string(),
+            op: next_id(),
             via: VIA_CLI.to_string(),
             attempt: 1,
             project: None,
@@ -327,6 +339,7 @@ impl CallRecord {
         m.insert("v".into(), Value::from(2));
         m.insert("id".into(), Value::from(next_id()));
         m.insert("run".into(), Value::from(run_id()));
+        m.insert("op".into(), Value::from(self.op.clone()));
         m.insert("ts".into(), Value::from(ts));
         m.insert("via".into(), Value::from(self.via.clone()));
         m.insert("tool".into(), Value::from(self.tool.clone()));
@@ -374,8 +387,15 @@ impl CallRecord {
 
 // ── The ledger: what an operation only knows at its ends ────────────────────
 
-/// Byte accounting and end-of-operation verdicts, held across an operation's
-/// round-trips.
+/// Identity, byte accounting and end-of-operation verdicts, held across an
+/// operation's round-trips.
+///
+/// A ledger *is* the operation: one is constructed per MCP dispatch and per CLI
+/// invocation, which is precisely the span a human calls one `scout find` or
+/// one `grep`.  So it mints the `op` id every row it parks carries, and the
+/// dashboard groups on ground truth rather than guessing from timestamps.
+/// `run` cannot do this job — `scout mcp` is one process, and one `run`, for a
+/// whole Claude Code session (SPEC-dashboard §1).
 ///
 /// The log's unit is one LLM call, but two of §3's fields are not: `raw_bytes`
 /// is known before the *first* call of an operation and `returned_bytes` only
@@ -389,6 +409,7 @@ impl CallRecord {
 /// `extract` that counted its file three times would inflate the one metric
 /// the whole thing exists to report.
 pub struct Ledger {
+    op: String,
     started: Instant,
     raw: Cell<Option<u64>>,
     pending: RefCell<Option<CallRecord>>,
@@ -398,6 +419,7 @@ pub struct Ledger {
 impl Default for Ledger {
     fn default() -> Self {
         Ledger {
+            op: next_id(),
             started: Instant::now(),
             raw: Cell::new(None),
             pending: RefCell::new(None),
@@ -425,6 +447,7 @@ impl Ledger {
         // Spelled out rather than `..Default::default()`: struct update syntax
         // cannot move fields out of a type that implements `Drop`.
         Ledger {
+            op: next_id(),
             started: Instant::now(),
             raw: Cell::new(None),
             pending: RefCell::new(None),
@@ -452,7 +475,12 @@ impl Ledger {
 
     /// Park a record: writes out whatever was parked before it, so only the
     /// newest row is ever waiting.
+    ///
+    /// Claiming the record for this operation happens here rather than at
+    /// `CallRecord::new`, so a row can only be grouped with its siblings by
+    /// going through the ledger that actually delimits them.
     pub fn record(&self, mut rec: CallRecord) {
+        rec.op = self.op.clone();
         if rec.raw_bytes.is_none() {
             rec.raw_bytes = self.raw.take();
         }
@@ -916,6 +944,17 @@ mod tests {
         assert_eq!(v["ok"], true, "the v1 boolean is still written");
         assert!(v["ts"].as_f64().unwrap() > 1_700_000_000.0, "ts is float seconds");
         assert!(v["id"].as_str().unwrap().starts_with(run_id()), "id extends run");
+        assert!(v["op"].as_str().unwrap().starts_with(run_id()), "so does op");
+    }
+
+    #[test]
+    fn a_record_written_on_its_own_is_its_own_operation() {
+        let tmp = NamedTempFile::new().unwrap();
+        write(&tmp, CallRecord::new("task", "task"));
+        write(&tmp, CallRecord::new("task", "task"));
+        let rows = lines_of(&tmp);
+        assert_eq!(rows[0]["run"], rows[1]["run"], "one process is one run");
+        assert_ne!(rows[0]["op"], rows[1]["op"], "...and two operations");
     }
 
     #[test]
@@ -1235,6 +1274,30 @@ mod tests {
             payload.to_string().len(),
             "the last row carries the payload size"
         );
+    }
+
+    #[test]
+    fn two_ledgers_of_one_process_stamp_two_operations() {
+        // The case the dashboard exists for: `scout mcp` is one process for a
+        // whole Claude Code session, so `run` is shared and `op` is not.
+        let _g = env_lock();
+        let tmp = NamedTempFile::new().unwrap();
+        std::env::set_var("SCOUT_CALLS_LOG", tmp.path());
+
+        for _ in 0..2 {
+            let ledger = Ledger::default();
+            ledger.record(CallRecord::new("grep", "grep"));
+            ledger.record(CallRecord::new("grep", "grep"));
+            ledger.finish(&json!({"hits": []}));
+        }
+        std::env::remove_var("SCOUT_CALLS_LOG");
+
+        let rows = lines_of(&tmp);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["op"], rows[1]["op"], "one dispatch is one operation");
+        assert_eq!(rows[2]["op"], rows[3]["op"]);
+        assert_ne!(rows[1]["op"], rows[2]["op"], "the next dispatch is another");
+        assert_eq!(rows[0]["run"], rows[3]["run"], "...all in the one process");
     }
 
     #[test]

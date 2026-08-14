@@ -243,11 +243,33 @@ keeps working on old lines. One line per LLM round-trip, same file.
 
 Field notes:
 
-- **`run` + `id`** are the fix for find's fan-out. `run` is minted once
-  per process (`std::process::id()` plus start time is sufficient — no
-  uuid dep); `id` appends a per-process counter. The dashboard groups
-  rows sharing a `run` under the originating `tool`, so a `find` reads
-  as one expandable row, not four.
+- **`run` + `id` + `op`.** `run` is minted once per process
+  (`std::process::id()` plus start time is sufficient — no uuid dep);
+  `id` appends a per-process counter; **`op` identifies one user-facing
+  operation** and is what the dashboard groups on, so a `find` reads as
+  one expandable row rather than four.
+
+  *Corrected during P2 — this spec contradicted itself.* An earlier
+  draft grouped on `run` alone, while §1's own table records that
+  `scout mcp` is **one process for an entire Claude Code session**.
+  Grouping on `run` would therefore collapse every MCP tool call of a
+  session into a single history row and destroy the pane the dashboard
+  mostly exists for. P2 shipped an idle-gap heuristic as a stopgap; it
+  was replaced with `op`, because `Ledger` (§3, byte accounting) is
+  constructed once per dispatch and so already delimits exactly the
+  right span — the boundary was known precisely, it just wasn't
+  recorded. `run` stays: it identifies the process, which is genuinely
+  useful, and P3 reconciles against both.
+
+  **Grouping must key on `op`, never on adjacency.** `mcp_server.rs`
+  dispatches through `tokio::task::spawn_blocking`, so parallel tool
+  calls run concurrently and **interleave their rows in the log** — and
+  Claude Code batches independent tool calls as a matter of course, so
+  this is the ordinary case, not an edge one. A "consecutive rows of one
+  `op`" rule splits any two concurrent multi-row operations. It also
+  breaks on an operation that straddles a log rotation. P3's reader
+  inherits the same constraint: live events from concurrent operations
+  will interleave over the channel exactly as their log rows do.
 - **`via`** is genuinely informative and free to derive — the MCP server,
   the CLI dispatcher, and `run_cmd` each know which they are. It answers
   "did Claude choose this tool, or did a hook force it?" Set it at the
@@ -292,6 +314,18 @@ Field notes:
   verdict once every batch is in, and `parse_failure` in the §3 sense
   (an unparseable *selector*) is discovered by the filter after
   `call_preset` has already returned successfully.
+
+  **On the headline looking small at first:** P2 observed the
+  context-saved figure reading only ~44 KB → ~4 KB and read it as thin
+  deposit coverage. It isn't. The log was 750 v1 rows against 5 v2 rows
+  — v1 rows predate byte accounting entirely and can never contribute.
+  Exercising the paths directly confirms the mechanism is sound: a
+  `via:hook` `shell_safety` row records `raw=2419 ret=156`, and a
+  `check_output` of `echo hello` records `raw=5 ret=199`. The number
+  simply needs v2 traffic to accumulate, and CLAUDE.md notes the
+  installed plugin binary only refreshes on a session restart — so
+  hook and MCP rows lag a rebuild. **Do not go hunting for missing
+  deposits on the strength of an early reading.**
 - **`ts` becomes a float.** *(Corrected during P1: an earlier draft said
   `parse_log` read `ts` with `as_u64()` and would silently get 0 for
   every new row. It never read `ts` at all — the hazard was invented.
@@ -501,7 +535,14 @@ needs; it is ubiquitous, and ct's `web.rs` already depends on it for the
 same neighborhood of problem.
 
 **Pidfile** at `$XDG_STATE_HOME/scout/dashboard.pid`, holding
-`{pid, port, started}`. Liveness is decided by **probing
+`{pid, port, started}` — but **one fixed path is unsafe once `--port`
+exists** (found in P2, two live bugs: `--port N` alongside a default
+daemon reported "stale pidfile — cleared" and trampled it, and `--stop`
+preferred the pidfile's pid over the probe's and could SIGTERM the wrong
+process). The SIGTERM handler must be async-signal-safe, so it `unlink`s
+its path unconditionally and cannot read the file back to check whose it
+is. The configured port therefore keeps `dashboard.pid`; any other port
+gets `dashboard-<port>.pid`. Liveness is decided by **probing
 `GET /api/status` on the recorded port and checking for a scout marker
 field**, not by the pid alone — a recycled pid is rare but a pidfile
 surviving a `kill -9` is not, and pid-liveness is awkward to check
@@ -654,7 +695,7 @@ not a streaming behavior, but it means a typo'd model in
 
 ## 6. Phases
 
-**P1 — enrich the record.** `stats.rs`: `log_call` grows into a
+**P1 — enrich the record. ✅ Done** (`a16b7fb`). `stats.rs`: `log_call` grows into a
 `CallRecord` struct with a builder, `parse_log` learns `v:2` and float
 `ts`, rotation lands. Thread `via`/`tool`/`project`/`input`/`outcome`
 through the three call sites plus the bypass paths in `extract.rs` and
@@ -665,14 +706,22 @@ at all, which makes it a safe place to stop if the rest stalls.
 ~400 lines touched, mostly mechanical, plus tests in `stats.rs`'s
 existing style.
 
-**P2 — the daemon and the server.** `src/dashboard.rs` (lifecycle +
-HTTP + tailing reader) and `dashboard.html`, over the log alone — no
-channel yet. Sequence it as `--foreground` first; a plain blocking
-server is far easier to debug than a detached one, then add
-`setsid`/pidfile/`--stop`/`--status` once the routes are right. ~350 +
-~700 lines, plus the `libc` dep. **At the end of P2 the dashboard is
-already useful** — every pane in §4 works except prompt bodies and the
-live views.
+**P2 — the daemon and the server. ✅ Done** (`1d99442`).
+`src/dashboard.rs` + `dashboard.html`, over the log alone. Came in at
+~1250 impl + ~500 test lines and ~815 lines of HTML, against an
+estimated 350 + 700 — the lifecycle's failure modes and the reader's
+rotation handling were most of the overrun. `libc` is the only added
+dep. Every pane in §4 works except prompt bodies and the live views,
+which is the intended stopping point.
+
+Two P2 details worth carrying forward: `/api/history`'s cursor is an
+**opaque row id**, not an ordinal, since scout's ids aren't ordered — an
+id the server can't find (a tab that slept through a rotation) returns a
+full page with `"resynced": true` rather than an error, which is the
+only behavior that lets a tab recover itself. And `/api/stats`
+recomputes from the in-memory rows rather than calling `stats.rs`, whose
+reader is file-based: re-reading 8 MB per poll would be the one
+expensive thing in an otherwise free daemon.
 
 **P3 — the live channel.** `src/live.rs`: the datagram sender
 (`Option<UnixDatagram>` resolved once per process, drop on any error),
