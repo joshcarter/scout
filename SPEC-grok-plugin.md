@@ -2,8 +2,9 @@
 
 **Status:** measured against Grok Build 1.0.3 on 2026-08-14, first by hand in
 this checkout and then with a purpose-built probe plugin (`grok-probe`, §1.2).
-Nothing here is implemented. Claude Code remains the supported install; this is
-what has to change if scout should also install and boot cleanly under Grok.
+**§3.1–3.7 are implemented**; §4's verification steps have not been run against
+a real install of the new payload. Findings in §2 are kept as the record of why
+the design is what it is.
 
 **Goal:** a Grok user can add the marketplace, install `scout` by name, get a
 working MCP server on the next session, and have as much of the Claude

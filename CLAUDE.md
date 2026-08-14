@@ -27,21 +27,33 @@ That lookup is free and cannot go stale.
 
 ## What a session actually picks up after you edit
 
-Installed from a **directory** marketplace (`extraKnownMarketplaces` → `source:
-directory`, path = this repo), `CLAUDE_PLUGIN_ROOT` resolves to the working tree
-itself. So hooks, `scripts/`, and `presets/` are read live from the checkout —
-edit, restart the session, done. There is a snapshot under
+The plugin payload is `plugins/scout/`, not the repo root. Installed from a
+**directory** marketplace (`extraKnownMarketplaces` → `source: directory`, path
+= this repo), `CLAUDE_PLUGIN_ROOT` resolves to `plugins/scout/` inside the
+working tree, so its `hooks/`, `scripts/`, and `skills/` are read live — edit,
+restart the session, done. There is a snapshot under
 `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, but it is not what
 runs; `installed_plugins.json`'s `installPath` points there and is misleading.
 
-The **binary** is the exception: it is a copy in `$CLAUDE_PLUGIN_DATA/bin`, so
-`cargo build --release` has to be followed by a restart for
-`scripts/ensure-binary.sh` to re-copy it. That refresh is mtime-driven — see the
-comment there for why a version compare alone silently keeps a stale binary.
+`presets/` stays at the repo root because it is a **build** input, not payload:
+`src/presets/mod.rs` pulls each one in with `include_str!`. Editing a preset
+requires a rebuild, not a restart. (User overrides in
+`$XDG_CONFIG_HOME/scout/presets/` are read at runtime and do take effect
+immediately.) `config.example.toml` is embedded the same way, by `src/config.rs`.
+
+The **binary** is a copy at `plugins/scout/bin/scout`, gitignored, refreshed by
+`make build`. Use `make build`, never a bare `cargo build --release` — the
+latter compiles but leaves the payload pointing at yesterday's binary, and the
+MCP server runs the payload copy. Restart the session to pick it up.
+
+Every write of the binary goes through a temp file and `mv`. Overwriting in
+place fails with `ETXTBSY` whenever an MCP server is executing the destination,
+which here is the normal case, not the edge case — and the old
+`ensure-binary.sh` `cp` failed exactly this way, silently, for weeks.
 
 To confirm which copy ran, `claude --debug-file <path> -p hi` then grep for
-`ensure-binary`; the char count of the reported `additionalContext` distinguishes
-repo from snapshot when they differ.
+`session-context`; the char count of the reported `additionalContext`
+distinguishes repo from snapshot when they differ.
 
 ## Tests
 

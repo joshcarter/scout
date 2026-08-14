@@ -6,7 +6,7 @@
   "repository": "https://github.com/joshcarter/scout",
   "mcpServers": {
     "scout": {
-      "command": "${CLAUDE_PLUGIN_DATA}/bin/scout",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/scout",
       "args": ["mcp"]
     }
   }

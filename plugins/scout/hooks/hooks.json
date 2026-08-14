@@ -1,0 +1,35 @@
+{
+  "description": "scout: PreToolUse hooks that screen and redirect shell commands to the local LLM, plus SessionStart guidance injection. The matcher is a union of Claude's Bash and Grok's run_terminal_command; on Grok Build 1.0.3 plugin hooks never execute at all (SPEC-grok-plugin.md §2.5), so the Grok half is forward-looking, not load-bearing.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/session-context.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|run_terminal_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/shell-safety.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|run_terminal_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/prefer-local-llm.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

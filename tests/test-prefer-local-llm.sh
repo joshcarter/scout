@@ -28,7 +28,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HOOK="$PROJECT_DIR/hooks/prefer-local-llm.sh"
+HOOK="$PROJECT_DIR/plugins/scout/hooks/prefer-local-llm.sh"
 
 export VERBOSE=false
 [ "${1:-}" = "--verbose" ] && VERBOSE=true

@@ -49,11 +49,58 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// The default config, embedded at build time.
+///
+/// Embedded rather than read from the plugin payload because the two surfaces
+/// that need it most cannot see a payload: `make install` puts the binary on
+/// `$PATH` with no plugin anywhere, and under Grok Build the SessionStart hook
+/// that used to seed this file never runs at all (SPEC-grok-plugin.md §2.5).
+const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
+
+/// Write the bundled default config to `path`, creating parent directories.
+///
+/// Never overwrites: an existing file — even an unparseable one — is left
+/// alone, because clobbering a config someone hand-edited is far worse than
+/// surfacing a parse error. Returns `Ok(false)` when a file was already there.
+pub fn seed_default_config(path: &Path) -> Result<bool, String> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create config dir {:?}: {e}", parent))?;
+    }
+    // create_new: two scout processes starting at once (an MCP server and a
+    // CLI call, say) must not race into a half-written file. Losing the race
+    // is success — the other process wrote the same bytes.
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(DEFAULT_CONFIG.as_bytes())
+                .map_err(|e| format!("cannot write config {:?}: {e}", path))?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(format!("cannot create config {:?}: {e}", path)),
+    }
+}
+
 /// Parse a `Config` from the `[llm]` section of `path`.
 ///
 /// Returns `Err` with a human-readable message if the file is missing,
 /// unparseable, or the required `endpoint` / `model` keys are absent.
+///
+/// First run seeds the default config. The guard is deliberate: only the path
+/// scout resolves for itself gets seeded, so a caller passing an explicit path
+/// (tests, `$SCOUT_CONFIG` pointing somewhere odd) still gets a clean "cannot
+/// read" error instead of a file it did not ask for. Seeding failures are
+/// swallowed — the read below reports the problem in terms the user can act
+/// on, and a read-only home directory should not change the error message.
 pub fn load_config(path: &Path) -> Result<Config, String> {
+    if !path.exists() && path == config_path() {
+        let _ = seed_default_config(path);
+    }
+
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read config {:?}: {e}", path))?;
 
@@ -276,5 +323,56 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         assert_eq!(p, PathBuf::from("/home/tester/.config/scout/config.toml"));
+    }
+
+    #[test]
+    fn seed_writes_the_embedded_default_and_it_parses() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("nested").join("config.toml");
+        assert!(seed_default_config(&p).unwrap(), "should report it wrote");
+        assert!(p.exists());
+        // The shipped default has to be a config scout can actually load,
+        // otherwise first run seeds a file and then fails on it.
+        load_config(&p).expect("embedded default must parse");
+    }
+
+    #[test]
+    fn seed_never_overwrites() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "hand edited, do not clobber").unwrap();
+        assert!(!seed_default_config(&p).unwrap(), "should report it skipped");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "hand edited, do not clobber"
+        );
+    }
+
+    #[test]
+    fn load_config_seeds_the_resolved_path_on_first_run() {
+        let _guard = env_lock();
+        let dir = TempDir::new().unwrap();
+        std::env::remove_var("SCOUT_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        let resolved = config_path();
+        assert!(!resolved.exists());
+        let loaded = load_config(&resolved);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert!(resolved.exists(), "first run should have seeded {resolved:?}");
+        assert!(loaded.is_ok(), "and then loaded it: {loaded:?}");
+    }
+
+    #[test]
+    fn load_config_does_not_seed_a_path_it_was_handed() {
+        // Only the path scout resolves for itself gets created. An explicit
+        // path that is missing stays missing and reports a read error.
+        let _guard = env_lock();
+        let dir = TempDir::new().unwrap();
+        std::env::remove_var("SCOUT_CONFIG");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let handed = dir.path().join("somewhere-else.toml");
+        let result = load_config(&handed);
+        assert!(result.is_err());
+        assert!(!handed.exists(), "must not have been created");
     }
 }

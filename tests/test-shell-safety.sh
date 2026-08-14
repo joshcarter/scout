@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-shell-safety.sh — Tests for hooks/shell-safety.sh
+# test-shell-safety.sh — Tests for plugins/scout/hooks/shell-safety.sh
 #
 # Verifies the two env-var-context features:
 #   - Step 2c-bis trusted plugin-script fast-path: a LONE invocation of a
@@ -22,7 +22,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HOOK="$PROJECT_DIR/hooks/shell-safety.sh"
+HOOK="$PROJECT_DIR/plugins/scout/hooks/shell-safety.sh"
 
 export VERBOSE=false
 [ "${1:-}" = "--verbose" ] && VERBOSE=true
@@ -82,7 +82,7 @@ assert_fallthrough(){ if is_allow "$(run_hook "$1")"; then fail "$2" "expected f
 
 assert_allow "\"$PR/scripts/refine-snapshot.sh\" . 2>&1"           "fastpath: snapshot script + arg + 2>&1"
 assert_allow "\"$PR/scripts/review-range.sh\" --since-last 2>&1"   "fastpath: review-range --since-last"
-assert_allow "\$CLAUDE_PLUGIN_ROOT/scripts/ensure-binary.sh 2>/dev/null"   "fastpath: \$CLAUDE_PLUGIN_ROOT + 2>/dev/null"
+assert_allow "\$CLAUDE_PLUGIN_ROOT/scripts/session-context.sh 2>/dev/null"   "fastpath: \$CLAUDE_PLUGIN_ROOT + 2>/dev/null"
 
 # ── Step 2c-bis MUST NOT fast-path these (chaining / redirection / traversal) ─
 

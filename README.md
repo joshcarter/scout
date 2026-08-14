@@ -60,53 +60,78 @@ and `[find]`.
 
 ## Install
 
-**As a Claude Code plugin** — the one way in, carrying hooks, MCP
-server, and binary bootstrap together:
+The plugin payload lives in `plugins/scout/` and carries the binary at
+`plugins/scout/bin/scout`. Build it first — the binary is gitignored, so
+a fresh clone has an empty `bin/`:
+
+```sh
+make build
+```
+
+**Claude Code:**
 
 ```
 /plugin marketplace add joshcarter/scout
 /plugin install scout@scout
 ```
 
-On the next session start, `scripts/ensure-binary.sh` installs the
-binary into `${CLAUDE_PLUGIN_DATA}/bin` and seeds a default config if
-you don't have one. Edit `[llm].endpoint` and `[llm].model` to match
-your local LLM host.
+**Grok Build:**
+
+```sh
+grok plugin marketplace add <path-to-checkout>
+grok plugin install scout --trust
+```
+
+The MCP server is declared as `${CLAUDE_PLUGIN_ROOT}/bin/scout`, which
+both harnesses expand to the installed payload, so it comes up on the
+first session with nothing to bootstrap. On first run scout writes a
+default `${XDG_CONFIG_HOME:-~/.config}/scout/config.toml` — edit
+`[llm].endpoint` and `[llm].model` to match your local LLM host.
+
+One difference worth knowing: **the hooks are Claude-only.** The
+build/test redirect and the shell-safety auto-allow both ride on
+PreToolUse, and Grok Build 1.0.3 does not execute plugin hooks at all
+(see `SPEC-grok-plugin.md` §2.5). Under Grok you get the MCP tools and
+the `scout` skill; the automatic steering is Claude's.
 
 **The CLI** (use scout from a terminal, like a smarter `ack`):
 
 ```sh
-make install    # binary to ~/.local/bin, config if missing
+make install    # binary to ~/.local/bin
 ```
 
 Plugin and CLI are independent — install either, or both. They share
-everything that matters: config and presets live in
+everything that matters: config and preset overrides live in
 `${XDG_CONFIG_HOME:-~/.config}/scout/` (`config.toml`, `presets/`), and
-both surfaces run the same code path. Only the binary is duplicated
-(the plugin manages its own copy in `CLAUDE_PLUGIN_DATA` so it can keep
-it current without touching your PATH).
+both surfaces run the same code path. Only the binary is duplicated:
+the plugin keeps its own copy in the payload so it stays current
+without touching your PATH.
 
 **Other MCP clients**: the binary is a stdio MCP server — run
 `scout mcp` and point your client at it. There's no install wrapper for
-this; in Claude Code, use the plugin.
+this; in a coding agent, use the plugin.
 
 ## Development
 
 ```sh
-cargo build --release
+make build                              # binary + refresh the plugin payload
 claude --plugin-dir ~/Projects/scout    # try the plugin in a session
 ```
 
-The SessionStart hook (`scripts/ensure-binary.sh`) installs the binary
-into `${CLAUDE_PLUGIN_DATA}/bin/scout`, preferring a local
-`target/release/scout` in a dev checkout, falling back to
-`cargo install scout-llm`. The MCP server declaration in
-`.claude-plugin/plugin.json` and the `bin/scout` PATH shim both point
-at that installed copy. (Repo-root `.mcp.json` is unrelated — it holds
-a `ct` entry for working on this checkout, nothing of scout's.) Note:
-in a brand-new install the MCP
-server may fail to start on the very first session (the bootstrap hook
-hasn't run yet); it comes up on the next session.
+`make build` compiles to `target/release/scout` and copies it to
+`plugins/scout/bin/scout`, which is what both manifests point at. Use
+`make build`, not a bare `cargo build --release` — the latter leaves the
+payload stale. The copy goes through a temp file and `mv` on purpose:
+overwriting in place fails with `ETXTBSY` whenever an MCP server is
+running from the destination, which under a directory marketplace is the
+normal case.
+
+Two manifests, identical content: Grok reads
+`plugins/scout/plugin.json`, Claude reads
+`plugins/scout/.claude-plugin/plugin.json`. Keep them in step. (Repo-root
+`.mcp.json` is unrelated — it holds a `ct` entry for working on this
+checkout, nothing of scout's; it sits outside the payload so no harness
+mistakes it for scout's own.)
 
 Verify the MCP handshake without Claude:
 

@@ -4,7 +4,7 @@
   "plugins": [
     {
       "name": "scout",
-      "source": "./",
+      "source": "./plugins/scout",
       "description": "Local-LLM scout: classifies build/test output, screens shell commands, and answers targeted code questions with a local model so the cloud model doesn't have to."
     }
   ]
