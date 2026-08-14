@@ -1,8 +1,37 @@
 # Spec: `scout dashboard` — a local web view of local-LLM traffic
 
-**Status:** settled — no open questions remain; §7 records the
-decisions. Streaming behavior in §5.5 is measured against the
-configured endpoint, not assumed.
+**Status:** **P1 and P2 shipped — the dashboard runs and is useful
+today.** No open design questions remain; §7 records the decisions and
+§6 the remaining phases. Streaming behavior in §5.5 is measured against
+the configured endpoint, not assumed.
+
+| Phase | State | What it delivers |
+|---|---|---|
+| **P1** — enrich the record | ✅ `a16b7fb` | `op`/`run`/`id`, `via`, `tool`, `input`, `outcome`, byte accounting, rotation |
+| **P2** — daemon + server | ✅ `1d99442` | `scout dashboard` on 13001; all §4 panes but bodies and live views |
+| — op grouping fix | ✅ `cee6d14` | recorded `op` replaces P2's idle-gap heuristic |
+| **P3** — live channel | ⬜ next | unix datagram socket, SSE, prompt/response bodies, in-flight calls |
+| **P4** — `find` refinement events | ⬜ | per-round internals: patterns, hits, rerank, reflect |
+| **P5** — token streaming | ⬜ | `call.token` deltas; cleared by measurement (§5.5) |
+| **P6** — bodies sidecar | ⬜ optional | retroactive bodies on disk; build only if missed |
+| **P7** — auto-start | ⬜ optional | SessionStart hook calls the idempotent start |
+
+**What works right now:** `scout dashboard` starts a detached daemon on
+<http://localhost:13001/>. Command history groups by operation, the
+context-saved ratio sums per-operation, failures break out by kind,
+p50/p95 latency, the Live/Pinned detail pane with three ways back, and
+filters by tool/via/project/failed. The reader survives log rotation.
+
+**What is missing until P3:** the detail pane has no prompt or response
+bodies — the single most valuable thing the dashboard could show — no
+in-flight indicator, and no `find` round detail. `/api/stream` answers
+`501` with a note rather than 404, so the route exists and the transport
+is the only missing piece.
+
+**One operational note:** per `CLAUDE.md`, the plugin's binary is a copy
+in `$CLAUDE_PLUGIN_DATA/bin` refreshed on session restart. Until a
+restart picks up the P1 build, hook and MCP traffic still writes v1 rows
+with none of the new fields, and the dashboard will look sparse.
 
 **Goal:** answer, at a glance, the two questions you cannot answer today:
 *what is Claude actually sending to the local model*, and *what is coming
@@ -55,7 +84,11 @@ is where most of the work is, and §3 is the real content of this spec.
 
 ---
 
-## 2. What the log records today, and why it is not enough
+## 2. What the log recorded before P1, and why it was not enough
+
+*Historical — P1 (`a16b7fb`) fixed every gap below. Kept because it is
+the argument for the record's shape, and because rows in this form are
+still the bulk of an existing `calls.jsonl`.*
 
 ```json
 {"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}
@@ -220,8 +253,9 @@ keeps working on old lines. One line per LLM round-trip, same file.
 ```json
 {
   "v": 2,
-  "id": "01JQ8F...-3",          // sortable per-process id; monotonic within a run
-  "run": "01JQ8F...",           // one process; groups find's internal rounds
+  "id": "01JQ8F...-3",          // this row; monotonic within a run
+  "run": "01JQ8F...",           // one process (a whole MCP session)
+  "op":  "01JQ8F...-1",         // one user-facing operation — the grouping key
   "ts": 1770000000.482,          // float seconds — sub-second ordering
   "via": "mcp",                  // mcp | cli | hook | run
   "tool": "find",                // user-facing operation
@@ -305,9 +339,11 @@ Field notes:
   non-mechanical part of the phase): it parks the newest record, lets
   the first row claim the raw deposit, and writes on `finish`, `fail`,
   or `Drop`. The consequence for the dashboard: **raw and returned land
-  on different rows of the same `run`, so the reader must sum per-run,
-  never per-row.** A per-row ratio is meaningless; a per-run ratio is
-  the metric.
+  on different rows of the same operation, so the reader must sum per
+  `op`, never per row.** A per-row ratio is meaningless. A real `find`
+  measures 1099 + 42215 raw across two rows against 1606 returned on a
+  third — per row that reads as `0 → 1606` and `42215 → 0`; per `op` it
+  is 43314 → 1606.
 
   Two outcomes turned out not to be round-trip properties either, and
   the same mechanism absorbed both: `none_relevant` is the rerank's
@@ -381,10 +417,18 @@ The check belongs in the writer, not the daemon: every entry point
 writes, most of them with no dashboard running, so rotation cannot
 depend on one. `write_record` already opens the file — `stat` it on
 open and rotate when over the cap, which costs one syscall per call and
-keeps a hook-only install bounded. Two writers racing on the rename is
-benign (`fs::rename` is atomic; the loser rotates an already-fresh file
-and loses nothing), but the reader must handle the file shrinking under
-it — see §5.
+keeps a hook-only install bounded. The reader must handle the file
+shrinking under it — see §5.
+
+*(P1 correction: two writers racing on the rename is **not** always
+benign, as an earlier draft claimed. If the loser's rename lands between
+the winner's rename and its reopen, `ENOENT` and nothing is lost; if it
+lands after, it renames the winner's fresh file over the generation just
+rotated and takes 8 MB of history with it. Left unclosed deliberately —
+a few microseconds against ~80 calls/day, both writers must also arrive
+exactly at the cap, and the cost is one generation of a diagnostic log.
+Closing it needs an `O_EXCL` lockfile, which is more machinery than this
+earns. The code comment says so too.)*
 
 ---
 
@@ -425,7 +469,7 @@ per user-facing operation, newest first:
 ```
 
 Columns: time · `via` badge · tool · one-line input summary · outcome
-glyph and summary · elapsed · tokens in→out. Rows sharing a `run`
+glyph and summary · elapsed · tokens in→out. Rows sharing an **`op`**
 collapse into one with a `⋮n` marker that expands to the constituent
 preset calls.
 
@@ -586,14 +630,26 @@ in-flight state to flush — the daemon only reads.
 
 Endpoints:
 
-| Route | Returns |
-|---|---|
-| `GET /` | the embedded HTML |
-| `GET /api/status` | model, endpoint, reachability, version, aggregates |
-| `GET /api/history?since=<id>&limit=&tool=&via=&failed=` | history rows, no bodies |
-| `GET /api/call/<id>` | one call including prompt and response bodies |
-| `GET /api/stats` | the `scout stats` table as JSON |
-| `GET /api/stream` | **SSE** — live events from the channel (§2.5) |
+| Route | Returns | State |
+|---|---|---|
+| `GET /` | the embedded HTML | ✅ P2 |
+| `GET /api/status` | model, endpoint, reachability, version, aggregates | ✅ P2 |
+| `GET /api/history?since=<id>&limit=&tool=&via=&project=&failed=` | operations with their rows inlined | ✅ P2 |
+| `GET /api/call/<id>` | one operation, resolved from *any* of its row ids | ✅ P2 |
+| `GET /api/stats` | the `scout stats` table as JSON | ✅ P2 |
+| `GET /api/stream` | **SSE** — live events from the channel (§2.5) | ⬜ P3 — currently `501` |
+
+Two P2 choices that the routes above encode:
+
+- **`since` is an opaque row id, not an ordinal**, because scout's ids
+  are not ordered. An id the server cannot find — a tab that slept
+  through a rotation — returns a full page with `"resynced": true`
+  rather than an error. That is the only behavior that lets a stale tab
+  recover itself.
+- **History inlines each operation's rows.** Rows are small (`input` is
+  capped at 300 chars), so the detail pane needs no second fetch;
+  `/api/call/<id>` returns the identical object purely so `#call/<id>`
+  deep links and `curl` work.
 
 `/api/stream` is `text/event-stream`: hold the connection open, write
 `data: {...}\n\n` per event, flush. Polling cannot deliver a token
@@ -695,65 +751,150 @@ not a streaming behavior, but it means a typo'd model in
 
 ## 6. Phases
 
-**P1 — enrich the record. ✅ Done** (`a16b7fb`). `stats.rs`: `log_call` grows into a
-`CallRecord` struct with a builder, `parse_log` learns `v:2` and float
-`ts`, rotation lands. Thread `via`/`tool`/`project`/`input`/`outcome`
-through the three call sites plus the bypass paths in `extract.rs` and
-`grep.rs`. `raw_bytes`/`returned_bytes` captured where both are already
-in hand. **This is the bulk of the work, and it stands on its own** —
-`scout stats` gets meaningfully better output from it with no dashboard
-at all, which makes it a safe place to stop if the rest stalls.
-~400 lines touched, mostly mechanical, plus tests in `stats.rs`'s
-existing style.
+### ✅ P1 — enrich the record (`a16b7fb`)
 
-**P2 — the daemon and the server. ✅ Done** (`1d99442`).
-`src/dashboard.rs` + `dashboard.html`, over the log alone. Came in at
-~1250 impl + ~500 test lines and ~815 lines of HTML, against an
-estimated 350 + 700 — the lifecycle's failure modes and the reader's
-rotation handling were most of the overrun. `libc` is the only added
-dep. Every pane in §4 works except prompt bodies and the live views,
-which is the intended stopping point.
+`stats.rs`: `log_call` became a `CallRecord` with a chained builder, an
+`Outcome` enum of 8 kinds, `run`/`id` minting, and rotation in the
+writer. `via`/`tool`/`project`/`input`/`outcome` threaded through all
+three call sites plus the bypass paths in `extract.rs` and `grep.rs`,
+which previously logged nothing at all. `scout stats` gained the
+context-saved ratio and a failures-by-kind breakdown, so the phase paid
+off with no dashboard at all.
 
-Two P2 details worth carrying forward: `/api/history`'s cursor is an
-**opaque row id**, not an ordinal, since scout's ids aren't ordered — an
-id the server can't find (a tab that slept through a rotation) returns a
-full page with `"resynced": true` rather than an error, which is the
-only behavior that lets a tab recover itself. And `/api/stats`
-recomputes from the in-memory rows rather than calling `stats.rs`, whose
-reader is file-based: re-reading 8 MB per poll would be the one
-expensive thing in an otherwise free daemon.
+Delivered ~1290 lines against an estimated ~400. The overrun was the
+`Ledger` and the byte accounting it exists for — see §3.
 
-**P3 — the live channel.** `src/live.rs`: the datagram sender
-(`Option<UnixDatagram>` resolved once per process, drop on any error),
-the daemon's receiver thread, the id-keyed upsert store, and
-`/api/stream` over SSE. Emit `call.start` / `call.end` with bodies
-first — that lights up the detail pane and P4's in-flight timer in one
-step, since on the channel they are the same mechanism. ~300 lines.
+### ✅ P2 — the daemon and the server (`1d99442`, `cee6d14`)
 
-**P4 — `find` refinement events.** `find.patterns` / `.hits` /
-`.rerank` / `.reflect`, and the round tab strip in the detail pane. The
-data the log serves worst, and the best argument for the channel
-existing. ~150 lines, mostly instrumentation at points `find.rs`
-already computes the values.
+`src/dashboard.rs` + `dashboard.html`, over the log alone. ~1250 impl +
+~500 test lines and ~815 lines of HTML, against an estimated 350 + 700;
+the lifecycle's failure modes and the reader's rotation handling were
+most of the overrun. `libc` is the only added dependency.
 
-**P5 — token streaming.** `client.rs` gains a streaming read loop
-(`stream_options: {include_usage: true}`, usage from the final chunk,
-empty-`choices` guard) and `[llm] stream`; `call.token` events coalesce
-on a 50 ms timer. Cleared by the §5.5 measurements — no latency cost, no
-usage loss, error taxonomy unchanged — but still sequenced last because
-it is the only phase touching a path all the tools depend on, and it
-needs P3's channel to have somewhere to send. ~200 lines.
+Verified end to end: detached start leaves the terminal's session
+(`PGID == SID == PID`, `TT=?`, reparented, so `^C` and hangup cannot
+reach it), `--restart` rebinds immediately, a `kill -9` leaves a stale
+pidfile that the next command clears, and a non-scout process on 13001
+produces a distinct error. The reader survives a live rotation against a
+running daemon.
 
-**P6 — bodies sidecar.** `persist_bodies`, the size and age sweep.
-Genuinely optional now that the channel carries bodies live — build it
-if retroactive detail turns out to be missed in practice, not before.
-~150 lines.
+`cee6d14` replaced P2's idle-gap grouping heuristic with the recorded
+`op` — see §3.
 
-**P7 — auto-start.** With an idempotent `scout dashboard` (§5) this is
-no longer a feature, just a call to the same start path from the
-SessionStart hook. Gated on `[dashboard] autostart`, default **off**: a
-plugin that opens a listening port without being asked is rude, and this
-one serves your source code.
+### ⬜ P3 — the live channel (next, and the one that matters)
+
+**Why it is next:** the detail pane currently shows metadata about a
+call but not the call. "Show me the exact resolved prompt" was the
+original goal of this whole document — presets go through
+`presets::resolve` template substitution and the final text is
+observable nowhere else — and P3 is what delivers it. It also delivers
+in-flight calls for free (§2.5), which answers "is the model thinking or
+is it wedged" on a local 27B.
+
+**New file `src/live.rs`, three parts:**
+
+1. **Sender.** `Option<UnixDatagram>` resolved **once per process** into
+   a `OnceLock`, non-blocking, connected to
+   `$XDG_RUNTIME_DIR/scout/live.sock`. Every failure mode — `ENOENT`
+   (nobody listening), `ECONNREFUSED` (stale socket), `EAGAIN` (daemon
+   not draining) — drops the event silently. This is the same fail-open
+   contract `stats.rs::append_line` already honors, and it matters most
+   for `shell_safety`, which sits in the critical path of every Bash
+   tool call Claude makes.
+2. **Receiver.** A daemon thread reading datagrams into the existing
+   in-memory store, plus an LRU body cache (~500 operations). Bodies
+   live in memory only; a daemon restart loses them, which §2.5 accepts.
+3. **`/api/stream`.** Replace P2's `501` with `text/event-stream`: hold
+   the connection, `data: {...}\n\n` per event, flush. Needs its own
+   path through the responder — the `HTTP/1.0 Connection: close` shape
+   borrowed from ct assumes bounded connections, and an SSE handler
+   thread lives as long as the browser tab. **Cap concurrent streams**
+   (say 8) so tab-hoarding cannot accumulate threads.
+
+**Where to hook the emitters.** `select::call_preset` already holds the
+resolved `system`/`user` messages and the reply — that is `call.start`
+and `call.end` in one function. `Ctx`'s `Ledger` already mints the `op`,
+so events carry it without new plumbing.
+
+**Reconciliation is the real work, not the transport.** Each call
+arrives twice — live over the socket, then again when its log line
+lands. Key the store by `id`, upsert, and treat the log as authoritative
+for summary fields with live events as enrichment. Three constraints the
+earlier phases established:
+
+- **Group by `op`, never adjacency.** `spawn_blocking` dispatch means
+  concurrent operations interleave over the channel exactly as they do
+  in the log (§3).
+- **No replay buffer** (§2.5). A dashboard started mid-call sees
+  `call.end` with no `call.start`; render it as an ordinary completed
+  row, not an orphan.
+- **The live pane must not be stolen by a filtered-out call** — the
+  `via:hook` default-off filter already implies this in P2's client-side
+  filtering, and streamed events must respect it too.
+
+**Testing.** A missing socket must be provably free (assert the sender
+resolves to `None` and no syscall repeats per event); a full receive
+buffer must drop rather than block; reconciliation must not duplicate a
+call that arrives on both paths; SSE must survive a client disconnecting
+mid-stream without leaking the handler thread.
+
+~300 lines was the estimate. P2 ran 3× its estimate, so treat that as
+optimistic — the reconciliation and the SSE responder path are both
+places where the detail is the work.
+
+### ⬜ P4 — `find` refinement events
+
+`find.patterns` / `.hits` / `.rerank` / `.reflect`, plus the round tab
+strip in the detail pane. The data the log serves worst — its rounds are
+currently three unrelated-looking preset rows even after `op` grouping
+ties them together — and the best argument for the channel existing.
+Watching the search converge is also the only practical way to tune
+`max_patterns`, `degenerate_hit_cap`, and `reflect` against real
+questions.
+
+Mostly instrumentation at points `find.rs` already computes the values:
+the guessed pattern list, per-pattern hit counts and which were dropped
+as degenerate, the rerank keeps with scores and `why`, the reflect
+verdict and any refined patterns. ~150 lines.
+
+### ⬜ P5 — token streaming
+
+`client.rs` gains a streaming read loop and `[llm] stream`;
+`call.token` events coalesce on a 50 ms timer. **Cleared by measurement
+already** (§5.5) — no latency cost, no usage loss, `LlmError` taxonomy
+unchanged — so this is implementation, not investigation. Carry the two
+measured gotchas: send `stream_options: {include_usage: true}` or usage
+vanishes entirely, and guard the final chunk's empty `"choices": []`.
+
+Sequenced last of the functional phases because it is the only one
+touching a path every tool depends on, and it needs P3's channel to have
+somewhere to send. ~200 lines.
+
+### ⬜ P6 — bodies sidecar (optional)
+
+`persist_bodies`, plus the size and age sweep. Genuinely optional now
+that the channel carries bodies live — **build it only if retroactive
+detail turns out to be missed in practice.** ~150 lines.
+
+### ⬜ P7 — auto-start (optional)
+
+With an idempotent `scout dashboard` (§5) this is no longer a feature,
+just a call to the same start path from the SessionStart hook. Gated on
+`[dashboard] autostart`, default **off**: a plugin that opens a
+listening port without being asked is rude, and this one serves your
+source code.
+
+### Not phased, but worth doing
+
+- **`LlmError::RequestFailed` is too coarse.** P1 has to decide
+  `http_error` by `msg.starts_with("HTTP ")` — string-matching a value
+  the same function formatted moments earlier. Recorded in `TODO.md`;
+  worth fixing the next time that enum is touched anyway.
+- **A misconfigured `[llm] model` fails silently.** LM Studio serves
+  whatever is loaded when handed a name that is not in `/v1/models`, and
+  `check_endpoint` cannot catch it. The response reports the model that
+  actually ran and scout discards it — comparing the two would catch
+  substitution precisely. Recorded in `TODO.md`.
 
 ---
 
@@ -769,9 +910,9 @@ Resolved by §2.5 — recorded so they aren't re-litigated:
 - *Bodies on disk by default?* **No.** They go over the channel. The
   sidecar survives as opt-in (§3).
 - *`find` grouping in the log or the reader?* **Both, at different
-  fidelities.** The log keeps `run`-based grouping for retroactive
-  history; the channel carries the per-round internals that make it
-  interesting, live only.
+  fidelities.** The log carries an `op` id so history groups a `find`
+  into one row retroactively; the channel carries the per-round
+  internals that make it interesting, live only (P4).
 - *Shared memory instead of the log?* **No** — measured, the log costs
   ~5–20 µs to write against a 1.58 ms floor on process spawn, and a
   tmpfs ring would be worse under memory pressure. The channel exists
@@ -789,4 +930,25 @@ Resolved by §2.5 — recorded so they aren't re-litigated:
   shows up from the log with its live detail missing. Not worth the
   per-process buffering to close.
 
-No open questions remain. Ready to execute.
+### Where the spec was wrong
+
+Recorded because each was found by building, not by reading, and the
+pattern is worth trusting: three of the four came from an implementer
+pushing back on the brief.
+
+1. **Byte accounting had no single capture point** (P1). "Cheap to
+   capture where both values are in hand" — no such point exists.
+   Produced the `Ledger`, and the per-`op` summing rule.
+2. **Grouping on `run` contradicted §1** (P2). `scout mcp` is one
+   process per session, so `run` would have collapsed a whole session
+   into one row. Produced the `op` field.
+3. **Adjacency grouping breaks under concurrency** (post-P2).
+   `spawn_blocking` dispatch interleaves rows from parallel tool calls,
+   which is the ordinary case since Claude Code batches independent
+   calls. Produced the id-keyed grouping.
+4. **A `ts`/`as_u64()` hazard that never existed** (P1). Invented in
+   review, not observed. Worth remembering as the counterexample: not
+   every plausible-sounding hazard is real, and a spec asserting one
+   costs implementation time.
+
+**No open design questions remain. P3 is next.**
