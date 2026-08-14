@@ -108,10 +108,15 @@ is worth showing but not worth persisting:
 | Worth watching live? | **yes** | **yes** | **yes** |
 
 At 80 calls/day, bodies alone are ~4 MB/day — the durable log goes from
-a 3-year rotation window to a ~2-day one, in exchange for detail almost
+a ~7-month rotation window to a ~2-day one, in exchange for detail almost
 nobody reads retroactively. Token streams and find's per-round internals
 are worse: high-rate, only meaningful in motion, and pure landfill once
 the call is over.
+
+*(P1 measured the v2 record at ~500 bytes against v1's ~90, so the 8 MB
+cap is ~17k rows — about seven months, not the multiple years an earlier
+draft assumed from v1 sizes. Still ample, but §4's "log size / rotation
+hint" row should be sized against seven months.)*
 
 So: **the log stays exactly as durable as it is today, and everything
 expensive moves to a channel that only exists when someone is
@@ -264,13 +269,34 @@ Field notes:
   `raw_bytes` is the input scout digested — captured build output,
   file bytes read, total bytes of the pre-rerank hit list.
   `returned_bytes` is the serialized payload handed to the caller. The
-  ratio is the number that justifies the tool's existence, and it is
-  cheap to capture at exactly the points that already have both values
-  in hand.
-- **`ts` becomes a float.** `parse_log` reads it with `as_u64()` today
-  and would silently get 0 for every new row; it must switch to
-  `as_f64()` — this is the one non-additive change and the reason for
-  the `v` field.
+  ratio is the number that justifies the tool's existence.
+
+  **Corrected during P1, and it changes P2.** An earlier draft called
+  this "cheap to capture at exactly the points that already have both
+  values in hand." No such point exists. The log's unit is a
+  *round-trip*, but `raw_bytes` is known before an operation's **first**
+  call and `returned_bytes` only after its **last** — and the naive fix
+  of stamping raw onto every row makes a three-chunk `extract` count its
+  file three times and inflates the headline number threefold.
+
+  P1 solved it with a `Ledger` on `Ctx` (~60 lines, the only
+  non-mechanical part of the phase): it parks the newest record, lets
+  the first row claim the raw deposit, and writes on `finish`, `fail`,
+  or `Drop`. The consequence for the dashboard: **raw and returned land
+  on different rows of the same `run`, so the reader must sum per-run,
+  never per-row.** A per-row ratio is meaningless; a per-run ratio is
+  the metric.
+
+  Two outcomes turned out not to be round-trip properties either, and
+  the same mechanism absorbed both: `none_relevant` is the rerank's
+  verdict once every batch is in, and `parse_failure` in the §3 sense
+  (an unparseable *selector*) is discovered by the filter after
+  `call_preset` has already returned successfully.
+- **`ts` becomes a float.** *(Corrected during P1: an earlier draft said
+  `parse_log` read `ts` with `as_u64()` and would silently get 0 for
+  every new row. It never read `ts` at all — the hazard was invented.
+  It is real for **P2's** reader, though, so P1 gave float `ts` a
+  consumer and tests covering both encodings.)*
 
 ### Prompt and response bodies
 
@@ -283,7 +309,7 @@ from every repo you work in.
 **Bodies go over the live channel (§2.5), not to disk.** That is the
 default and it resolves what was this spec's main open question: nothing
 sensitive is written to `~/.local/state` as a side effect of a dashboard
-nobody opened, and the durable log keeps its multi-year rotation window.
+nobody opened, and the durable log keeps its ~7-month rotation window.
 
 A **sidecar remains available, opt-in**, for retroactive detail — bodies
 to `$XDG_STATE_HOME/scout/bodies/<run>.jsonl` as `{id, system, user,

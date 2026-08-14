@@ -4,6 +4,20 @@ Make sure Claude gets what it needs to know about scout's features,
 and guidance to favor using them. Builds, unit test runs, etc. should
 be going through scout with some consistency.
 
+# `LlmError::RequestFailed` is too coarse to classify
+
+`RequestFailed(String)` covers an HTTP status error, a mid-call I/O
+failure, and an unreadable or unparseable response body alike. P1 needs
+to tell those apart to set `outcome.kind`, and the only handle available
+is the message text — so `client.rs` decides `http_error` by
+`msg.starts_with("HTTP ")`.
+
+It is contained (the sniff sits next to where the string is minted, in
+the same file) and it works, but it is string-matching on a value the
+same function formatted moments earlier. The real fix is to split the
+variant so the taxonomy is carried in the type. Worth doing the next
+time that enum is touched for another reason rather than on its own.
+
 # A misconfigured model name fails silently
 
 A typo in `[llm] model` runs happily against whatever the host has
