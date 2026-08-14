@@ -1,21 +1,29 @@
 # Spec: Grok Build plugin packaging
 
-**Status:** findings from a Grok Build 1.0.3 session in this checkout
-(2026-08-14). Nothing in this file is implemented. Claude Code remains
-the supported install; this is what has to change if scout should also
-install and boot cleanly under Grok.
+**Status:** measured against Grok Build 1.0.3 on 2026-08-14, first by hand in
+this checkout and then with a purpose-built probe plugin (`grok-probe`, §1.2).
+Nothing here is implemented. Claude Code remains the supported install; this is
+what has to change if scout should also install and boot cleanly under Grok.
 
-**Goal:** a Grok user can add the marketplace, install `scout` by name,
-get a working MCP server on the next session, and have the same
-steering (binary bootstrap, build/test redirect, usage guidance) Claude
-Code already gets — without breaking the Claude plugin.
+**Goal:** a Grok user can add the marketplace, install `scout` by name, get a
+working MCP server on the next session, and have as much of the Claude
+steering (binary bootstrap, build/test redirect, usage guidance) as Grok is
+capable of delivering — without breaking the Claude plugin.
 
-**Non-goals:** changing scout's MCP tool schemas; making Grok's native
-`grep` / `read_file` go away; a Grok-only fork of the binary.
+**Non-goals:** changing scout's MCP tool schemas; making Grok's native `grep` /
+`read_file` go away; a Grok-only fork of the binary.
+
+**The short version:** the packaging problem is solved and the fix is smaller
+than expected — one MCP command spelling works in both harnesses, and Grok's
+copy-on-install will carry the binary. The steering problem is worse than
+expected: Grok does not run plugin hooks at all, so two of scout's three
+delivery mechanisms have to move somewhere else.
 
 ---
 
-## 1. What we tried
+## 1. How we measured
+
+### 1.1 By hand
 
 | Step | Result |
 |---|---|
@@ -27,35 +35,36 @@ Code already gets — without breaking the Claude plugin.
 | `grok plugin install $HOME/Projects/scout --trust` | Installed. Copied the **entire** working tree (including `target/`, ~3.9G) to `~/.grok/installed-plugins/scout-<id>`. |
 | Copy `target/release/scout` into the path `grok mcp doctor` printed | `scout` MCP came up: handshake OK, 4 tools. New session required. |
 
-Grok had also already picked scout up via Claude compatibility
-(`~/.claude/settings.json` `enabledPlugins.scout@scout` +
-`extraKnownMarketplaces` pointing at this directory). That path loaded
-the **Claude plugin cache snapshot**
-(`~/.claude/plugins/cache/scout/scout/0.1.0`), not the live checkout.
-`grok plugin list` was empty in that state; `grok inspect` still showed
-`scout (user, enabled)`.
+### 1.2 With the probe
+
+`~/Projects/grok-probe` is a throwaway plugin shaped exactly like the payload
+proposed in §3: plugin in a `plugins/<name>/` subdirectory, a real 12M
+executable in the payload's `bin/`, MCP command pointed at a plugin-root
+variable. It declares **five MCP servers running one identical script**,
+differing only in how the command path is spelled, and registers each hook
+twice, once per root variable. Every spawn appends its variant, cwd, and full
+plugin-variable environment to `~/grok-probe.log` before attempting the
+handshake, so a server that fails to start still reports what it saw.
+
+That turns "which substitutions does Grok honor" into a single reading of
+`grok mcp doctor`, and it distinguishes *hook did not fire* from *hook fired
+but the path did not expand* — a distinction §2 previously could not make.
 
 ---
 
 ## 2. Findings
 
-### 2.1 Marketplace `source: "./"` is dropped
+### 2.1 Marketplace `source: "./"` is dropped — CONFIRMED, and the fix works
 
-`.claude-plugin/marketplace.json` is the Claude-shaped single-repo
-index:
+`.claude-plugin/marketplace.json` is the Claude-shaped single-repo index:
 
 ```json
 { "name": "scout", "source": "./", "description": "…" }
 ```
 
-Claude Code accepts a plugin that *is* the marketplace root. Grok
-registers the marketplace and then publishes **zero** plugins from it.
-`grok plugin list --json --available` never included a `scout`
-marketplace entry, which is why name-based install failed even though
-the source was in `config.toml`.
-
-Probed against Grok 1.0.3 (local temp marketplaces, add → list →
-remove):
+Claude Code accepts a plugin that *is* the marketplace root. Grok registers the
+marketplace and then publishes **zero** plugins from it, which is why
+name-based install failed even though the source was in `config.toml`.
 
 | `source` value | Cataloged? |
 |---|---|
@@ -65,329 +74,379 @@ remove):
 | `"./"`, `"."`, `""` | no |
 | `{ "type": "local", "path": "./" }` or `"path": "."` | no |
 
-`.grok-plugin/marketplace.json` vs `.claude-plugin/marketplace.json`
-did not matter. The rejected shape is **plugin at marketplace root**.
-Grok's own docs assume a `plugins/<name>/` subdirectory.
+`.grok-plugin/marketplace.json` vs `.claude-plugin/marketplace.json` did not
+matter. The rejected shape is **plugin at marketplace root**.
 
-`grok plugin install <name>` looks up the **plugin** name, not the
-marketplace name. Even with a working index the command is
-`install scout`, not `install <marketplace>`.
-
-### 2.2 Path install snapshots the whole repo
-
-`grok plugin install /abs/path --trust` does not behave like Claude's
-directory marketplace. Claude leaves `CLAUDE_PLUGIN_ROOT` on the
-working tree. Grok copies into `~/.grok/installed-plugins/scout-<id>`.
-
-There is no exclude list. This checkout's `target/` came along
-(~3.9G). The copy is not updated when you rebuild in the tree; it is a
-snapshot of whatever was on disk at install time (hooks, `plugin.json`,
-and a stale `target/release/scout` if one happened to be there).
-
-### 2.3 MCP command points at an empty Grok plugin-data dir
-
-`.claude-plugin/plugin.json` declares:
+The probe confirmed the working end of this end to end: with
+`source: "./plugins/probe"` in `.claude-plugin/marketplace.json`,
+`grok plugin install probe --trust` resolved by **plugin** name, and
+`registry.json` recorded the subdirectory explicitly:
 
 ```json
-"mcpServers": {
-  "scout": {
-    "command": "${CLAUDE_PLUGIN_DATA}/bin/scout",
-    "args": ["mcp"]
-  }
-}
+"marketplace": { "source_display_name": "grok-probe", "plugin_subdir": "plugins/probe" }
 ```
 
-Claude expands `CLAUDE_PLUGIN_DATA` to
-`~/.claude/plugins/data/scout-scout`. SessionStart
-(`scripts/ensure-binary.sh`) copies `target/release/scout` there
-before the session is useful. That is why Claude works.
+### 2.2 Path install snapshots the whole repo — CONFIRMED, and it becomes an asset
 
-Grok expands the same substitution to a **different** path:
+`grok plugin install /abs/path --trust` does not behave like Claude's directory
+marketplace. Claude leaves `CLAUDE_PLUGIN_ROOT` on the working tree. Grok
+copies into `~/.grok/installed-plugins/<name>-<id>`. There is no exclude list,
+which is how this checkout's `target/` came along at ~3.9G.
 
-```
-~/.grok/plugin-data/user/<id>/scout/bin/scout
-```
-
-The `<id>` is per plugin-install identity, not stable across
-install methods. Claude-compat used `9e028837`; the path install used
-`e3540977`. The directory did not exist until we created it by hand.
-`grok mcp doctor` then reported:
+With a slim payload that copy stops being a liability and becomes the delivery
+mechanism. The probe shipped a real 12M ELF (a copy of `scout`) at
+`plugins/probe/bin/fake-binary`. After install:
 
 ```
-✗ command not found (~/.grok/plugin-data/user/<id>/scout/bin/scout)
+payload binary     = present, 11688064 bytes, exec=yes
+payload --version  = scout 0.1.0
 ```
 
-A working `scout` was already on `PATH` (`~/.local/bin/scout`). Grok
-never used it, because the plugin command is a hard-coded plugin-data
-path.
+Byte-identical, exec bit preserved, and it **ran** from the installed copy.
+Total install size 12M. This is the single result the whole plan rests on.
 
-Grok documents `GROK_PLUGIN_DATA` / `GROK_PLUGIN_ROOT` for hooks and
-says it also sets the `CLAUDE_PLUGIN_*` aliases. Observed behavior:
-plugin-data was never populated, so either SessionStart did not run,
-or it ran too late (after MCP spawn), or it ran with the script's
-fallback (`$HOME/.claude/plugins/data/scout-scout`) instead of Grok's
-data dir. We did not distinguish those three; the spawn failure is the
-same.
+The copy is still a snapshot: it is not updated when you rebuild in the tree.
+See §3.2 for what that costs.
 
-Grok's plugin docs also say plugins deliver files, not native
-binaries. A SessionStart-copied Rust binary is a Claude-shaped
-bootstrap Grok does not currently honor on the MCP path.
+### 2.3 Plugin-data is empty at spawn — CONFIRMED, and the cause is now known
 
-### 2.4 Project `.mcp.json` is attributed to the plugin
+`.claude-plugin/plugin.json` declares `"command": "${CLAUDE_PLUGIN_DATA}/bin/scout"`.
+Claude expands that to `~/.claude/plugins/data/scout-scout`, which SessionStart
+(`scripts/ensure-binary.sh`) populates. Grok expands the same token to
+`~/.grok/plugin-data/user/<id>/scout/bin/scout` and **never creates it**:
 
-Repo-root `.mcp.json` is a **project** server for working *on* this
-checkout:
+```
+✗ command not found (~/.grok/plugin-data/user/<id>/probe/bin/probe-mcp)
+```
+
+The earlier session could not tell whether SessionStart ran late, ran with the
+wrong fallback, or never ran. The probe answers it: **it never ran** (§2.5).
+Ordering is moot. Any design that requires a hook to populate a directory
+before MCP spawn is dead under Grok.
+
+The `<id>` is per install identity and not stable across install methods
+(Claude-compat `9e028837`, path install `e3540977`, probe `a8876d9c`).
+
+### 2.4 Plugin-root variables DO expand in the MCP command — NEW, decisive
+
+Both root spellings expand, to the same place, and both handshake cleanly:
+
+| Server | Command as declared | Result |
+|---|---|---|
+| `probe-claude-root` | `${CLAUDE_PLUGIN_ROOT}/bin/probe-mcp` | ✓ resolved to `~/.grok/installed-plugins/probe-0c80af74/bin/probe-mcp`, handshake OK |
+| `probe-grok-root` | `${GROK_PLUGIN_ROOT}/bin/probe-mcp` | ✓ same path, handshake OK |
+| `probe-claude-data` | `${CLAUDE_PLUGIN_DATA}/bin/probe-mcp` | ✗ command not found |
+| `probe-grok-data` | `${GROK_PLUGIN_DATA}/bin/probe-mcp` | ✗ command not found |
+| `probe-path` | bare `probe-mcp` | ✗ command not found — payload `bin/` is not on the spawn PATH |
+
+Grok honors Claude's root alias. **One manifest command string serves both
+harnesses**, with no conditional logic and no wrapper.
+
+The asymmetry that makes this work: `PLUGIN_ROOT` is whatever the harness
+installed, so it exists by definition before anything spawns. `PLUGIN_DATA` is
+an empty directory some hook is supposed to fill later.
+
+### 2.5 Grok does not run plugin hooks — NEW, and worse than assumed
+
+The probe registered a SessionStart recorder and a no-op PreToolUse dumper,
+each twice (once per root variable), with the union matcher
+`Bash|run_terminal_command`. After a full session with shell commands run and
+`permission_mode = "always-approve"`:
+
+**Neither event fired. Zero hook blocks in the log.**
+
+This is not a substitution failure — Grok expanded the *same*
+`${CLAUDE_PLUGIN_ROOT}` token correctly in the MCP command field (§2.4). Grok
+parses `hooks/hooks.json` (`grok inspect` reports the plugin as providing a
+file hook) but does not execute it.
+
+Previous speculation about matcher names (`Bash` vs `run_terminal_command`) is
+untestable until hooks run at all. The union matcher is still the right shape
+and costs nothing, but do not expect it to do anything on Grok today.
+
+Consequences, in order of severity:
+
+1. **Config seeding does not happen.** `ensure-binary.sh` seeds
+   `~/.config/scout/config.toml` on first run. Under Grok a user gets a healthy
+   scout MCP server with no config, so every call needing the local model
+   fails. This is the only one that breaks functionality.
+2. **Guidance injection does not happen** — confirms §2.7 with a cause.
+3. **The build/test redirect** and **shell-safety auto-allow** are unavailable.
+   Both fail open, so nothing breaks; Grok simply gets no steering.
+
+### 2.6 Plugin variables are NOT exported to the spawned process — NEW
+
+Every spawn logged all four as unset:
+
+```
+CLAUDE_PLUGIN_ROOT = <unset>    GROK_PLUGIN_ROOT   = <unset>
+CLAUDE_PLUGIN_DATA = <unset>    GROK_PLUGIN_DATA   = <unset>
+```
+
+Grok substitutes into the command *string* at spawn time; it does not put the
+variables in the child's environment. So nothing can resolve its own location
+at runtime — no wrapper script that tries `$GROK_PLUGIN_DATA` then
+`$CLAUDE_PLUGIN_DATA` then PATH can work, because it will see none of them.
+Manifest-time substitution is the only mechanism available, and per §2.4 it is
+sufficient.
+
+### 2.7 Grok reads which manifest? The payload root — NEW
+
+The probe shipped `plugin.json` in both candidate locations with deliberately
+different versions. `registry.json` recorded:
 
 ```json
-{ "mcpServers": { "ct": { "command": "ct", "args": ["mcp-serve"] } } }
+"plugins": { "probe": { "version": "0.0.2" } }
 ```
 
-`CLAUDE.md` already says this is a ct entry, nothing of scout's.
-Claude Code treats it as project MCP.
+`0.0.2` is the payload-root `plugins/probe/plugin.json`. Grok did **not** read
+`plugins/probe/.claude-plugin/plugin.json` (`0.0.1`), which is the only
+location Claude accepts. Two manifest copies are required. See §3.3.
 
-Grok's plugin loader treats a plugin folder's `.mcp.json` as **plugin**
-MCP. Because the plugin *is* the repo (and the path-install copy
-includes that file), `/mcp` under the scout plugin listed the healthy
-`ct` server (46 tools) next to the failing `scout` server. That is
-the "I expanded scout and saw ct tools" symptom.
+### 2.8 Project `.mcp.json` is attributed to the plugin — CONFIRMED
 
-`grok inspect` reported the plugin as providing `1` MCP (the
-`plugin.json` `scout` server) while `grok mcp doctor` reported `2`
-servers from `plugin: scout`. Both views are consistent with "load
-`plugin.json` *and* `.mcp.json`."
+Repo-root `.mcp.json` holds a `ct` entry for working *on* this checkout.
+Claude treats it as project MCP. Grok's plugin loader treats a plugin folder's
+`.mcp.json` as **plugin** MCP — and because the plugin *is* the repo, `/mcp`
+under scout listed the healthy `ct` server next to the failing `scout` one.
 
-### 2.5 Hook matchers name Claude tools
+Moving the payload into `plugins/scout/` fixes this structurally: repo-root
+`.mcp.json` is no longer inside the plugin directory, so there is nothing to
+attribute. No exclude list needed.
 
-`hooks/hooks.json` matches `Bash` for `shell-safety.sh` and
-`prefer-local-llm.sh`. Grok's shell tool is `run_terminal_command`.
-Grok matchers test the real tool name. Those PreToolUse hooks will not
-fire on Grok unless the matcher includes that name.
+### 2.9 Grok loads Claude's plugin config wholesale — NEW, affects testing
 
-SessionStart uses `${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh`.
-Grok inspect listed the plugin hook as a `file` hook pointing at
-`hooks/hooks.json`; we did not see a populated Grok plugin-data dir
-after session start, so bootstrap + guidance injection did not take
-effect.
+`grok plugin marketplace list` reports `claude-plugins-official`, which was
+never added to Grok. Grok reads `~/.claude/settings.json` directly:
+`enabledPlugins["scout@scout"]` plus `extraKnownMarketplaces.scout` is enough
+to load scout as a Grok plugin with two servers, **independently of Grok's own
+registry** — `grok plugin list` and `registry.json` both show it absent while
+`grok mcp doctor` shows it healthy.
 
-`bin/scout` (the PATH shim) only execs
-`$CLAUDE_PLUGIN_DATA/bin/scout` or
-`~/.claude/plugins/data/scout-scout/bin/scout`. It does not look at
-`$GROK_PLUGIN_DATA` or a real binary on `PATH`.
+Practical effect: uninstalling the Grok plugin does not remove it, and neither
+does `grok plugin marketplace remove scout`. Use `grok plugin disable scout` on
+the Grok side, or clear `scout@scout` from Claude's settings (which disables it
+in Claude too). Disable it before testing the new payload, or you will be
+looking at two overlapping installs.
 
-### 2.6 Usage guidance never enters a Grok session
+### 2.10 Usage guidance never enters a Grok session — CONFIRMED
 
-Claude gets the "prefer scout over raw Bash/Read/Grep for token-heavy
-work" table from SessionStart `additionalContext` in
-`ensure-binary.sh`. Grok did not receive that block.
+Claude gets the delegation table from SessionStart `additionalContext` in
+`ensure-binary.sh`. Grok did not receive it, because the hook never ran (§2.5).
+Asked directly, the Grok session reported the sentinel string was absent from
+its system prompt and any injected guidance, and that it could only find the
+string by searching the filesystem.
 
-What Grok *did* load: `CLAUDE.md` (commit cadence, don't hardcode MCP
-names, prefer `check_output` over bare `cargo test`). That is not a
-search-routing table, and scout's own table only recommends
-`grep(pattern, intent)` when a raw pattern would be too noisy anyway.
-
-Grok's native `grep` / `read_file` / `list_dir` are always in the tool
-list with full schemas. MCP tools are a second hop (`search_tool` then
-`use_tool`). Combined with a dead or undiscovered scout server, the
-model uses built-in search. That is a packaging + guidance problem,
-not a model-preference mystery.
+What Grok *did* load: `CLAUDE.md`. That is not a search-routing table. Grok's
+native `grep` / `read_file` / `list_dir` are always in the tool list with full
+schemas, while MCP tools are a second hop (`search_tool` then `use_tool`).
+Combined with a dead or undiscovered scout server, the model uses built-in
+search. Packaging plus guidance, not a model-preference mystery.
 
 ---
 
-## 3. Suggested resolution
+## 3. Resolution
 
-Keep the Claude plugin at repo root as it is. Add a Grok-shaped
-payload next to it. Do not make Grok install the Rust crate.
+One payload, shared by both harnesses. Not a Grok-shaped copy alongside the
+Claude one — that is two of everything and the drift is silent.
 
-### 3.1 Slim plugin directory + Grok marketplace index
-
-Add a subdirectory Grok will catalog, and an index that points at it:
+### 3.1 Move the plugin into `plugins/scout/`
 
 ```
-.grok-plugin/marketplace.json          # source: "./plugins/scout"
+.claude-plugin/marketplace.json        # source: "./plugins/scout"
 plugins/scout/
-  plugin.json                          # metadata; MCP via .mcp.json
-  .mcp.json                            # scout only (see §3.2)
-  hooks/hooks.json                     # Grok-safe matchers (§3.4)
-  scripts/ensure-binary.sh             # optional; must not be the only boot path
-  bin/scout                            # shim that knows GROK_PLUGIN_DATA
+  plugin.json                          # Grok reads this (§2.7)
+  .claude-plugin/plugin.json           # Claude reads this (§2.7)
+  hooks/hooks.json                     # union matcher; Claude-only in practice
+  hooks/shell-safety.sh
+  hooks/prefer-local-llm.sh
+  scripts/ensure-binary.sh             # shrinks — see §3.5
+  bin/scout                            # the real binary, put there by `make`
+  bin/.gitkeep
 ```
 
-`.grok-plugin/marketplace.json`:
+Claude accepts a subdirectory source — that is the ordinary multi-plugin
+marketplace shape; `source: "./"` is the special case and the one Grok drops.
+So a single `marketplace.json` serves both, and `/plugin install scout@scout`
+is unchanged for Claude.
+
+This one move retires §2.1, §2.2 (payload is 12M, not 3.9G), and §2.8.
+
+Cost: `CLAUDE_PLUGIN_ROOT` moves two levels down, so `ensure-binary.sh` loses
+`$PLUGIN_ROOT/target/release/scout`, `$PLUGIN_ROOT/.claude-plugin/plugin.json`,
+and `$PLUGIN_ROOT/config.example.toml`. Resolve those against a repo root found
+by walking up for `Cargo.toml`, and let the local-build branch not fire when
+there is no checkout above — which is the Grok case regardless, since Grok
+copies.
+
+### 3.2 Ship the binary in the payload, via `make`
+
+A make target installs `target/release/scout` to `plugins/scout/bin/scout`.
+`.gitignore` gets that path; `bin/.gitkeep` keeps the directory tracked.
+
+Fold it into the existing `build` target rather than adding a separate one, so
+`make build` cannot leave the plugin stale. `install-bin` (CLI → `$PREFIX/bin`)
+stays as it is: two destinations, one command, nothing to remember.
+
+What this buys, per harness:
+
+- **Claude**, directory marketplace: `PLUGIN_ROOT` *is* the checkout, so `make`
+  lands on the next session start. The mtime-versus-version logic in
+  `ensure-binary.sh` — and its long justifying comment — is no longer needed.
+- **Grok**: the payload copy carries the binary at install time (§2.2), so the
+  server spawns on the **first** session with no bootstrap at all.
+
+Two limits, both acceptable:
+
+- A clean `git clone` has no binary, so a marketplace install straight from
+  GitHub yields a payload that cannot spawn. This makes the *local* story
+  airtight and does nothing for a stranger; prebuilt release binaries are what
+  closes that, and they would populate this same `bin/scout` path.
+- Grok copied at install time, so after a rebuild a Grok user must reinstall.
+  Claude does not. That is the live-vs-snapshot split, now confined to "the
+  binary changed" instead of "anything changed."
+
+### 3.3 One MCP command spelling, two manifest copies
+
+Both `plugins/scout/plugin.json` and `plugins/scout/.claude-plugin/plugin.json`
+declare exactly:
 
 ```json
-{
-  "name": "scout",
-  "owner": { "name": "Josh Carter", "url": "https://github.com/joshcarter" },
-  "plugins": [
-    {
-      "name": "scout",
-      "description": "Local-LLM scout: classifies build/test output, screens shell commands, and answers targeted code questions with a local model so the cloud model doesn't have to.",
-      "source": { "type": "local", "path": "./plugins/scout" }
-    }
-  ]
+"mcpServers": {
+  "scout": { "command": "${CLAUDE_PLUGIN_ROOT}/bin/scout", "args": ["mcp"] }
 }
 ```
 
-Then `grok plugin marketplace add $HOME/Projects/scout` followed by
-`grok plugin install scout --trust` should resolve. The installed copy
-is hooks + manifests, not `target/`.
+Per §2.4 this resolves under both harnesses. No `PLUGIN_DATA`, no PATH
+dependency, no wrapper, no SessionStart ordering dependency. It also removes
+the first-session spawn failure Claude users currently hit (README:107).
 
-Claude's `.claude-plugin/marketplace.json` can stay on `source: "./"`
-so `/plugin install scout@scout` is unchanged.
+The two files are ~20 duplicated lines because Grok and Claude read different
+paths (§2.7). Keep them honest with a make target that copies one to the other,
+or a test that diffs them. Worth checking during the Claude smoke test whether
+Claude also accepts the payload-root `plugin.json` — if it does, delete the
+`.claude-plugin/` copy and the problem disappears.
 
-### 3.2 Split project MCP from plugin MCP
+### 3.4 Seed config from the binary, not from a hook
 
-| File | Audience | Servers |
-|---|---|---|
-| repo-root `.mcp.json` | anyone working *on* scout | `ct` only |
-| `plugins/scout/.mcp.json` | Grok plugin payload | `scout` only |
-| `.claude-plugin/plugin.json` `mcpServers` | Claude plugin payload | `scout` only (already) |
+`ensure-binary.sh` currently seeds `~/.config/scout/config.toml`. Under Grok
+that never runs (§2.5), leaving a healthy server that fails every real call.
 
-Do not copy repo-root `.mcp.json` into `plugins/scout/`. Once Grok
-installs the slim dir, `/mcp` under scout should list scout's tools,
-and `ct` should show up as project MCP when the cwd is this repo.
+Move first-run config seeding into the binary: on startup, if no config exists
+at the resolved path, write the default and note it. This is the right fix
+independent of Grok — it makes `scout` on PATH robust for anyone who installed
+by `make install`, `cargo install`, or a future release tarball, none of which
+run the hook either.
 
-### 3.3 MCP command that does not depend on SessionStart
+Resolution order must stay in step with `src/config.rs`, `hooks/shell-safety.sh`
+and the Makefile: `$SCOUT_CONFIG`, else `${XDG_CONFIG_HOME:-~/.config}/scout/`.
 
-Grok will not reliably have `$CLAUDE_PLUGIN_DATA/bin/scout` at spawn.
-The command that already works on this machine is `scout` on `PATH`
-(`~/.local/bin/scout`, same binary `cargo build --release` produces).
+### 3.5 What `ensure-binary.sh` becomes
 
-Recommended `plugins/scout/.mcp.json`:
+With §3.2 and §3.4 done, its install half and its config half are both gone.
+What remains is SessionStart guidance injection for Claude — a different script
+wearing the same name. Rename it, or fold it into a small
+`scripts/session-context.sh`, and delete the version compare, the mtime check,
+and the `cargo install scout-llm` fallback.
 
-```json
-{
-  "mcpServers": {
-    "scout": {
-      "command": "scout",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+### 3.6 Guidance: `AGENTS.md` is the only Grok channel
 
-Claude can keep `${CLAUDE_PLUGIN_DATA}/bin/scout` in
-`.claude-plugin/plugin.json`. Two declarations, two boot stories:
+`additionalContext` reaches Claude and nothing else (§2.10). Put the delegation
+table in an `AGENTS.md` at repo root, which Grok auto-loads. Keep the
+`additionalContext` copy for Claude — it is the only channel that works
+in sessions outside this repo.
 
-- **Claude:** SessionStart copies into plugin-data; MCP uses that copy.
-- **Grok:** MCP uses `PATH`. `cargo install --path .` / the existing
-  `~/.local/bin/scout` is the binary. Optional SessionStart can still
-  refresh `$GROK_PLUGIN_DATA/bin/scout` for the shim, but it must not
-  be the only way the server starts.
+Content is the table that already exists in `ensure-binary.sh`: prefer
+`check_output` / `extract` / `grep(pattern, intent)` for token-heavy work; the
+`# raw-output` bypass; `ToolSearch` / `search_tool` to resolve deferred MCP
+names. Per `CLAUDE.md`, do not bake a fully-qualified MCP tool name into it.
+Do not tell the model to use scout for every identifier search — the Claude
+guidance does not say that either.
 
-If a single `plugin.json` must serve both harnesses, prefer `scout` on
-`PATH` and make `ensure-binary.sh` install *onto* `PATH` (or document
-`cargo install --path .`) rather than only into plugin-data. A missing
-plugin-data path is a hard spawn failure; a PATH lookup at least
-fails with a diagnosable `command not found` that `grok mcp doctor`
-already explains.
+Two copies of this text now exist. Generate one from the other, or accept the
+duplication and note it in both.
 
-`scripts/ensure-binary.sh` should, if it runs under Grok:
+### 3.7 Hooks: Claude-only, pending one more probe
 
-1. Treat `GROK_PLUGIN_DATA` as a first-class dest (not only
-   `CLAUDE_PLUGIN_DATA`).
-2. Keep writing the Claude dest so a dual-harness machine stays in
-   sync.
-3. Not use `~/.claude/plugins/data/scout-scout` as the Grok fallback.
+Ship `hooks/hooks.json` with the union matcher `Bash|run_terminal_command`. It
+is correct for Claude, costs nothing, and is inert on Grok (§2.5).
 
-`bin/scout` should exec, in order: `$GROK_PLUGIN_DATA/bin/scout`,
-`$CLAUDE_PLUGIN_DATA/bin/scout`, the Claude dest, then a real binary
-found via `command -v` that is **not** the shim (avoid recursion).
+Whether Grok's hooks are recoverable is worth one narrow probe: try hooks
+declared inline in `plugin.json` rather than a sibling `hooks/hooks.json`, a
+`.grok-plugin/hooks.json`, and Grok's own documented event names if they differ
+from Claude's. Grok parses the file today but does not execute it, so the shape
+is the most likely culprit. Until that resolves, treat the redirect and
+shell-safety layers as Claude-only features and say so in the README.
 
-### 3.4 Hook matchers and guidance Grok will actually load
-
-In the Grok plugin's `hooks/hooks.json` (or the shared file if one
-file must serve both):
-
-- PreToolUse matcher: `Bash|run_terminal_command` (Grok's shell tool
-  name). If search is ever redirected, Grok's names are `grep`,
-  `read_file`, `list_dir` — not `Grep` / `Read` / `Glob`.
-- SessionStart may still run `ensure-binary.sh`, but guidance cannot
-  live only in `additionalContext`. Grok did not inject that block.
-
-Put the delegation table where Grok auto-loads project instructions:
-an `AGENTS.md` (or a short addition to `CLAUDE.md`, which Grok already
-reads). A `plugins/scout` `SKILL.md` with a strong trigger is a second
-copy for sessions outside this repo.
-
-The table that already exists in `ensure-binary.sh` is the right text:
-prefer `check_output` / `extract` / `grep(pattern, intent)` for
-token-heavy work; `# raw-output` bypass; ToolSearch / `search_tool`
-for deferred MCP names. Do not tell the model to use scout for every
-identifier search — that is not what the Claude guidance says either.
-
-### 3.5 Local workaround until the above ships
-
-No repo change required:
+### 3.8 Local workaround until the above ships
 
 ```bash
 grok mcp add scout -- scout mcp
 ```
 
-That registers `~/.local/bin/scout` in `~/.grok/config.toml` and does
-not depend on plugin-data or SessionStart. Do not add it while a
-plugin-declared `scout` server is also configured unless you have
-checked that user config **replaces** the plugin server (Grok's merge
-order documents config.toml over Claude/Cursor/`.mcp.json`; plugin
-servers are a separate source).
-
-Uninstall the accidental 3.9G snapshot if it is still present:
-
-```bash
-grok plugin uninstall scout --confirm
-```
-
-The `[[marketplace.sources]] name = "scout"` entry is harmless but
-useless until §3.1 exists.
-
-After a rebuild, `cp target/release/scout ~/.local/bin/scout` (or
-`cargo install --path . --force`) is what keeps the PATH server
-current. Grok's plugin-data copy, if you still use it, is a second
-manual `cp` to whatever `grok mcp doctor scout` prints — the hash
-changes when the install identity changes.
+Registers `~/.local/bin/scout` in `~/.grok/config.toml`; no plugin-data, no
+SessionStart. Disable the Claude-compat load first (§2.9) or you will have two
+scout servers. After a rebuild, `make install` is what keeps this current.
 
 ---
 
 ## 4. Verification
 
-Once §3.1–3.4 are in:
+Once §3.1–3.3 are in:
 
-1. `grok plugin marketplace add $HOME/Projects/scout` (or refresh).
-2. `grok plugin list --json --available` includes
+1. `grok plugin disable scout` (kill the Claude-compat load, §2.9).
+2. `grok plugin marketplace add $HOME/Projects/scout` (or `update`).
+3. `grok plugin list --json --available` includes
    `{ "name": "scout", "marketplace": "scout" }`.
-3. `grok plugin install scout --trust` succeeds and
-   `~/.grok/installed-plugins/` does **not** contain `target/`.
-4. `grok mcp doctor scout` : command found, handshake OK, 4 tools.
-   `ct` is **not** listed as `plugin: scout`.
-5. New Grok session: `/mcp` → scout expands to `check_output` /
-   `extract` / `grep` / `ping` (or whatever the server currently
-   exports), not ct's 46 tools.
-6. `grok inspect` shows the slim path, not
-   `~/.claude/plugins/cache/scout/…`.
-7. A `cargo test` via Grok's shell tool is redirected or at least
-   nudged toward `check_output` if the matcher in §3.4 is in place.
+4. `grok plugin install scout --trust` succeeds;
+   `~/.grok/installed-plugins/scout-<id>` is ~12M and contains no `target/`.
+5. `grok mcp doctor scout`: command found under
+   `~/.grok/installed-plugins/`, handshake OK, 4 tools — on the **first**
+   session, no manual copy. `ct` is **not** listed as `plugin: scout`.
+6. New Grok session: `/mcp` → scout expands to `check_output` / `extract` /
+   `grep` / `ping`, not ct's 46 tools.
+7. A scout MCP call succeeds on a machine with no `~/.config/scout/config.toml`
+   (§3.4).
 
-Claude Code smoke: `/plugin install scout@scout` from the directory
-marketplace still resolves; SessionStart still copies into
-`~/.claude/plugins/data/scout-scout`; `ct` still comes from project
-`.mcp.json` when the cwd is this repo.
+Claude Code smoke:
+
+8. `/plugin install scout@scout` from the directory marketplace still resolves
+   against the new `source: "./plugins/scout"`.
+9. MCP spawns on the **first** session (no plugin-data bootstrap).
+10. `make build` leaves `plugins/scout/bin/scout` current; a rebuild is picked
+    up after a restart.
+11. Both PreToolUse hooks still fire; `ct` still comes from project `.mcp.json`
+    when the cwd is this repo.
+12. Does Claude accept the payload-root `plugin.json`? If yes, drop
+    `.claude-plugin/plugin.json` from the payload (§3.3).
 
 ---
 
 ## 5. Decision log
 
-Nothing here is decided except the diagnosis. Open product choices:
+Closed by measurement:
 
-- **One hooks.json or two?** Shared file with a union matcher
-  (`Bash|run_terminal_command`) is less drift. Two files is less
-  chance of a Claude matcher surprise.
-- **PATH vs plugin-data for Claude?** Leave Claude on plugin-data.
-  Switching Claude to `PATH` would drop the "plugin owns the binary"
-  story `ensure-binary.sh` exists for.
-- **Should Grok run SessionStart before MCP spawn?** That is a Grok
-  bug/limitation, not something scout can fix. Design as if it does
-  not.
-- **Live checkout vs snapshot.** Grok copies. The slim dir is the
-  workaround. A `[plugins].paths` / `.grok/plugins/` symlink at the
-  slim dir would be a dev-only alternative if we want edits to hooks
-  without reinstall; not required for a first Grok-ready install.
+- **PATH vs plugin-data?** Neither. Plugin-root, one spelling, both harnesses
+  (§2.4). Plugin-data is unreachable under Grok and unnecessary under Claude.
+- **A wrapper that resolves the binary at runtime?** Impossible — the child
+  process sees none of the plugin variables (§2.6).
+- **One hooks.json or two?** One, union matcher. Two files would be two copies
+  of a thing that only runs in one harness anyway (§2.5).
+- **Should Grok run SessionStart before MCP spawn?** Moot. It does not run
+  plugin hooks at all. The design does not depend on it.
+- **Will Grok carry a 12M binary in the payload?** Yes, exec bit intact, and it
+  runs (§2.2).
+
+Still open:
+
+- **Are Grok's plugin hooks recoverable at all?** §3.7. Determines whether the
+  redirect and shell-safety layers are Claude-only permanently.
+- **Does Claude accept a payload-root `plugin.json`?** If so, one manifest
+  instead of two (§3.3).
+- **Prebuilt release binaries.** Deferred, but it is what makes scout
+  installable by someone who is not building from this checkout. The payload
+  `bin/scout` path in §3.2 is where a release tarball would land, so the two
+  designs agree.
+- **Live checkout vs snapshot for Grok dev.** Grok copies; reinstall after a
+  rebuild is the honest cost. A `.grok/plugins/` symlink would paper over it on
+  one machine and mislead about what users experience. Not recommended.
