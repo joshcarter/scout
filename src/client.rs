@@ -25,6 +25,35 @@ pub enum LlmError {
 /// stderr, and the MCP server turns that message into tool-level `isError`
 /// content.  (A JSON-RPC `to_rpc_error` renderer lived here through step 2,
 /// for an MCP layer scout does not hand-roll — rmcp owns the envelopes.)
+impl LlmError {
+    /// The call log's `outcome.kind` for this failure (SPEC-dashboard §3).
+    ///
+    /// It lives here, next to the code that mints the messages, because two of
+    /// the four variants are broader than the taxonomy: `RequestFailed` covers
+    /// an HTTP status, a mid-call I/O error and an unreadable reply alike, and
+    /// the only thing separating them is the string this file just wrote.  A
+    /// richer `LlmError` would make this a plain match — worth doing the next
+    /// time this enum is touched, not worth destabilising the taxonomy for.
+    pub fn outcome(&self) -> crate::stats::Outcome {
+        use crate::stats::Outcome;
+        match self {
+            LlmError::EndpointUnavailable { .. } => Outcome::EndpointUnreachable,
+            LlmError::Timeout => Outcome::Timeout,
+            LlmError::RequestFailed(msg) if msg.starts_with("HTTP ") => Outcome::HttpError,
+            // The endpoint answered and then went away mid-call; from the
+            // caller's chair that is the same problem as never answering.
+            LlmError::RequestFailed(msg) if msg.starts_with("network I/O") => {
+                Outcome::EndpointUnreachable
+            }
+            // Everything else in these two arms is a reply scout could not use:
+            // unparseable JSON, no content field, an empty response.
+            LlmError::RequestFailed(_) => Outcome::ParseFailure,
+            LlmError::Internal(msg) if msg.contains("empty response") => Outcome::EmptyResponse,
+            LlmError::Internal(_) => Outcome::ParseFailure,
+        }
+    }
+}
+
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -61,6 +90,10 @@ impl LlmClient {
 
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
     }
 
     /// Best-effort check: GET /models. Returns (reachable, elapsed_ms).
@@ -216,6 +249,25 @@ mod tests {
         let s = LlmError::Timeout.to_string();
         assert!(s.contains("timed out"), "{s}");
         assert!(s.contains("timeout_seconds"), "{s}");
+    }
+
+    #[test]
+    fn every_failure_maps_to_a_call_log_outcome() {
+        use crate::stats::Outcome;
+        let cases = [
+            (LlmError::EndpointUnavailable { endpoint: "x".into() }, Outcome::EndpointUnreachable),
+            (LlmError::Timeout, Outcome::Timeout),
+            (LlmError::RequestFailed("HTTP 500: boom".into()), Outcome::HttpError),
+            (LlmError::RequestFailed("network I/O error: reset".into()), Outcome::EndpointUnreachable),
+            (LlmError::RequestFailed("parse LLM response: eof".into()), Outcome::ParseFailure),
+            (LlmError::Internal("LLM returned empty response".into()), Outcome::EmptyResponse),
+            (LlmError::Internal("serialize request: nope".into()), Outcome::ParseFailure),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.outcome(), want, "{err:?}");
+        }
+        // ...and none of them is ever recorded as a success.
+        assert!(!LlmError::Timeout.outcome().is_ok());
     }
 
     #[test]

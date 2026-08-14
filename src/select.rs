@@ -55,6 +55,20 @@ pub struct Ctx<'a> {
     pub presets: &'a [Preset],
     /// Project root: the base for relative paths and the search walk.
     pub project: String,
+    /// How this invocation was reached: `mcp` | `cli` (SPEC-dashboard §3).
+    ///
+    /// Set by whoever built the `Ctx` — the MCP server or the CLI dispatcher —
+    /// because only they know, and a value derived any later could drift.
+    pub via: &'static str,
+    /// The user-facing operation this context belongs to (`find`, `edit`),
+    /// which is not the preset a given round-trip sends (`find_patterns`).
+    /// One `find` writes three or four rows; they share this and a `run` id,
+    /// which is what lets the log group them back into one operation.
+    pub tool: String,
+    /// `find`'s round counter, read by every record written during that round.
+    pub attempt: std::cell::Cell<u64>,
+    /// Byte accounting for the operation in flight — see `stats::Ledger`.
+    pub ledger: crate::stats::Ledger,
     /// Optional sink for human-facing progress notes (SPEC-cli §2).
     ///
     /// The filters are shared verbatim with the MCP server, which speaks
@@ -66,7 +80,45 @@ pub struct Ctx<'a> {
     pub progress: Option<ProgressSink<'a>>,
 }
 
+/// A context with nothing configured: no model, no project, the CLI's `via`.
+///
+/// Exists so the four new logging fields cost a test fixture one line rather
+/// than four — `Ctx { project: p, ..Default::default() }`.
+impl Default for Ctx<'_> {
+    fn default() -> Self {
+        Ctx {
+            client: None,
+            client_error: None,
+            presets: &[],
+            project: String::new(),
+            via: crate::stats::VIA_CLI,
+            tool: String::new(),
+            attempt: std::cell::Cell::new(1),
+            ledger: crate::stats::Ledger::default(),
+            progress: None,
+        }
+    }
+}
+
 impl Ctx<'_> {
+    /// A call-log record for this context, pre-filled with everything it
+    /// already knows: the tool, how it was reached, which round it is on, the
+    /// project, and the model behind it.  The caller adds the outcome.
+    ///
+    /// `args` is the preset's own argument object; `stats::input_summary`
+    /// takes the handful of fields worth keeping from it.
+    pub fn record(&self, preset: &str, args: &serde_json::Value) -> crate::stats::CallRecord {
+        let mut rec = crate::stats::CallRecord::new(&self.tool, preset)
+            .via(self.via)
+            .attempt(self.attempt.get())
+            .project(&self.project)
+            .input(crate::stats::input_summary(preset, args));
+        if let Some(c) = self.client {
+            rec = rec.endpoint(c.model(), c.endpoint());
+        }
+        rec
+    }
+
     /// Report progress to whoever asked for it; a no-op when nobody did.
     pub fn note(&self, msg: &str) {
         if let Some(sink) = &self.progress {
@@ -412,8 +464,9 @@ fn truncate_why(why: &str) -> String {
 ///
 /// This is ct's `call_plugin_preset` with the plugin hop removed: scout owns
 /// the preset table and the HTTP client, so resolving the templates and
-/// calling the model happen in-process.  The call is logged to the stats log
-/// exactly as `scout run --preset` logs it.
+/// calling the model happen in-process.  Every round-trip through here writes
+/// one call-log row (SPEC-dashboard §3) via the context's ledger, which is
+/// what makes a `find`'s internal rounds visible as themselves.
 pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String, String> {
     let client = ctx.require_client()?;
     let preset = ctx.preset(preset_name)?;
@@ -424,20 +477,21 @@ pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String,
         serde_json::json!({"role": "user", "content": user}),
     ];
 
+    let rec = ctx.record(preset_name, args);
     let start = std::time::Instant::now();
     match client.complete(messages, None) {
         Ok((text, usage)) => {
-            crate::stats::log_call(
-                preset_name,
-                usage["prompt_tokens"].as_u64().unwrap_or(0),
-                usage["completion_tokens"].as_u64().unwrap_or(0),
-                start.elapsed().as_millis() as u64,
-                true,
-            );
+            let ms = start.elapsed().as_millis() as u64;
+            ctx.ledger.record(rec.usage(&usage).ms(ms));
             Ok(text)
         }
         Err(e) => {
-            crate::stats::log_call(preset_name, 0, 0, 0, false);
+            // The elapsed time of a failure is worth keeping — a 30-second
+            // timeout and an instant connection refusal are the same `ok:
+            // false` and very different problems.  `scout stats` still averages
+            // successes only, so this changes no existing number.
+            let ms = start.elapsed().as_millis() as u64;
+            ctx.ledger.record(rec.ms(ms).outcome(e.outcome()).summary(e.to_string()));
             Err(format!("local LLM call failed: {e}"))
         }
     }

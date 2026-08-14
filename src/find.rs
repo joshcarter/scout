@@ -173,6 +173,10 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let mut truncated = false;
 
     for round in 1..=attempts {
+        // Every call-log row this round writes is tagged with it, which is how
+        // the log tells a first guess from a reflect-driven retry.
+        ctx.attempt.set(round as u64);
+        ctx.ledger.raw_bytes(tree.len() as u64);
         // Either the reflect stage already said what to search next, or this is
         // a synthesis round and the pattern preset gets asked.
         let mut candidates = match refined.take() {

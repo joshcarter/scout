@@ -104,10 +104,15 @@ impl Scout {
             client_error,
             presets: &self.presets,
             project: project_root(),
+            // This is the one entry point Claude reaches on its own, which is
+            // exactly what `via` is for (SPEC-dashboard §3).
+            via: crate::stats::VIA_MCP,
+            tool: tool.to_string(),
             // Silence is mandatory here: stdout is the JSON-RPC transport.
             progress: None,
+            ..Default::default()
         };
-        match tool {
+        let result = match tool {
             "check_output" => crate::check_output::run(&ctx, &args),
             "extract" => crate::extract::run(&ctx, &args),
             "grep" => crate::grep::run(&ctx, &args),
@@ -115,7 +120,15 @@ impl Scout {
                 format!("unknown tool {other:?}"),
                 "the built-in tools",
             )),
+        };
+        // Close the call log's last row now that the payload — and its size —
+        // exists.  Dropping `ctx` would still write the row; this is what puts
+        // `returned_bytes` on it.
+        match &result {
+            Ok(payload) => ctx.ledger.finish(payload),
+            Err(e) => ctx.ledger.fail(&e.text()),
         }
+        result
     }
 }
 

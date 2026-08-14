@@ -106,6 +106,18 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     // it is checked before the bypass threshold and truncates at `max_hits`
     // rather than returning an unbounded list.
     let Some(intent) = intent else {
+        // No model ran, so this row exists for the same reason the bypass rows
+        // do (§2): otherwise a search scout actually served looks exactly like
+        // a search it was never asked for.
+        ctx.ledger.raw_bytes(hit_list_bytes(&hits));
+        ctx.ledger.record(
+            ctx.record("grep", &serde_json::json!({
+                "pattern": pattern, "hits_considered": hits.len(),
+            }))
+            .outcome(crate::stats::Outcome::Bypassed)
+            .summary("no intent given — unfiltered search")
+            .ms(ctx.ledger.elapsed_ms()),
+        );
         return Ok(unfiltered_payload(&pattern, &hits, max_hits, search_truncated));
     };
 
@@ -137,9 +149,19 @@ pub fn rerank(
     search_truncated: bool,
 ) -> ToolResult {
     let hits_total = hits.len();
+    // The pre-rerank hit list is what scout digested here (SPEC-dashboard §3).
+    ctx.ledger.raw_bytes(hit_list_bytes(hits));
 
     // ── 3. Bypass: nothing for the model to filter ───────────────────
     if hits_total <= cfg.bypass_max_hits {
+        ctx.ledger.record(
+            ctx.record("grep", &serde_json::json!({
+                "pattern": pattern, "intent": intent, "hits_considered": hits_total,
+            }))
+            .outcome(crate::stats::Outcome::Bypassed)
+            .summary("few enough hits to return whole")
+            .ms(ctx.ledger.elapsed_ms()),
+        );
         return Ok(bypass_payload(pattern, intent, hits, search_truncated));
     }
 
@@ -230,6 +252,14 @@ pub fn rerank(
         none_relevant,
         search_truncated,
     ))
+}
+
+/// The bytes of a hit list as scout holds it — every hit's context block, the
+/// bulk of what a rerank call carries and what an unfiltered search would have
+/// put in the caller's context.  Close enough to `render_hit_list`'s length
+/// without building the string to find out.
+fn hit_list_bytes(hits: &[RawHit]) -> u64 {
+    hits.iter().map(|h| (h.context.len() + h.file.len()) as u64).sum()
 }
 
 /// Search knobs for one run: the grep config, the caller's `regex`, and the

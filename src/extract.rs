@@ -62,9 +62,22 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         .map_err(|e| fail(&format!("could not read {file}: {e}")))?;
     let (resolved, lines) = (content.path, content.lines);
     let file_lines = lines.len();
+    // What scout digested on the caller's behalf, for the context-saved metric
+    // (SPEC-dashboard §3).  +1 per line for the terminator `split_lines` drops.
+    ctx.ledger.raw_bytes(lines.iter().map(|l| l.len() as u64 + 1).sum());
 
     // ── 2. Bypass: the LLM adds nothing to a small file ──────────────
     if file_lines <= cfg.bypass_max_lines {
+        // Logged, with no model behind it: an unlogged fast path is
+        // indistinguishable from scout never having been called (§2).
+        ctx.ledger.record(
+            ctx.record("extract", &serde_json::json!({
+                "file": resolved, "question": question, "file_lines": file_lines,
+            }))
+            .outcome(crate::stats::Outcome::Bypassed)
+            .summary("file is small enough to return whole")
+            .ms(ctx.ledger.elapsed_ms()),
+        );
         return Ok(bypass_payload(&resolved, &lines));
     }
 

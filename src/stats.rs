@@ -1,12 +1,21 @@
 // Call log: write path (used by every LLM-calling command) and the `scout
 // stats` report (read path). Merges ct-local-llm's stats.rs (writer) with
 // cmd/ct's local_stats.rs (reader) into one module.
+//
+// One JSONL line per LLM round-trip, appended by every scout process — there
+// is no daemon, so the log is the only thing every entry point shares
+// (SPEC-dashboard §1).  The record is `v: 2` (§3): everything past the
+// original six fields is optional, so a v1 line still parses, and `ts` is the
+// one non-additive change — it is a float now, and readers must take both.
 
-use serde_json::json;
+use serde_json::{Map, Value};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime};
 
 /// Path to the call log.
 ///
@@ -29,38 +38,530 @@ pub fn log_path() -> Option<PathBuf> {
     Some(state_dir.join("scout").join("calls.jsonl"))
 }
 
-/// Append a JSONL record to the call log. Silently ignored on any I/O error
-/// (including a missing parent dir) so a full disk or unset $HOME never
-/// breaks a scout command.
-pub fn log_call(preset: &str, tokens_in: u64, tokens_out: u64, ms: u64, ok: bool) {
-    if let Some(path) = log_path() {
-        write_record(&path, preset, tokens_in, tokens_out, ms, ok);
+// ── Identity ────────────────────────────────────────────────────────────────
+
+/// This process's `run` id, minted once.
+///
+/// A pid is unique among *live* processes and the millisecond separates the
+/// reuses, which is all this has to do: it groups the three or four rows one
+/// `scout find` writes into one user-facing operation.  No uuid dependency,
+/// and no way for two concurrent scout processes to collide.
+pub fn run_id() -> &'static str {
+    static RUN: OnceLock<String> = OnceLock::new();
+    RUN.get_or_init(|| {
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        format!("{ms:x}-{}", std::process::id())
+    })
+}
+
+/// `run` plus a per-process counter: monotonic within a run, so a `find`'s
+/// rounds sort into the order they were actually made even when two land in
+/// the same millisecond.
+fn next_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", run_id(), SEQ.fetch_add(1, Ordering::Relaxed) + 1)
+}
+
+// ── The record ──────────────────────────────────────────────────────────────
+
+/// How the call was reached.
+///
+/// Set at the entry point — the MCP server, the CLI dispatcher, `run_cmd` —
+/// and never derived inside the logger, so it cannot drift away from the
+/// process that actually made the call.
+pub const VIA_MCP: &str = "mcp";
+pub const VIA_CLI: &str = "cli";
+pub const VIA_RUN: &str = "run";
+pub const VIA_HOOK: &str = "hook";
+
+const KNOWN_VIA: &[&str] = &[VIA_MCP, VIA_CLI, VIA_RUN, VIA_HOOK];
+
+/// `$SCOUT_VIA`, when it names one of the four known values, else `default`.
+///
+/// `scout run` is reached both from a shell and from `hooks/shell-safety.sh`,
+/// and only the caller knows which — so the caller says so.  Unknown values
+/// are ignored rather than logged: an open-ended field would make `via` a
+/// dumping ground the dashboard cannot group on.
+pub fn via_from_env(default: &str) -> String {
+    match std::env::var("SCOUT_VIA") {
+        Ok(v) if KNOWN_VIA.contains(&v.as_str()) => v,
+        _ => default.to_string(),
     }
 }
 
-fn write_record(path: &std::path::Path, preset: &str, tokens_in: u64, tokens_out: u64, ms: u64, ok: bool) {
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let line = json!({
-        "ts": ts,
-        "preset": preset,
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "ms": ms,
-        "ok": ok,
-    });
+/// What became of one round-trip.
+///
+/// This is the field that replaces `ok:false`, under which endpoint-down,
+/// timeout, empty reply and unparseable JSON were indistinguishable —
+/// endpoint-down being both the most common real failure and the one worth
+/// telling apart from the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The model answered and scout used the answer.
+    Ok,
+    /// scout served the request itself — no model involved (`bypass_max_lines`,
+    /// `bypass_max_hits`, a grep with no intent).
+    Bypassed,
+    /// The model read the candidates and judged none of them relevant — a
+    /// verdict, not a failure.
+    NoneRelevant,
+    EmptyResponse,
+    ParseFailure,
+    EndpointUnreachable,
+    Timeout,
+    HttpError,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Ok => "ok",
+            Outcome::Bypassed => "bypassed",
+            Outcome::NoneRelevant => "none_relevant",
+            Outcome::EmptyResponse => "empty_response",
+            Outcome::ParseFailure => "parse_failure",
+            Outcome::EndpointUnreachable => "endpoint_unreachable",
+            Outcome::Timeout => "timeout",
+            Outcome::HttpError => "http_error",
+        }
+    }
+
+    /// The v1 `ok` boolean, still written so a reader that predates `outcome`
+    /// keeps working: did scout answer the caller?  A bypass and a
+    /// "none relevant" verdict both did.
+    pub fn is_ok(self) -> bool {
+        matches!(self, Outcome::Ok | Outcome::Bypassed | Outcome::NoneRelevant)
+    }
+}
+
+/// Cap for any string inside `input`.  A `check_output` command can carry a
+/// whole shell pipeline and a `task` prompt is unbounded; neither belongs in a
+/// log line at full length.
+const MAX_INPUT_CHARS: usize = 300;
+
+/// One string field of `input`, trimmed and capped with an explicit elision
+/// marker so a truncated value can never read as the whole value.
+fn clip(s: &str) -> Value {
+    let s = s.trim();
+    if s.chars().count() <= MAX_INPUT_CHARS {
+        return Value::String(s.to_string());
+    }
+    let head: String = s.chars().take(MAX_INPUT_CHARS).collect();
+    Value::String(format!("{head}…"))
+}
+
+/// The `input` object for one round-trip: a few named fields per preset, never
+/// a blob (§3).  The preset is the key rather than the tool because the record
+/// already says which template was sent, and `input` describes *that* call —
+/// a `find`'s rerank round is a grep call, and its pattern is the interesting
+/// thing about it.
+///
+/// An unknown preset (a user override, `quality_review`) falls back to
+/// whichever of the common argument names it happens to carry.
+pub fn input_summary(preset: &str, args: &Value) -> Value {
+    let mut m = Map::new();
+    let put_str = |m: &mut Map<String, Value>, out: &str, key: &str| {
+        if let Some(s) = args.get(key).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            m.insert(out.to_string(), clip(s));
+        }
+    };
+    let put_num = |m: &mut Map<String, Value>, out: &str, key: &str| {
+        if let Some(n) = args.get(key).and_then(Value::as_u64) {
+            m.insert(out.to_string(), Value::from(n));
+        }
+    };
+
+    match preset {
+        "check_output" | "shell_safety" => put_str(&mut m, "command", "command"),
+        "extract" => {
+            put_str(&mut m, "file", "file");
+            put_str(&mut m, "question", "question");
+            put_num(&mut m, "lines", "file_lines");
+        }
+        "grep" => {
+            put_str(&mut m, "pattern", "pattern");
+            put_str(&mut m, "intent", "intent");
+            put_num(&mut m, "hits_scanned", "hits_considered");
+        }
+        "find" | "find_patterns" | "find_reflect" => put_str(&mut m, "question", "question"),
+        "task" => put_str(&mut m, "prompt", "prompt"),
+        _ => {
+            for key in ["command", "question", "pattern", "prompt"] {
+                put_str(&mut m, key, key);
+            }
+        }
+    }
+    Value::Object(m)
+}
+
+/// One call-log row, built up as the call proceeds and written once.
+///
+/// Everything but `tool`/`preset` is optional: a record with nothing else set
+/// still writes a line a v1 reader understands.
+#[derive(Debug, Clone)]
+pub struct CallRecord {
+    pub tool: String,
+    pub preset: String,
+    pub via: String,
+    pub attempt: u64,
+    pub project: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub input: Value,
+    pub outcome: Outcome,
+    pub summary: Option<String>,
+    pub raw_bytes: Option<u64>,
+    pub returned_bytes: Option<u64>,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub ms: u64,
+}
+
+impl CallRecord {
+    /// A record for `tool`'s round-trip through `preset`.  `tool` is the
+    /// user-facing operation (`find`), `preset` the template actually sent
+    /// (`find_patterns`) — they differ for exactly the reason the dashboard
+    /// needs both.
+    pub fn new(tool: &str, preset: &str) -> Self {
+        CallRecord {
+            tool: tool.to_string(),
+            preset: preset.to_string(),
+            via: VIA_CLI.to_string(),
+            attempt: 1,
+            project: None,
+            model: None,
+            endpoint: None,
+            input: Value::Object(Map::new()),
+            outcome: Outcome::Ok,
+            summary: None,
+            raw_bytes: None,
+            returned_bytes: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            ms: 0,
+        }
+    }
+
+    pub fn via(mut self, via: &str) -> Self {
+        self.via = via.to_string();
+        self
+    }
+
+    /// `find`'s round counter; 1 everywhere else.
+    pub fn attempt(mut self, attempt: u64) -> Self {
+        self.attempt = attempt.max(1);
+        self
+    }
+
+    pub fn project(mut self, project: &str) -> Self {
+        if !project.is_empty() {
+            self.project = Some(project.to_string());
+        }
+        self
+    }
+
+    pub fn endpoint(mut self, model: &str, endpoint: &str) -> Self {
+        self.model = Some(model.to_string());
+        self.endpoint = Some(endpoint.to_string());
+        self
+    }
+
+    pub fn input(mut self, input: Value) -> Self {
+        self.input = input;
+        self
+    }
+
+    pub fn outcome(mut self, outcome: Outcome) -> Self {
+        self.outcome = outcome;
+        self
+    }
+
+    /// A one-line note about the outcome — the model's verdict, or the error
+    /// as the caller saw it.  Capped like `input`.
+    pub fn summary(mut self, summary: impl AsRef<str>) -> Self {
+        let s = summary.as_ref().trim();
+        if !s.is_empty() {
+            self.summary = clip(s).as_str().map(str::to_string);
+        }
+        self
+    }
+
+    /// Token counts from an OpenAI-shaped `usage` object.
+    pub fn usage(mut self, usage: &Value) -> Self {
+        self.tokens_in = usage["prompt_tokens"].as_u64().unwrap_or(0);
+        self.tokens_out = usage["completion_tokens"].as_u64().unwrap_or(0);
+        self
+    }
+
+    pub fn ms(mut self, ms: u64) -> Self {
+        self.ms = ms;
+        self
+    }
+
+    /// What scout digested on the caller's behalf: captured build output, file
+    /// bytes read, the pre-rerank hit list.
+    pub fn raw_bytes(mut self, bytes: u64) -> Self {
+        self.raw_bytes = Some(bytes);
+        self
+    }
+
+    /// What scout handed back — the serialized payload.  With `raw_bytes`,
+    /// this is the context-saved metric.
+    pub fn returned_bytes(mut self, bytes: u64) -> Self {
+        self.returned_bytes = Some(bytes);
+        self
+    }
+
+    /// Serialize to the on-disk shape.  Absent fields are omitted rather than
+    /// written as null: the log is read far more often than it is written, and
+    /// an absent field is unambiguous.
+    pub fn to_json(&self) -> Value {
+        let ts = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut m = Map::new();
+        m.insert("v".into(), Value::from(2));
+        m.insert("id".into(), Value::from(next_id()));
+        m.insert("run".into(), Value::from(run_id()));
+        m.insert("ts".into(), Value::from(ts));
+        m.insert("via".into(), Value::from(self.via.clone()));
+        m.insert("tool".into(), Value::from(self.tool.clone()));
+        m.insert("preset".into(), Value::from(self.preset.clone()));
+        m.insert("attempt".into(), Value::from(self.attempt));
+        for (key, value) in [
+            ("project", &self.project),
+            ("model", &self.model),
+            ("endpoint", &self.endpoint),
+        ] {
+            if let Some(v) = value {
+                m.insert(key.into(), Value::from(v.clone()));
+            }
+        }
+        if self.input.as_object().is_some_and(|o| !o.is_empty()) {
+            m.insert("input".into(), self.input.clone());
+        }
+        let mut outcome = Map::new();
+        outcome.insert("kind".into(), Value::from(self.outcome.as_str()));
+        if let Some(s) = &self.summary {
+            outcome.insert("summary".into(), Value::from(s.clone()));
+        }
+        m.insert("outcome".into(), Value::Object(outcome));
+        for (key, value) in [("raw_bytes", self.raw_bytes), ("returned_bytes", self.returned_bytes)] {
+            if let Some(n) = value {
+                m.insert(key.into(), Value::from(n));
+            }
+        }
+        m.insert("tokens_in".into(), Value::from(self.tokens_in));
+        m.insert("tokens_out".into(), Value::from(self.tokens_out));
+        m.insert("ms".into(), Value::from(self.ms));
+        m.insert("ok".into(), Value::from(self.outcome.is_ok()));
+        Value::Object(m)
+    }
+
+    /// Append this record to the call log.  Silently ignored on any I/O error
+    /// (including a missing parent dir) so a full disk or unset $HOME never
+    /// breaks a scout command.
+    pub fn log(self) {
+        if let Some(path) = log_path() {
+            append_line(&path, &self.to_json().to_string());
+        }
+    }
+}
+
+// ── The ledger: what an operation only knows at its ends ────────────────────
+
+/// Byte accounting and end-of-operation verdicts, held across an operation's
+/// round-trips.
+///
+/// The log's unit is one LLM call, but two of §3's fields are not: `raw_bytes`
+/// is known before the *first* call of an operation and `returned_bytes` only
+/// after the *last* one, and `none_relevant` is a verdict the rerank reaches
+/// after its final batch.  The ledger holds that gap open — a filter deposits
+/// the raw size up front, `call_preset` attaches it to the first row it
+/// writes and parks the newest row here, and the entry point stamps the
+/// payload size onto that parked row as it flushes it.
+///
+/// Attributing each number to exactly one row is the point: a three-chunk
+/// `extract` that counted its file three times would inflate the one metric
+/// the whole thing exists to report.
+pub struct Ledger {
+    started: Instant,
+    raw: Cell<Option<u64>>,
+    pending: RefCell<Option<CallRecord>>,
+    silent: bool,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Ledger {
+            started: Instant::now(),
+            raw: Cell::new(None),
+            pending: RefCell::new(None),
+            silent: false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Ledger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Ledger")
+    }
+}
+
+impl Ledger {
+    /// A ledger that records nothing.
+    ///
+    /// For test fixtures: they build a real `Ctx` and run the real filters, and
+    /// the real filters log — so without this, every test run would append rows
+    /// to the developer's own `calls.jsonl`.  Deliberately not the `Default`,
+    /// which is what the entry points get — and `cfg(test)`, so no production
+    /// path can reach for it.
+    #[cfg(test)]
+    pub fn silent() -> Self {
+        // Spelled out rather than `..Default::default()`: struct update syntax
+        // cannot move fields out of a type that implements `Drop`.
+        Ledger {
+            started: Instant::now(),
+            raw: Cell::new(None),
+            pending: RefCell::new(None),
+            silent: true,
+        }
+    }
+
+    fn emit(&self, rec: CallRecord) {
+        if !self.silent {
+            rec.log();
+        }
+    }
+
+    /// Milliseconds since the operation began.  This is what a bypassed row
+    /// reports: no model ran, but the file read or the search did.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Deposit the bytes scout digested for this operation.  Claimed by the
+    /// next record written; a deposit nobody claims is simply dropped.
+    pub fn raw_bytes(&self, bytes: u64) {
+        self.raw.set(Some(bytes));
+    }
+
+    /// Park a record: writes out whatever was parked before it, so only the
+    /// newest row is ever waiting.
+    pub fn record(&self, mut rec: CallRecord) {
+        if rec.raw_bytes.is_none() {
+            rec.raw_bytes = self.raw.take();
+        }
+        if let Some(previous) = self.pending.replace(Some(rec)) {
+            self.emit(previous);
+        }
+    }
+
+    /// Stamp the finished operation's payload onto the parked row and write it.
+    pub fn finish(&self, payload: &Value) {
+        let Some(mut rec) = self.pending.take() else { return };
+        if rec.returned_bytes.is_none() {
+            let bytes = serde_json::to_string(payload).map(|s| s.len() as u64).unwrap_or(0);
+            rec.returned_bytes = Some(bytes);
+        }
+        // The rerank's verdict is only known once every batch is in, which is
+        // after the last of its rows was built.
+        if rec.outcome == Outcome::Ok
+            && payload.get("none_relevant").and_then(Value::as_bool).unwrap_or(false)
+        {
+            rec.outcome = Outcome::NoneRelevant;
+        }
+        self.emit(rec);
+    }
+
+    /// The operation failed: write the parked row, naming the failure.
+    ///
+    /// A row whose own round-trip already failed (endpoint down, timeout)
+    /// keeps that kind — it is the more specific answer.  A row that succeeded
+    /// under an operation that did not is the "model replied, scout could not
+    /// use the reply" case: an unparseable selector, no usable line ranges,
+    /// hit ids that were all hallucinated.
+    pub fn fail(&self, reason: &str) {
+        let Some(mut rec) = self.pending.take() else { return };
+        if rec.outcome.is_ok() {
+            rec = rec.outcome(Outcome::ParseFailure).summary(reason);
+        }
+        self.emit(rec);
+    }
+}
+
+impl Drop for Ledger {
+    /// A parked row must reach the log even when the operation ends by a path
+    /// that never calls `finish` — an early return, a `?`, a panic unwinding
+    /// past the entry point.  Losing the payload size is a missing field;
+    /// losing the row is a missing call.
+    fn drop(&mut self) {
+        if let Some(rec) = self.pending.take() {
+            self.emit(rec);
+        }
+    }
+}
+
+// ── Write path ──────────────────────────────────────────────────────────────
+
+/// Rotate the log past this size, keeping one previous generation.
+///
+/// `shell-safety.sh` fires on every Bash tool call, so this file grows faster
+/// than anything else scout writes and `print_report` reads all of it every
+/// time.  A v2 record runs ~500 bytes against v1's ~90, so 8 MB is ~17k rows —
+/// around seven months at the observed ~80 calls/day, and two generations of
+/// that is the whole history a dashboard can show.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// `calls.jsonl` → `calls.jsonl.1`.  Not `with_extension`, which would eat the
+/// `.jsonl`.
+fn rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// Append one line, rotating first if the file is over the cap.
+///
+/// Fail-open is the whole contract here: every step is best-effort and any
+/// failure — unwritable dir, full disk, a lost rotation race — degrades to
+/// "no log line" and never reaches the caller.  The rotation check costs one
+/// `fstat` on the handle we just opened, which is why it lives in the writer:
+/// every entry point writes, and most of them have no dashboard running to do
+/// it for them.
+///
+/// Two writers racing on the rename has two outcomes, and only one is free.
+/// If the loser's rename lands between the winner's rename and its reopen,
+/// the path is gone, `rename` fails with `ENOENT`, and nothing is lost.  If it
+/// lands after the reopen, it renames the winner's *fresh* file over the
+/// generation the winner just rotated, and 8 MB of history goes with it.
+///
+/// Left as-is deliberately: the window is a few microseconds against ~80 calls
+/// a day, both writers must also arrive exactly at the cap, and the cost is one
+/// lost generation of a diagnostic log — no corruption, no effect on the
+/// command. Closing it properly needs an O_EXCL lockfile, which is more
+/// machinery than this earns.
+fn append_line(path: &Path, line: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{line}");
+    let opts = {
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).append(true);
+        o
+    };
+    let Ok(mut f) = opts.open(path) else { return };
+    if f.metadata().map(|m| m.len() >= MAX_LOG_BYTES).unwrap_or(false) {
+        drop(f);
+        let _ = std::fs::rename(path, rotated_path(path));
+        let Ok(reopened) = opts.open(path) else { return };
+        f = reopened;
     }
+    let _ = writeln!(f, "{line}");
 }
 
 // ── `scout stats` report ────────────────────────────────────────────────────
@@ -78,26 +579,74 @@ struct PresetStats {
 struct Report {
     rows: Vec<(String, PresetStats)>,
     parse_errors: u64,
+    /// Rows scout served with no model at all.  Deliberately kept out of the
+    /// per-preset table: that table counts LLM round-trips, and a bypass is
+    /// the absence of one.
+    bypassed: u64,
+    raw_bytes: u64,
+    returned_bytes: u64,
+    /// Failed rows by `outcome.kind`, most frequent first.  A v1 row that
+    /// failed has no kind and counts as `unknown`.
+    failures: Vec<(String, u64)>,
+    span_secs: f64,
 }
 
-fn parse_log(path: &std::path::Path) -> std::io::Result<Report> {
-    let f = std::fs::File::open(path)?;
-    let mut by_preset: HashMap<String, PresetStats> = HashMap::new();
-    let mut parse_errors: u64 = 0;
+/// One record's timestamp, in seconds.
+///
+/// v1 wrote an integer, v2 writes a float; `as_f64` takes both, where the
+/// `as_u64` this replaced would silently return 0 for every v2 row.
+fn record_ts(v: &Value) -> Option<f64> {
+    v.get("ts").and_then(Value::as_f64).filter(|t| *t > 0.0)
+}
 
+#[derive(Default)]
+struct Accumulator {
+    by_preset: HashMap<String, PresetStats>,
+    by_failure: HashMap<String, u64>,
+    parse_errors: u64,
+    bypassed: u64,
+    raw_bytes: u64,
+    returned_bytes: u64,
+    first_ts: Option<f64>,
+    last_ts: Option<f64>,
+}
+
+/// Fold one log file into the accumulator.  A missing file is not an error —
+/// `calls.jsonl.1` only exists after the first rotation.
+fn fold_file(path: &Path, acc: &mut Accumulator) -> std::io::Result<()> {
+    let f = std::fs::File::open(path)?;
     for line in BufReader::new(f).lines().map_while(Result::ok) {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = match serde_json::from_str(&line) {
+        let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => {
-                parse_errors += 1;
+                acc.parse_errors += 1;
                 continue;
             }
         };
+
+        if let Some(ts) = record_ts(&v) {
+            acc.first_ts = Some(acc.first_ts.map_or(ts, |f: f64| f.min(ts)));
+            acc.last_ts = Some(acc.last_ts.map_or(ts, |l: f64| l.max(ts)));
+        }
+        acc.raw_bytes += v["raw_bytes"].as_u64().unwrap_or(0);
+        acc.returned_bytes += v["returned_bytes"].as_u64().unwrap_or(0);
+
+        let kind = v["outcome"]["kind"].as_str();
+        if kind == Some(Outcome::Bypassed.as_str()) {
+            acc.bypassed += 1;
+            continue;
+        }
+
+        let call_ok = v["ok"].as_bool().unwrap_or(false);
+        if !call_ok {
+            *acc.by_failure.entry(kind.unwrap_or("unknown").to_string()).or_insert(0) += 1;
+        }
+
         let preset = v["preset"].as_str().unwrap_or("unknown").to_string();
-        let entry = by_preset.entry(preset).or_insert(PresetStats {
+        let entry = acc.by_preset.entry(preset).or_insert(PresetStats {
             calls: 0,
             ok: 0,
             tokens_in: 0,
@@ -105,7 +654,6 @@ fn parse_log(path: &std::path::Path) -> std::io::Result<Report> {
             ok_total_ms: 0,
         });
         entry.calls += 1;
-        let call_ok = v["ok"].as_bool().unwrap_or(false);
         if call_ok {
             entry.ok += 1;
             entry.ok_total_ms += v["ms"].as_u64().unwrap_or(0);
@@ -113,14 +661,51 @@ fn parse_log(path: &std::path::Path) -> std::io::Result<Report> {
         entry.tokens_in += v["tokens_in"].as_u64().unwrap_or(0);
         entry.tokens_out += v["tokens_out"].as_u64().unwrap_or(0);
     }
+    Ok(())
+}
 
-    let mut rows: Vec<(String, PresetStats)> = by_preset.into_iter().collect();
+/// Read the whole history: the rotated generation first, then the live file,
+/// so the report spans a rotation instead of restarting at it.
+fn parse_log(path: &Path) -> std::io::Result<Report> {
+    let mut acc = Accumulator::default();
+    let _ = fold_file(&rotated_path(path), &mut acc);
+    fold_file(path, &mut acc)?;
+
+    let mut rows: Vec<(String, PresetStats)> = acc.by_preset.into_iter().collect();
     rows.sort_by_key(|r| std::cmp::Reverse(r.1.calls));
-    Ok(Report { rows, parse_errors })
+    let mut failures: Vec<(String, u64)> = acc.by_failure.into_iter().collect();
+    failures.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+    Ok(Report {
+        rows,
+        parse_errors: acc.parse_errors,
+        bypassed: acc.bypassed,
+        raw_bytes: acc.raw_bytes,
+        returned_bytes: acc.returned_bytes,
+        failures,
+        span_secs: match (acc.first_ts, acc.last_ts) {
+            (Some(f), Some(l)) => l - f,
+            _ => 0.0,
+        },
+    })
+}
+
+/// Byte counts a human reads at a glance — the context-saved line is the whole
+/// point of the report and `18874368 → 219136` is not a number anyone parses.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
+    for (scale, unit) in UNITS {
+        if n >= scale {
+            return format!("{:.1} {unit}", n as f64 / scale as f64);
+        }
+    }
+    format!("{n} B")
 }
 
 /// Print the `scout stats` report: per-preset call counts, pass rate, token
-/// totals, and average latency of successful calls, plus an overall total.
+/// totals, and average latency of successful calls, plus an overall total —
+/// then the three things the record now carries that the table cannot show:
+/// context saved, calls served without the model, and failures by kind.
 pub fn print_report() -> anyhow::Result<()> {
     let path = match log_path() {
         Some(p) => p,
@@ -138,8 +723,17 @@ pub fn print_report() -> anyhow::Result<()> {
 
     let report = parse_log(&path)?;
 
-    if report.rows.is_empty() {
+    if report.rows.is_empty() && report.bypassed == 0 {
         println!("No calls recorded yet.");
+        return Ok(());
+    }
+
+    // A log of nothing but bypasses is a real state — `scout grep` with no
+    // intent never calls a model — and an empty table with a 0.0% TOTAL under
+    // it would read as a failure rather than as an absence.
+    if report.rows.is_empty() {
+        println!("No model calls recorded yet.");
+        print_summary(&report);
         return Ok(());
     }
 
@@ -177,6 +771,8 @@ pub fn print_report() -> anyhow::Result<()> {
         "TOTAL", total_calls, overall_pass
     );
 
+    print_summary(&report);
+
     if report.parse_errors > 0 {
         eprintln!("  ({} unreadable log lines skipped)", report.parse_errors);
     }
@@ -184,12 +780,61 @@ pub fn print_report() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The lines below the table: everything the v2 record added.  Each one is
+/// skipped when the log has nothing to say about it, so a report over old
+/// v1-only history looks exactly as it did before.
+fn print_summary(report: &Report) {
+    let mut printed_header = false;
+    let mut section = |line: String| {
+        if !printed_header {
+            println!();
+            printed_header = true;
+        }
+        println!("{line}");
+    };
+
+    if report.raw_bytes > 0 {
+        let ratio = if report.returned_bytes > 0 {
+            format!(" ({:.0}×)", report.raw_bytes as f64 / report.returned_bytes as f64)
+        } else {
+            String::new()
+        };
+        section(format!(
+            "context saved:  {} → {}{ratio}",
+            human_bytes(report.raw_bytes),
+            human_bytes(report.returned_bytes)
+        ));
+    }
+    if report.bypassed > 0 {
+        section(format!(
+            "bypassed:       {} call(s) served without the model",
+            report.bypassed
+        ));
+    }
+    if !report.failures.is_empty() {
+        let parts: Vec<String> =
+            report.failures.iter().map(|(kind, n)| format!("{kind} {n}")).collect();
+        section(format!("failures:       {}", parts.join(" · ")));
+    }
+    // Below an hour the span says nothing but "you just started"; the number
+    // is only interesting as a denominator for the counts above it.
+    if report.span_secs >= 3600.0 {
+        let span = if report.span_secs >= 86_400.0 {
+            format!("{:.1} days", report.span_secs / 86_400.0)
+        } else {
+            format!("{:.1} hours", report.span_secs / 3600.0)
+        };
+        section(format!("history spans:  {span}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::NamedTempFile;
 
-    // ── log_path / log_call ──────────────────────────────────────────────
+    // ── log_path / the write path ────────────────────────────────────────
 
     // Env vars are process-global and tests run in parallel: every test that
     // sets SCOUT_CALLS_LOG — or asserts on a log_path() derived without it —
@@ -198,6 +843,19 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lines_of(f: &NamedTempFile) -> Vec<Value> {
+        BufReader::new(f.reopen().unwrap())
+            .lines()
+            .map_while(Result::ok)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(&l).expect("every written line must be JSON"))
+            .collect()
+    }
+
+    fn write(f: &NamedTempFile, rec: CallRecord) {
+        append_line(f.path(), &rec.to_json().to_string());
     }
 
     #[test]
@@ -220,39 +878,204 @@ mod tests {
     }
 
     #[test]
-    fn write_record_produces_parseable_json_with_correct_fields() {
+    fn a_record_writes_every_field_the_dashboard_reads() {
         let tmp = NamedTempFile::new().unwrap();
-        write_record(tmp.path(), "quality_review", 123, 45, 678, true);
-        write_record(tmp.path(), "shell_safety", 0, 0, 0, false);
+        write(
+            &tmp,
+            CallRecord::new("find", "find_patterns")
+                .via(VIA_CLI)
+                .attempt(2)
+                .project("/home/josh/Projects/scout")
+                .endpoint("qwen3:27b", "http://localhost:11434/v1")
+                .input(input_summary("find_patterns", &json!({"question": "where is the port bound"})))
+                .outcome(Outcome::Ok)
+                .summary("8 patterns, 3 non-degenerate")
+                .raw_bytes(184_320)
+                .returned_bytes(1180)
+                .usage(&json!({"prompt_tokens": 1840, "completion_tokens": 210}))
+                .ms(3100),
+        );
 
-        let lines: Vec<String> = BufReader::new(tmp.reopen().unwrap())
-            .lines()
-            .map_while(Result::ok)
-            .collect();
-        assert_eq!(lines.len(), 2, "expected 2 log lines");
-
-        let v0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v0["preset"], "quality_review");
-        assert_eq!(v0["tokens_in"], 123);
-        assert_eq!(v0["tokens_out"], 45);
-        assert_eq!(v0["ms"], 678);
-        assert_eq!(v0["ok"], true);
-        assert!(v0["ts"].as_u64().unwrap_or(0) > 0, "ts should be a unix timestamp");
-
-        let v1: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(v1["preset"], "shell_safety");
-        assert_eq!(v1["ok"], false);
+        let v = &lines_of(&tmp)[0];
+        assert_eq!(v["v"], 2);
+        assert_eq!(v["via"], "cli");
+        assert_eq!(v["tool"], "find");
+        assert_eq!(v["preset"], "find_patterns");
+        assert_eq!(v["attempt"], 2);
+        assert_eq!(v["project"], "/home/josh/Projects/scout");
+        assert_eq!(v["model"], "qwen3:27b");
+        assert_eq!(v["endpoint"], "http://localhost:11434/v1");
+        assert_eq!(v["input"]["question"], "where is the port bound");
+        assert_eq!(v["outcome"]["kind"], "ok");
+        assert_eq!(v["outcome"]["summary"], "8 patterns, 3 non-degenerate");
+        assert_eq!(v["raw_bytes"], 184_320);
+        assert_eq!(v["returned_bytes"], 1180);
+        assert_eq!(v["tokens_in"], 1840);
+        assert_eq!(v["tokens_out"], 210);
+        assert_eq!(v["ms"], 3100);
+        assert_eq!(v["ok"], true, "the v1 boolean is still written");
+        assert!(v["ts"].as_f64().unwrap() > 1_700_000_000.0, "ts is float seconds");
+        assert!(v["id"].as_str().unwrap().starts_with(run_id()), "id extends run");
     }
 
     #[test]
-    fn log_call_with_unwritable_path_does_not_panic() {
+    fn ids_are_monotonic_within_a_run() {
+        let tmp = NamedTempFile::new().unwrap();
+        write(&tmp, CallRecord::new("grep", "grep"));
+        write(&tmp, CallRecord::new("grep", "grep"));
+        let rows = lines_of(&tmp);
+        assert_eq!(rows[0]["run"], rows[1]["run"], "one process is one run");
+        assert_ne!(rows[0]["id"], rows[1]["id"]);
+        let seq = |v: &Value| {
+            v["id"].as_str().unwrap().rsplit('-').next().unwrap().parse::<u64>().unwrap()
+        };
+        assert!(seq(&rows[1]) > seq(&rows[0]), "the counter only goes up");
+    }
+
+    #[test]
+    fn a_failure_records_its_kind_and_is_not_ok() {
+        let tmp = NamedTempFile::new().unwrap();
+        write(
+            &tmp,
+            CallRecord::new("check_output", "check_output")
+                .outcome(Outcome::EndpointUnreachable)
+                .summary("local LLM endpoint http://localhost:11434/v1 is not responding"),
+        );
+        let v = &lines_of(&tmp)[0];
+        assert_eq!(v["outcome"]["kind"], "endpoint_unreachable");
+        assert_eq!(v["ok"], false);
+        assert!(v["outcome"]["summary"].as_str().unwrap().contains("not responding"));
+    }
+
+    #[test]
+    fn a_bypassed_record_round_trips_as_a_success_with_no_tokens() {
+        let tmp = NamedTempFile::new().unwrap();
+        write(
+            &tmp,
+            CallRecord::new("extract", "extract")
+                .outcome(Outcome::Bypassed)
+                .summary("file is small enough to return whole")
+                .raw_bytes(4096)
+                .returned_bytes(4400)
+                .ms(7),
+        );
+        let v = &lines_of(&tmp)[0];
+        assert_eq!(v["outcome"]["kind"], "bypassed");
+        assert_eq!(v["ok"], true, "scout answered the caller — no model needed");
+        assert_eq!(v["tokens_in"], 0);
+        assert_eq!(v["tokens_out"], 0);
+        assert_eq!(v["ms"], 7, "a bypass still did real work");
+
+        // ...and it stays out of the per-preset table, which counts LLM calls.
+        let r = parse_log(tmp.path()).unwrap();
+        assert!(r.rows.is_empty());
+        assert_eq!(r.bypassed, 1);
+        assert_eq!(r.raw_bytes, 4096);
+        assert_eq!(r.returned_bytes, 4400);
+    }
+
+    #[test]
+    fn absent_fields_are_omitted_rather_than_written_null() {
+        let tmp = NamedTempFile::new().unwrap();
+        write(&tmp, CallRecord::new("task", "task"));
+        let v = &lines_of(&tmp)[0];
+        for key in ["project", "model", "endpoint", "input", "raw_bytes", "returned_bytes"] {
+            assert!(v.get(key).is_none(), "{key} should be absent, got {v}");
+        }
+        assert!(v["outcome"].get("summary").is_none());
+    }
+
+    #[test]
+    fn input_strings_are_capped_with_an_elision_marker() {
+        let long = "x".repeat(1000);
+        let input = input_summary("check_output", &json!({"command": long}));
+        let command = input["command"].as_str().unwrap();
+        assert_eq!(command.chars().count(), MAX_INPUT_CHARS + 1);
+        assert!(command.ends_with('…'), "truncation must be visible: {command}");
+    }
+
+    #[test]
+    fn input_summary_picks_the_fields_that_belong_to_each_preset() {
+        let extract = input_summary(
+            "extract",
+            &json!({"file": "src/a.rs", "question": "where", "file_lines": 900, "output": "huge"}),
+        );
+        assert_eq!(extract, json!({"file": "src/a.rs", "question": "where", "lines": 900}));
+
+        let grep = input_summary(
+            "grep",
+            &json!({"pattern": "TcpListener", "intent": "bind sites", "hits_considered": 40}),
+        );
+        assert_eq!(
+            grep,
+            json!({"pattern": "TcpListener", "intent": "bind sites", "hits_scanned": 40})
+        );
+
+        // An unknown preset still says something useful rather than nothing.
+        assert_eq!(
+            input_summary("quality_review", &json!({"command": "git diff", "junk": "ignored"})),
+            json!({"command": "git diff"})
+        );
+        // ...and an empty object is what "nothing to say" looks like.
+        assert_eq!(input_summary("quality_review", &json!({})), json!({}));
+    }
+
+    #[test]
+    fn via_from_env_only_accepts_the_known_values() {
+        let _g = env_lock();
+        std::env::set_var("SCOUT_VIA", "hook");
+        assert_eq!(via_from_env(VIA_RUN), "hook");
+        std::env::set_var("SCOUT_VIA", "nonsense");
+        assert_eq!(via_from_env(VIA_RUN), "run", "an unknown value must not reach the log");
+        std::env::remove_var("SCOUT_VIA");
+        assert_eq!(via_from_env(VIA_RUN), "run");
+    }
+
+    #[test]
+    fn logging_to_an_unwritable_path_does_not_panic() {
         let _g = env_lock();
         // Ensure fail-open: an uncreatable log path must not panic. Pointing
         // at /dev/null/... also keeps the test from appending a synthetic row
         // to the developer's real calls.jsonl.
         std::env::set_var("SCOUT_CALLS_LOG", "/dev/null/calls.jsonl");
-        log_call("test_preset", 100, 50, 200, true);
+        CallRecord::new("task", "task").ms(200).log();
+        // The ledger's paths must be as fail-open as the direct one.
+        let ledger = Ledger::default();
+        ledger.raw_bytes(10);
+        ledger.record(CallRecord::new("task", "task"));
+        ledger.record(CallRecord::new("task", "task"));
+        ledger.finish(&json!({"hits": []}));
+        ledger.fail("nothing parked, nothing written");
+        drop(ledger);
         std::env::remove_var("SCOUT_CALLS_LOG");
+    }
+
+    #[test]
+    fn rotation_happens_at_the_cap_and_the_report_spans_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        // One oversized generation's worth of real records, cheaply: a padded
+        // line per call would take 90k writes.
+        let fat = json!({"ts": 1_770_000_000u64, "preset": "grep", "tokens_in": 1,
+                         "tokens_out": 1, "ms": 10, "ok": true, "pad": "x".repeat(4096)});
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_LOG_BYTES {
+            append_line(&path, &fat.to_string());
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        append_line(&path, &json!({"preset": "extract", "ok": true, "ts": 1_770_000_100.5}).to_string());
+
+        assert!(rotated_path(&path).exists(), "the previous generation must be kept");
+        assert_eq!(std::fs::metadata(rotated_path(&path)).unwrap().len(), before);
+        assert!(
+            std::fs::metadata(&path).unwrap().len() < 1024,
+            "the live file restarts at the record that triggered the rotation"
+        );
+
+        // History spans the rotation: both presets are still in the report.
+        let r = parse_log(&path).unwrap();
+        let presets: Vec<&str> = r.rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(presets.contains(&"grep") && presets.contains(&"extract"), "{presets:?}");
     }
 
     // ── parse_log / report aggregation ───────────────────────────────────
@@ -284,6 +1107,62 @@ mod tests {
         assert_eq!(r.parse_errors, 1);
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0].1.calls, 2);
+    }
+
+    #[test]
+    fn v1_lines_still_parse_after_the_schema_change() {
+        // The exact six-field shape scout wrote before v2, integer ts and all.
+        let f = write_log(&[
+            r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#,
+            r#"{"ts":1770000060,"preset":"grep","tokens_in":0,"tokens_out":0,"ms":0,"ok":false}"#,
+        ]);
+        let r = parse_log(f.path()).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].1.calls, 2);
+        assert_eq!(r.rows[0].1.ok, 1);
+        assert_eq!(r.rows[0].1.tokens_in, 1840);
+        assert_eq!(r.span_secs, 60.0, "an integer ts must not read as 0");
+        // A v1 failure has no kind, and is counted rather than dropped.
+        assert_eq!(r.failures, vec![("unknown".to_string(), 1)]);
+    }
+
+    #[test]
+    fn float_and_integer_timestamps_both_read() {
+        let f = write_log(&[
+            r#"{"ts":1770000000,"preset":"a","ok":true}"#,
+            r#"{"ts":1770000010.482,"preset":"a","ok":true}"#,
+        ]);
+        let r = parse_log(f.path()).unwrap();
+        assert!((r.span_secs - 10.482).abs() < 0.001, "span was {}", r.span_secs);
+    }
+
+    #[test]
+    fn failures_are_grouped_by_outcome_kind() {
+        let f = write_log(&[
+            r#"{"preset":"grep","ok":false,"outcome":{"kind":"endpoint_unreachable"}}"#,
+            r#"{"preset":"grep","ok":false,"outcome":{"kind":"endpoint_unreachable"}}"#,
+            r#"{"preset":"grep","ok":false,"outcome":{"kind":"timeout"}}"#,
+            r#"{"preset":"grep","ok":true,"outcome":{"kind":"ok"}}"#,
+        ]);
+        let r = parse_log(f.path()).unwrap();
+        assert_eq!(
+            r.failures,
+            vec![("endpoint_unreachable".to_string(), 2), ("timeout".to_string(), 1)],
+            "most frequent first"
+        );
+        assert_eq!(r.rows[0].1.calls, 4, "failures still count as calls");
+    }
+
+    #[test]
+    fn context_saved_sums_across_every_row() {
+        let f = write_log(&[
+            r#"{"preset":"extract","ok":true,"raw_bytes":100000,"returned_bytes":1000}"#,
+            r#"{"preset":"grep","ok":true,"raw_bytes":50000,"returned_bytes":500}"#,
+            r#"{"preset":"grep","ok":true}"#,
+        ]);
+        let r = parse_log(f.path()).unwrap();
+        assert_eq!(r.raw_bytes, 150_000);
+        assert_eq!(r.returned_bytes, 1500);
     }
 
     #[test]
@@ -327,5 +1206,96 @@ mod tests {
         let r = parse_log(f.path()).unwrap();
         assert_eq!(r.rows[0].0, "b"); // 3 calls first
         assert_eq!(r.rows[1].0, "a"); // 1 call second
+    }
+
+    // ── Ledger ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_ledger_attributes_raw_bytes_to_one_row_and_payload_size_to_the_last() {
+        let _g = env_lock();
+        let tmp = NamedTempFile::new().unwrap();
+        std::env::set_var("SCOUT_CALLS_LOG", tmp.path());
+
+        let payload = json!({"mode": "extract", "snippets": []});
+        let ledger = Ledger::default();
+        ledger.raw_bytes(100_000);
+        ledger.record(CallRecord::new("extract", "extract").ms(1));
+        ledger.record(CallRecord::new("extract", "extract").ms(2));
+        ledger.finish(&payload);
+        drop(ledger);
+        std::env::remove_var("SCOUT_CALLS_LOG");
+
+        let rows = lines_of(&tmp);
+        assert_eq!(rows.len(), 2, "every round-trip is a row");
+        assert_eq!(rows[0]["raw_bytes"], 100_000, "the first row claims the input");
+        assert!(rows[1].get("raw_bytes").is_none(), "and no other row counts it again");
+        assert!(rows[0].get("returned_bytes").is_none());
+        assert_eq!(
+            rows[1]["returned_bytes"],
+            payload.to_string().len(),
+            "the last row carries the payload size"
+        );
+    }
+
+    #[test]
+    fn the_ledger_promotes_a_none_relevant_verdict_onto_the_last_row() {
+        let _g = env_lock();
+        let tmp = NamedTempFile::new().unwrap();
+        std::env::set_var("SCOUT_CALLS_LOG", tmp.path());
+        let ledger = Ledger::default();
+        ledger.record(CallRecord::new("grep", "grep"));
+        ledger.finish(&json!({"mode": "rerank", "none_relevant": true, "hits": []}));
+        std::env::remove_var("SCOUT_CALLS_LOG");
+
+        let v = &lines_of(&tmp)[0];
+        assert_eq!(v["outcome"]["kind"], "none_relevant");
+        assert_eq!(v["ok"], true, "a verdict is not a failure");
+    }
+
+    #[test]
+    fn a_failed_operation_names_the_failure_on_the_row_that_replied() {
+        let _g = env_lock();
+        let tmp = NamedTempFile::new().unwrap();
+        std::env::set_var("SCOUT_CALLS_LOG", tmp.path());
+        let ledger = Ledger::default();
+        // The round-trip itself succeeded; the reply was unusable.
+        ledger.record(CallRecord::new("extract", "extract").ms(900));
+        ledger.fail("scout extract: local LLM returned unparsable output");
+
+        // A round-trip that failed on its own keeps the more specific kind.
+        let ledger2 = Ledger::default();
+        ledger2.record(CallRecord::new("extract", "extract").outcome(Outcome::EndpointUnreachable));
+        ledger2.fail("scout extract: local LLM call failed");
+        std::env::remove_var("SCOUT_CALLS_LOG");
+
+        let rows = lines_of(&tmp);
+        assert_eq!(rows[0]["outcome"]["kind"], "parse_failure");
+        assert_eq!(rows[0]["ok"], false);
+        assert!(rows[0]["outcome"]["summary"].as_str().unwrap().contains("unparsable"));
+        assert_eq!(rows[1]["outcome"]["kind"], "endpoint_unreachable");
+    }
+
+    #[test]
+    fn a_dropped_ledger_still_writes_its_parked_row() {
+        let _g = env_lock();
+        let tmp = NamedTempFile::new().unwrap();
+        std::env::set_var("SCOUT_CALLS_LOG", tmp.path());
+        {
+            let ledger = Ledger::default();
+            ledger.record(CallRecord::new("grep", "grep").outcome(Outcome::Timeout));
+            // No finish(): the operation failed and returned early.
+        }
+        std::env::remove_var("SCOUT_CALLS_LOG");
+
+        let rows = lines_of(&tmp);
+        assert_eq!(rows.len(), 1, "losing the payload size must not lose the call");
+        assert_eq!(rows[0]["outcome"]["kind"], "timeout");
+    }
+
+    #[test]
+    fn human_bytes_reads_like_a_size() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(18 * (1 << 20)), "18.0 MB");
     }
 }

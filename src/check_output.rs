@@ -65,6 +65,10 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         verify::MAX_OUTPUT_BYTES,
     );
 
+    // The captured output is the whole point of this tool: it is what would
+    // otherwise have landed in the caller's context (SPEC-dashboard §3).
+    ctx.ledger.raw_bytes(output.len() as u64);
+
     // Augment the args with the captured output before calling the model.
     // `language` is injected too so a user-authored preset override can key
     // its prompt on the toolchain (`${args.language}`); the built-in preset
@@ -118,11 +122,11 @@ mod tests {
 
     fn offline_ctx(project: &str) -> Ctx<'static> {
         Ctx {
-            client: None,
             client_error: Some("no config in tests".into()),
-            presets: &[],
             project: project.to_string(),
-            progress: None,
+            // A test must never append to the developer's own call log.
+            ledger: crate::stats::Ledger::silent(),
+            ..Default::default()
         }
     }
 

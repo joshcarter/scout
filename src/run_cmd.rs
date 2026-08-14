@@ -169,6 +169,20 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
 
     let (system, user) = presets::resolve(preset, &args_value, &project);
 
+    // The preset name is the operation here — `shell_safety` is what a human
+    // reading the log is looking for, not "run".  `via` distinguishes a hook
+    // from a shell: `run_cmd` cannot tell, so the caller says so through
+    // `$SCOUT_VIA` (hooks/shell-safety.sh sets it).
+    let prompt_bytes = (system.len() + user.len()) as u64;
+    let record = || {
+        crate::stats::CallRecord::new(&preset_name, &preset_name)
+            .via(&crate::stats::via_from_env(crate::stats::VIA_RUN))
+            .project(&project)
+            .endpoint(client.model(), client.endpoint())
+            .input(crate::stats::input_summary(&preset_name, &args_value))
+            .raw_bytes(prompt_bytes)
+    };
+
     let messages = vec![
         json!({"role": "system", "content": system}),
         json!({"role": "user",   "content": user}),
@@ -178,7 +192,11 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
     let (text, usage) = match client.complete(messages, None) {
         Ok(r) => r,
         Err(e) => {
-            crate::stats::log_call(&preset_name, 0, 0, 0, false);
+            record()
+                .ms(start.elapsed().as_millis() as u64)
+                .outcome(e.outcome())
+                .summary(e.to_string())
+                .log();
             eprintln!("scout run: LLM call failed: {:?}", e);
             std::process::exit(1);
         }
@@ -186,18 +204,20 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
     let duration_ms = start.elapsed().as_millis() as u64;
 
     if text.trim().is_empty() {
-        crate::stats::log_call(&preset_name, 0, 0, duration_ms, false);
+        record()
+            .ms(duration_ms)
+            .outcome(crate::stats::Outcome::EmptyResponse)
+            .summary("the model returned nothing")
+            .log();
         eprintln!("scout run: LLM returned empty response");
         std::process::exit(1);
     }
 
-    crate::stats::log_call(
-        &preset_name,
-        usage["prompt_tokens"].as_u64().unwrap_or(0),
-        usage["completion_tokens"].as_u64().unwrap_or(0),
-        duration_ms,
-        true,
-    );
+    record()
+        .usage(&usage)
+        .ms(duration_ms)
+        .returned_bytes(text.len() as u64)
+        .log();
 
     print!("{text}");
     std::process::exit(0);

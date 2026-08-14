@@ -305,11 +305,10 @@ fn tool_error_names_the_fallback_tool() {
 #[test]
 fn require_client_explains_a_missing_config() {
     let ctx = Ctx {
-        client: None,
         client_error: Some("cannot read config \"/nope/config.toml\"".into()),
-        presets: &[],
         project: ".".into(),
-        progress: None,
+        ledger: crate::stats::Ledger::silent(),
+        ..Default::default()
     };
     let e = ctx.require_client().err().expect("no client configured");
     assert!(e.contains("not configured"), "{e}");
@@ -319,6 +318,6 @@ fn require_client_explains_a_missing_config() {
 #[test]
 fn unknown_preset_is_an_error_not_a_panic() {
     let ctx =
-        Ctx { client: None, client_error: None, presets: &[], project: ".".into(), progress: None };
+        Ctx { project: ".".into(), ledger: crate::stats::Ledger::silent(), ..Default::default() };
     assert!(ctx.preset("extract").unwrap_err().contains("not found"));
 }

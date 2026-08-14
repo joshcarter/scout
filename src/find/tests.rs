@@ -13,11 +13,11 @@ use crate::select::Ctx;
 
 fn offline_ctx(project: &str) -> Ctx<'static> {
     Ctx {
-        client: None,
         client_error: Some("no config in tests".into()),
-        presets: &[],
         project: project.to_string(),
-        progress: None,
+        // A test must never append to the developer's own call log.
+        ledger: crate::stats::Ledger::silent(),
+        ..Default::default()
     }
 }
 

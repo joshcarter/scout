@@ -450,7 +450,7 @@ fn run_edit(a: EditArgs) -> ! {
     // project-relative paths resolve — and the paths the picker printed are the
     // ones the editor opens.
     let project = resolve_project(project);
-    let payload = match run_pipeline(tool, project.clone(), &args, true) {
+    let payload = match run_pipeline(tool, "edit", project.clone(), &args, true) {
         Ok(payload) => payload,
         Err(e) => {
             eprintln!("{}", e.text());
@@ -529,8 +529,14 @@ fn resolve_project(project: Option<String>) -> String {
 /// `scout edit` can reach a payload without also inheriting `run_filter`'s
 /// "print it and exit" ending — everything about *how* the pipeline runs stays
 /// identical for every verb.
+///
+/// `verb` is what the user typed and what the call log records as the `tool`;
+/// `pipeline` is which filter runs. They differ only for `scout edit`, which
+/// fronts both search pipelines and is its own operation to a reader of the
+/// log.
 fn run_pipeline(
-    tool: &str,
+    pipeline: &str,
+    verb: &str,
     project: String,
     args: &serde_json::Value,
     progress: bool,
@@ -545,17 +551,27 @@ fn run_pipeline(
         client_error,
         presets: &presets,
         project,
+        via: stats::VIA_CLI,
+        tool: verb.to_string(),
         // Only the terminal paths want progress chatter, and only ever on
         // stderr — stdout carries the result and may be piped.
         progress: progress.then(|| Box::new(|msg: &str| eprintln!("{msg}")) as select::ProgressSink),
+        ..Default::default()
     };
 
-    match tool {
+    let result = match pipeline {
         "grep" => grep::run(&ctx, args),
         "find" => find::run(&ctx, args),
         "extract" => extract::run(&ctx, args),
         _ => check_output::run(&ctx, args),
+    };
+    // The payload's size is half the context-saved metric, and this is the
+    // first point that has it (SPEC-dashboard §3).
+    match &result {
+        Ok(payload) => ctx.ledger.finish(payload),
+        Err(e) => ctx.ledger.fail(&e.text()),
     }
+    result
 }
 
 fn run_filter(
@@ -565,7 +581,7 @@ fn run_filter(
     grep_out: Option<GrepOutput>,
 ) -> ! {
     let project = resolve_project(project);
-    let result = run_pipeline(tool, project, &args, grep_out.is_some());
+    let result = run_pipeline(tool, tool, project, &args, grep_out.is_some());
 
     match result {
         Ok(payload) => match &grep_out {
@@ -696,20 +712,29 @@ fn run_task(prompt: &str) -> ! {
         local-LLM escape hatch. Answer the user's request directly.";
     let params = json!({"system": system, "user": prompt});
 
+    // Everything the record needs that is the same either way.
+    let record = || {
+        stats::CallRecord::new("task", "task")
+            .via(stats::VIA_CLI)
+            .project(&resolve_project(None))
+            .endpoint(client.model(), client.endpoint())
+            .input(stats::input_summary("task", &json!({ "prompt": prompt })))
+            .raw_bytes(prompt.len() as u64)
+    };
+
     match task::handle(&client, &params) {
         Ok(result) => {
-            stats::log_call(
-                "task",
-                result["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-                result["usage"]["completion_tokens"].as_u64().unwrap_or(0),
-                result["duration_ms"].as_u64().unwrap_or(0),
-                true,
-            );
-            println!("{}", result["text"].as_str().unwrap_or(""));
+            let text = result["text"].as_str().unwrap_or("");
+            record()
+                .usage(&result["usage"])
+                .ms(result["duration_ms"].as_u64().unwrap_or(0))
+                .returned_bytes(text.len() as u64)
+                .log();
+            println!("{text}");
             std::process::exit(0);
         }
         Err(e) => {
-            stats::log_call("task", 0, 0, 0, false);
+            record().outcome(e.outcome()).summary(e.to_string()).log();
             eprintln!("scout task: {:?}", e);
             std::process::exit(1);
         }

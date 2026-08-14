@@ -344,6 +344,13 @@ if [ -n "$VAR_NAMES" ]; then
 ${RESOLVED}"
 fi
 
+# Identify this traffic as a hook's in scout's call log (SPEC-dashboard §3
+# `via`): `scout run` is reached both from a shell and from here, and only the
+# caller knows which. Exported rather than prefixed onto the command, because
+# _timeout is a shell function and an assignment prefix on one does not
+# reliably scope to it.
+export SCOUT_VIA=hook
+
 LLM_OUTPUT=$(_timeout "$SCOUT_BIN" run \
   --preset shell_safety \
   --arg "command=$COMMAND" \
