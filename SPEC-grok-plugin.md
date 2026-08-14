@@ -296,6 +296,27 @@ What this buys, per harness:
 - **Grok**: the payload copy carries the binary at install time (§2.2), so the
   server spawns on the **first** session with no bootstrap at all.
 
+**Copy with rename, never in place.** Under Claude's directory marketplace the
+MCP server executes the binary *at the path `make` wants to write*, and Linux
+refuses to overwrite a running executable:
+
+```
+cp: cannot create regular file '.../bin/scout': Text file busy
+```
+
+This is not hypothetical — it is happening today with `ensure-binary.sh`. Its
+`cp "$LOCAL_BUILD" "$BIN"` fails with `ETXTBSY` whenever a scout MCP server is
+live, which after the first session is always. The failure is self-perpetuating
+and silent apart from a status string: the SessionStart line reads
+`Binary status: error: copy from local build failed (rebuilt since last
+install)` and the session goes on using a binary that can never be updated.
+
+Every writer of the binary — the make target, `install-bin`, whatever remains
+of `ensure-binary.sh` — must write a sibling temp file and `mv` it into place.
+Rename is atomic and succeeds against a busy target; the running process keeps
+its old inode until it exits. `cp` and `install` both truncate in place and
+both fail.
+
 Two limits, both acceptable:
 
 - A clean `git clone` has no binary, so a marketplace install straight from
