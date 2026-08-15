@@ -69,7 +69,8 @@ run them directly. All three matter when touching hooks:
 - `bash tests/test-suggest-scout.sh` — advisory extract/grep nudge hook
   (trigger thresholds, throttle, fail-open).
 
-All three are fully green (44 + 202 + 42). They were not, for a long time, and
+All three are fully green (37 + 202 + 42 — shell-safety lost seven cases when
+the substitution fast-path was deleted). They were not, for a long time, and
 the reason is worth keeping: each suite's `[missing binary]` case expected a
 `missing-binary` log reason and got `endpoint-unreachable` or `parse-failure`
 instead. This note used to call that a test-isolation gap, "not a hook bug."
