@@ -320,3 +320,149 @@ fn unknown_preset_is_an_error_not_a_panic() {
         Ctx { project: ".".into(), ledger: crate::stats::Ledger::silent(), ..Default::default() };
     assert!(ctx.preset("extract").unwrap_err().contains("not found"));
 }
+
+// ── The round-trip ───────────────────────────────────────────────────
+//
+// These need an endpoint, and an endpoint that answers on demand is a socket
+// the test owns rather than whatever is (or is not) installed on the machine
+// running the suite. The pattern is `client.rs`'s: bind :0, hand back the URL,
+// serve one request from a thread.
+
+/// Read one whole HTTP request off `sock` — headers, then exactly the body
+/// `Content-Length` promises.
+///
+/// Answering before the request has been consumed is what makes a naive
+/// one-shot server flaky: closing with unread bytes still in the receive queue
+/// sends an RST, and the reply the client had already buffered goes with it.
+fn read_request(sock: &mut std::net::TcpStream) {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    loop {
+        let head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        if let Some(end) = head_end {
+            let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return;
+            }
+        }
+        match sock.read(&mut scratch) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+        }
+    }
+}
+
+/// A server that answers exactly one chat-completion with `body`, then closes.
+/// Returns the base URL to point a client at.
+fn one_shot_server(body: &'static str) -> String {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else { return };
+        read_request(&mut sock);
+        let _ = sock.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = sock.flush();
+    });
+    format!("http://{addr}/v1")
+}
+
+fn client_against(endpoint: String) -> LlmClient {
+    LlmClient::new(crate::client::Config {
+        endpoint,
+        model: "test-model".into(),
+        timeout: std::time::Duration::from_secs(5),
+        first_token_timeout: std::time::Duration::from_secs(5),
+        idle_timeout: std::time::Duration::from_secs(5),
+        api_key: None,
+        max_tokens: None,
+        // The body served above is one whole JSON object, not an SSE stream.
+        // What `scout task` streams is pinned end to end in tests/task_cli.rs,
+        // where a real subprocess meets a real event-stream.
+        stream: false,
+    })
+}
+
+/// A preset with no context providers and no template slots, so nothing in
+/// `presets::resolve` can be the thing that fails.
+fn bare_preset(name: &str) -> Preset {
+    Preset {
+        name: name.to_string(),
+        description: String::new(),
+        input_schema: json!({}),
+        system_template: "you are a test".into(),
+        user_template: "answer the test".into(),
+        context: Vec::new(),
+        verify: None,
+    }
+}
+
+#[test]
+fn an_empty_reply_is_logged_as_empty_response() {
+    // The regression this pins: `call_preset` had no emptiness check at all, so
+    // a reply of nothing kept `CallRecord::new`'s default `Outcome::Ok` and the
+    // row said the model had answered. Only the *last* row of an operation is
+    // parked for `Ledger::fail` to correct, so a mid-batch empty reply in a
+    // multi-batch rerank was logged as a success and stayed that way.
+    let endpoint = one_shot_server(
+        r#"{"choices":[{"message":{"content":"   \n"}}],"usage":{"prompt_tokens":9,"completion_tokens":0}}"#,
+    );
+    let client = client_against(endpoint);
+    let table = vec![bare_preset("grep")];
+    let ctx = Ctx {
+        client: Some(&client),
+        presets: &table,
+        project: ".".into(),
+        tool: "grep".into(),
+        ledger: crate::stats::Ledger::silent(),
+        ..Default::default()
+    };
+
+    let reply = call_preset(&ctx, "grep", &json!({}))
+        .expect("an empty reply degrades the batch, it does not fail the call");
+    assert_eq!(
+        ctx.ledger.pending_outcome(),
+        Some(crate::stats::Outcome::EmptyResponse),
+        "a reply of nothing must not be logged as a success"
+    );
+    assert!(
+        reply.trim().is_empty(),
+        "the filters still see nothing, and still degrade through their own \
+         parse-failure path: {reply:?}"
+    );
+}
+
+#[test]
+fn a_dead_endpoint_is_a_stamped_endpoint_unreachable_row() {
+    // Inherited from the `task` module, which held the third copy of this
+    // round-trip and tested it here. `scout task` now makes the same call the
+    // filters do, so the case moves to the call itself.
+    let client = client_against("http://127.0.0.1:1/v1".into());
+    let mut rec = crate::stats::CallRecord::new("task", "task");
+    // Not through a `Ledger`, so nothing sets this — and an unsilenced record
+    // in the suite fires `call.start` at whatever dashboard the developer
+    // running it has open.
+    rec.silent = true;
+
+    let (rec, result) = round_trip(&client, rec, "be helpful", "say hello");
+
+    assert!(
+        matches!(result, Err(LlmError::EndpointUnavailable { .. })),
+        "port 1 refuses connections"
+    );
+    assert_eq!(rec.outcome, crate::stats::Outcome::EndpointUnreachable);
+    assert!(rec.summary.is_some(), "a failure row has to say what failed");
+}

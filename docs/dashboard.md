@@ -646,9 +646,13 @@ pub fn complete_streaming(&self, messages: Vec<Value>, max_tokens: Option<u64>,
 
 Four properties, each of which the obvious alternative gives up:
 
-1. **`task.rs` has no `CallRecord` to thread.** `task::handle` calls
-   `complete`; the record lives above it in `main::run_task`. With the
-   sink, `task.rs` needed no edit at all.
+1. **A caller with no `CallRecord` to thread still compiles.** `task.rs`
+   was the example: it called `complete` while the record lived above it
+   in `run_task`, so with the sink it needed no edit at all. That turned
+   out to be the property's cost as well as its benefit — needing no edit
+   is why it never got one, and `scout task` went unstreamed until the
+   three copies of the round-trip were merged into `select::round_trip`.
+   The sink still earns its keep on 2–4; the module is gone.
 2. **`CallRecord::silent` stays enforced where it already is.** A silent
    caller installs no sink and `client.rs` never learns the concept, so
    a unit test cannot fire tokens into a developer's dashboard by

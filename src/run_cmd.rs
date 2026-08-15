@@ -186,53 +186,35 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
     // One record for the whole invocation so `call.start` and the log line
     // share an `id` (docs/dashboard.md P3). The old closure reminted on every
     // arm and would have broken reconciliation.
-    let mut rec = crate::stats::CallRecord::new(&preset_name, &preset_name)
+    let rec = crate::stats::CallRecord::new(&preset_name, &preset_name)
         .via(&crate::stats::via_from_env(crate::stats::VIA_RUN))
         .project(&project)
         .endpoint(client.model(), client.endpoint())
         .input(crate::stats::input_summary(&preset_name, &args_value))
         .raw_bytes(prompt_bytes);
 
-    let messages = vec![
-        json!({"role": "system", "content": system}),
-        json!({"role": "user",   "content": user}),
-    ];
-
-    crate::live::emit_start(&rec, &system, &user);
-    let start = std::time::Instant::now();
-    // Streams `call.token` to the dashboard while the reply arrives (P5); a
-    // no-op sink when nothing is listening.
-    let result =
-        crate::live::with_token_stream(&rec, |sink| client.complete_streaming(messages, None, sink));
-    let (text, usage) = match result {
-        Ok(r) => r,
+    // `select::round_trip` owns the call and its telemetry; what stays here is
+    // what only a subcommand that never returns can decide — writing the row
+    // outright (there is no ledger holding an operation open) and diverging.
+    let (rec, result) = crate::select::round_trip(&client, rec, &system, &user);
+    let text = match result {
+        Ok(t) => t,
         Err(e) => {
-            rec = rec
-                .ms(start.elapsed().as_millis() as u64)
-                .outcome(e.outcome())
-                .summary(e.to_string());
-            crate::live::emit_end(&rec, None);
+            // Two failures, two messages: a reply of nothing is not a call that
+            // did not complete, and telling the user it was sends them looking
+            // at the endpoint instead of at the prompt.
+            let empty = rec.outcome == crate::stats::Outcome::EmptyResponse;
             rec.log();
-            eprintln!("scout run: LLM call failed: {:?}", e);
+            if empty {
+                eprintln!("scout run: LLM returned empty response");
+            } else {
+                eprintln!("scout run: LLM call failed: {:?}", e);
+            }
             std::process::exit(1);
         }
     };
-    let duration_ms = start.elapsed().as_millis() as u64;
 
-    if text.trim().is_empty() {
-        rec = rec
-            .ms(duration_ms)
-            .outcome(crate::stats::Outcome::EmptyResponse)
-            .summary("the model returned nothing");
-        crate::live::emit_end(&rec, None);
-        rec.log();
-        eprintln!("scout run: LLM returned empty response");
-        std::process::exit(1);
-    }
-
-    rec = rec.usage(&usage).ms(duration_ms).returned_bytes(text.len() as u64);
-    crate::live::emit_end(&rec, Some(&text));
-    rec.log();
+    rec.returned_bytes(text.len() as u64).log();
 
     print!("{text}");
     std::process::exit(0);

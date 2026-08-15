@@ -15,7 +15,8 @@
 //! * `validate_ranges` — clamp / drop / merge / sort line ranges.
 //! * `validate_keeps` — validate, dedupe and sort hit ids.
 //! * `apply_line_budget` — enforce a returned-line budget, lowest score first.
-//! * `call_preset` — one preset round-trip against the local LLM.
+//! * `round_trip` — the one LLM round-trip, shared with `scout run` and
+//!   `scout task`; `call_preset` — the filters' preset-resolving wrapper on it.
 //! * `Ctx` / `ToolError` — the invocation context shared by every filter and
 //!   the fail-open error carrying the raw tool to fall back to.
 //! * `non_empty_arg` — required-arg plucking.
@@ -26,8 +27,9 @@
 
 use serde_json::Value;
 
-use crate::client::LlmClient;
+use crate::client::{LlmClient, LlmError};
 use crate::presets::{self, Preset};
+use crate::stats::CallRecord;
 
 /// Where a filter sends human-facing progress notes, when anyone is listening.
 pub type ProgressSink<'a> = Box<dyn Fn(&str) + 'a>;
@@ -468,6 +470,86 @@ fn truncate_why(why: &str) -> String {
     why.chars().take(MAX_WHY_LEN).collect()
 }
 
+// ── The LLM round-trip ───────────────────────────────────────────────
+
+/// Send one `(system, user)` pair to the model and account for what happened:
+/// `call.start`, the timed streaming call, the outcome, `call.end`.  Returns
+/// the *stamped* record beside the reply.
+///
+/// The three verbs that talk to the model — the filters (`call_preset`),
+/// `scout run` (`run_cmd`) and `scout task` (`cli::run_task`) — used to carry a
+/// copy of these seven steps each, and the copies drifted: two checked for an
+/// empty reply and one logged it as `ok`, two streamed and one did not.  What
+/// legitimately differs between the three is *not* any of that, and it stays
+/// with the callers rather than becoming arguments here:
+///
+/// * **Minting the record.**  A filter's comes from `Ctx::record`, which knows
+///   the operation, the round and the ledger's `op`; `run` and `task` build one
+///   by hand because they have no `Ctx` to ask.
+/// * **Persisting it.**  A filter parks the row on its `Ledger`, which holds it
+///   open for the payload size and guarantees it still reaches the log on an
+///   early return or a panic unwind; `run` and `task` write theirs outright
+///   with `CallRecord::log`.  Taking a `Ledger` here would put that `Drop`
+///   guarantee behind an argument, and taking neither is why this hands the
+///   record back instead of writing it.
+/// * **What a failure means.**  The filters fail open and return an error the
+///   caller renders beside a raw-tool fallback; `run` and `task` print to
+///   stderr and `std::process::exit(1)`.  Neither belongs in shared code.
+///
+/// One record per invocation, minted by the caller and stamped here, is also
+/// what keeps `call.start`, `call.end` and the log line sharing an `id`
+/// (docs/dashboard.md P3).
+///
+/// An empty reply is an `Err` here rather than an `Ok("")`: it is the one
+/// outcome the model can produce that carries no information at all, and every
+/// caller has to notice it to log it.  It is spelled as the `LlmError`
+/// `client.rs` already maps to `Outcome::EmptyResponse`, so classification
+/// below stays the same single line it is for a transport failure.
+pub fn round_trip(
+    client: &LlmClient,
+    rec: CallRecord,
+    system: &str,
+    user: &str,
+) -> (CallRecord, Result<String, LlmError>) {
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": system}),
+        serde_json::json!({"role": "user", "content": user}),
+    ];
+
+    crate::live::emit_start(&rec, system, user);
+    let start = std::time::Instant::now();
+    // The sink streams `call.token` while the reply is still arriving (P5).
+    // It is a no-op for a silent record and when no dashboard is listening, so
+    // `complete_streaming` here is the same call `complete` was.
+    let result = crate::live::with_token_stream(&rec, |sink| {
+        client.complete_streaming(messages, None, sink)
+    })
+    .and_then(|(text, usage)| {
+        if text.trim().is_empty() {
+            Err(LlmError::Internal("LLM returned empty response".into()))
+        } else {
+            Ok((text, usage))
+        }
+    });
+    // The elapsed time of a failure is worth keeping — a 30-second timeout and
+    // an instant connection refusal are the same `ok: false` and very different
+    // problems.  `scout stats` still averages successes only, so this changes
+    // no existing number.
+    let ms = start.elapsed().as_millis() as u64;
+    match result {
+        Ok((text, usage)) => {
+            let rec = rec.usage(&usage).ms(ms);
+            crate::live::emit_end(&rec, Some(&text));
+            (rec, Ok(text))
+        }
+        Err(e) => {
+            let rec = rec.ms(ms).outcome(e.outcome()).summary(e.to_string());
+            crate::live::emit_end(&rec, None);
+            (rec, Err(e))
+        }
+    }
+}
+
 // ── Preset invocation ────────────────────────────────────────────────
 
 /// Run one preset round-trip against the local LLM and return the reply text.
@@ -483,38 +565,23 @@ pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String,
     // there is no call to log, and no half-built prompt to send.
     let (system, user) = presets::resolve(preset, args, &ctx.project)?;
 
-    let messages = vec![
-        serde_json::json!({"role": "system", "content": system}),
-        serde_json::json!({"role": "user", "content": user}),
-    ];
-
-    let rec = ctx.record(preset_name, args);
-    crate::live::emit_start(&rec, &system, &user);
-    let start = std::time::Instant::now();
-    // The sink streams `call.token` while the reply is still arriving (P5).
-    // It is a no-op for a silent record and when no dashboard is listening, so
-    // `complete_streaming` here is the same call `complete` was.
-    let result =
-        crate::live::with_token_stream(&rec, |sink| client.complete_streaming(messages, None, sink));
+    let (rec, result) = round_trip(client, ctx.record(preset_name, args), &system, &user);
+    let empty = rec.outcome == crate::stats::Outcome::EmptyResponse;
+    ctx.ledger.record(rec);
     match result {
-        Ok((text, usage)) => {
-            let ms = start.elapsed().as_millis() as u64;
-            let rec = rec.usage(&usage).ms(ms);
-            crate::live::emit_end(&rec, Some(&text));
-            ctx.ledger.record(rec);
-            Ok(text)
-        }
-        Err(e) => {
-            // The elapsed time of a failure is worth keeping — a 30-second
-            // timeout and an instant connection refusal are the same `ok:
-            // false` and very different problems.  `scout stats` still averages
-            // successes only, so this changes no existing number.
-            let ms = start.elapsed().as_millis() as u64;
-            let rec = rec.ms(ms).outcome(e.outcome()).summary(e.to_string());
-            crate::live::emit_end(&rec, None);
-            ctx.ledger.record(rec);
-            Err(format!("local LLM call failed: {e}"))
-        }
+        Ok(text) => Ok(text),
+        // A reply of nothing is now logged as `empty_response`, but the filters
+        // still see it as the empty string they always saw, because every one of
+        // them already handles it and two of them handle it better than an `Err`
+        // would.  `parse_selector_json("")` is `None` and `parse_candidates("")`
+        // is empty, so an empty reply lands on the same degrade branch either
+        // way in `extract`, `grep` and `check_output` — an `Err` there would buy
+        // nothing but different wording.  In `find` it would buy a regression:
+        // `call_preset(...).map_err(fail)?` ends the whole search, so one empty
+        // patterns reply would kill a multi-round `find` that today notes the
+        // failure and tries the next round.
+        Err(_) if empty => Ok(String::new()),
+        Err(e) => Err(format!("local LLM call failed: {e}")),
     }
 }
 

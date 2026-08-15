@@ -15,7 +15,7 @@
 use crate::client::LlmClient;
 use crate::{
     check_output, config, dashboard, edit, extract, filter_config, find, grep, presets, render,
-    select, source, stats, task,
+    select, source, stats,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -694,6 +694,12 @@ fn grep_status(payload: &serde_json::Value, out: &GrepOutput) -> Vec<String> {
 /// prompt as-is to the local LLM under a minimal system prompt and prints
 /// the response. Diverges via `std::process::exit`, mirroring run_cmd's
 /// error-handling style.
+///
+/// The call itself is `select::round_trip`, the same one the filters and
+/// `scout run` make. It used to be a `task` module of its own, whose docstring
+/// promised it would back "preset dispatch" in a later step that never came;
+/// what it actually did was hold the oldest of three copies of this round-trip,
+/// and the copy that never streamed.
 pub fn run_task(prompt: &str) -> ! {
     let cfg_path = config::config_path();
     let cfg = match config::load_config(&cfg_path) {
@@ -707,7 +713,6 @@ pub fn run_task(prompt: &str) -> ! {
 
     let system = "You are a helpful, concise assistant embedded in a coding agent's \
         local-LLM escape hatch. Answer the user's request directly.";
-    let params = json!({"system": system, "user": prompt});
 
     // One record so start and end share an `id` with the log line.
     let rec = stats::CallRecord::new("task", "task")
@@ -717,22 +722,17 @@ pub fn run_task(prompt: &str) -> ! {
         .input(stats::input_summary("task", &json!({ "prompt": prompt })))
         .raw_bytes(prompt.len() as u64);
 
-    crate::live::emit_start(&rec, system, prompt);
-    match task::handle(&client, &params) {
-        Ok(result) => {
-            let text = result["text"].as_str().unwrap_or("");
-            let rec = rec
-                .usage(&result["usage"])
-                .ms(result["duration_ms"].as_u64().unwrap_or(0))
-                .returned_bytes(text.len() as u64);
-            crate::live::emit_end(&rec, Some(text));
-            rec.log();
+    let (rec, result) = select::round_trip(&client, rec, system, prompt);
+    match result {
+        Ok(text) => {
+            // Trimmed for both stdout and the byte count: the escape hatch
+            // prints an answer, not the model's leading newline.
+            let text = text.trim();
+            rec.returned_bytes(text.len() as u64).log();
             println!("{text}");
             std::process::exit(0);
         }
         Err(e) => {
-            let rec = rec.outcome(e.outcome()).summary(e.to_string());
-            crate::live::emit_end(&rec, None);
             rec.log();
             eprintln!("scout task: {:?}", e);
             std::process::exit(1);
@@ -769,6 +769,19 @@ mod tests {
         // Catches duplicate shorts/longs and bad `conflicts_with` targets,
         // which clap only reports at runtime otherwise.
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn task_without_a_prompt_is_refused_at_parse_time() {
+        // Successor to the `task` module's "missing required 'user' param"
+        // test. That module took the prompt through a JSON params object and
+        // had to check it was there; the prompt now arrives as a `&str`
+        // straight from clap, which is where the same invariant is enforced.
+        // (Its "missing 'system'" sibling has no successor by construction:
+        // the system prompt is a literal in `run_task` and cannot go absent.)
+        assert!(Cli::try_parse_from(["scout", "task"]).is_err());
+        let cli = Cli::try_parse_from(["scout", "task", "why is the sky blue"]).expect("parses");
+        assert!(matches!(cli.command, Command::Task { prompt } if prompt == "why is the sky blue"));
     }
 
     #[test]

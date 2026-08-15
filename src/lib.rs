@@ -23,14 +23,17 @@
 //! * `check_output`, `extract`, `grep`, `find` — the four filter pipelines.
 //!   Each takes a `select::Ctx` and a JSON argument object and returns a
 //!   payload, so the CLI and the MCP server run identical code.
-//! * `select` — the shared LLM round-trip and the validation of what comes back.
+//! * `select` — the shared LLM round-trip (`round_trip`, which `scout run` and
+//!   `scout task` call too) and the validation of what comes back.
 //! * `client`, `config`, `filter_config`, `presets` — configuration and the
 //!   endpoint.
 //! * `source`, `render`, `edit` — search, human rendering, `$EDITOR` handoff.
 //! * `stats`, `live`, `dashboard` — the call log, its live IPC feed, and the
 //!   web view over both.
-//! * `classify_command`, `verify`, `run_cmd`, `task` — hook plumbing, subprocess
-//!   capture, and the two direct-to-model verbs.
+//! * `classify_command`, `verify`, `run_cmd` — hook plumbing, subprocess
+//!   capture, and `scout run`.  (`scout task`, the other direct-to-model verb,
+//!   is a dozen lines in `cli` now that it shares `select::round_trip`; the
+//!   `task` module it used to live in held nothing else.)
 //!
 //! Visibility follows one rule: `pub` is for what a caller outside the crate
 //! legitimately needs — the binary, and tests pinning pure logic.  Anything
@@ -58,6 +61,4 @@ pub mod run_cmd;
 pub mod select;
 pub mod source;
 pub mod stats;
-// `task` is the one-function body of `scout task`; the CLI is its only caller.
-pub(crate) mod task;
 pub mod verify;
