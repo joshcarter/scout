@@ -152,7 +152,7 @@ model = "qwen/qwen3.6-35b-a3b"
 # worth serving them on.
 # port = 13001
 #
-# Prompt and response bodies travel the live channel (unix datagram + SSE)
+# Prompt and response bodies travel the live channel (unix socket + SSE)
 # and are held in the daemon's memory only. They are not written to the
 # call log. A daemon restart loses them; that is accepted. The persist_bodies
 # sidecar is a later, opt-in phase.

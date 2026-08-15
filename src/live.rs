@@ -1,10 +1,31 @@
 //! The ephemeral live channel (docs/dashboard.md §2, P3).
 //!
 //! Short-lived scout processes send `call.start` / `call.end` over a
-//! non-blocking unix datagram. The dashboard daemon is the only listener.
-//! Every failure — nobody listening, a stale socket, a full buffer, a
-//! payload that will not fit — drops the event. Telemetry is never allowed
-//! to slow a tool call, least of all `shell_safety`.
+//! non-blocking `AF_UNIX` **stream** socket, one length-prefixed frame per
+//! event. The dashboard daemon is the only listener.
+//!
+//! The invariant that outranks everything else here: **telemetry never blocks
+//! a tool call, and every failure drops the event.** Nobody listening, a stale
+//! socket, a full send buffer, a write that only got half a frame out — all of
+//! them end the same way, with the event gone and the caller unaffected. That
+//! matters most for `shell_safety`, which sits in the critical path of every
+//! Bash call the agent makes.
+//!
+//! It was a datagram channel until it met macOS. `net.local.dgram.maxdgram`
+//! caps a unix datagram at 2048 bytes there whatever `SO_SNDBUF` says, so
+//! every event past 2 KiB — which is nearly all of them — failed `EMSGSIZE`
+//! and the dashboard stayed empty. `SOCK_SEQPACKET` would have kept message
+//! boundaries, but macOS does not support it for `AF_UNIX` either. So:
+//! `SOCK_STREAM` on every platform, with the message boundary the transport no
+//! longer provides carried explicitly, as a 4-byte little-endian length in
+//! front of each event's JSON.
+//!
+//! Framing is what the stream costs, and it is paid on both sides: the writer
+//! serializes header and payload into one contiguous buffer so a successful
+//! `write` is a whole frame, and drops the connection on any short or failed
+//! write rather than leaving the reader stranded mid-frame. The reader
+//! discards a frame torn by a writer that died mid-payload — the stream
+//! world's lost datagram.
 //!
 //! Bodies and in-flight rows live only in the daemon's memory. A restart
 //! loses them; that is accepted.
@@ -17,17 +38,23 @@ use crate::record::Row;
 use crate::stats::{self, CallRecord, Outcome};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-/// Hard cap on a serialized event. Unix datagrams fail `EMSGSIZE` above
-/// `SO_SNDBUF`, which is not a portable promise; 64 KiB is safely under
-/// every host this has to run on.
-pub const MAX_DGRAM: usize = 64 * 1024;
+/// Hard cap on a serialized event, and so on a frame either side will accept.
+///
+/// The stream itself imposes no limit — that was the point of leaving
+/// datagrams — but a length prefix a reader trusts unconditionally is a
+/// 4 GiB allocation waiting for one corrupt byte. So the bound is declared
+/// here, `fit_event` shrinks anything larger before it reaches the wire, and
+/// the reader treats a longer declared length as a stream it can no longer
+/// follow.
+pub const MAX_EVENT: usize = 64 * 1024;
 /// In-memory body cache. A daemon restart empties it.
 pub const MAX_BODIES: usize = 500;
 /// In-memory `find` round cache, keyed by `op`. Smaller than `MAX_BODIES`:
@@ -61,6 +88,15 @@ pub const ABANDONED_RETAIN_SECS: f64 = 3600.0;
 pub const ABANDONED: &str = "abandoned";
 const SUB_CAP: usize = 32;
 const RCVBUF: libc::c_int = 4 * 1024 * 1024;
+/// Writer-side send buffer. A stream write that does not fit drops the event
+/// and the connection with it (see `emit_bytes`), so the buffer is what keeps
+/// that rare rather than merely handled. Best-effort: a host that refuses the
+/// size just keeps its default.
+const SNDBUF: libc::c_int = 1024 * 1024;
+/// Concurrent connection threads the daemon will keep. Writers are
+/// short-lived scout processes plus one long-lived MCP server, so this is a
+/// backstop against something pathological, not a scheduler.
+const MAX_CONNS: usize = 64;
 
 // ── Path ────────────────────────────────────────────────────────────────────
 
@@ -135,7 +171,7 @@ enum Sock {
     /// First resolve saw `ENOENT`. Cached so a long-lived MCP server does
     /// not `connect(2)` on every Bash intercept.
     Missing,
-    Ready(std::os::unix::net::UnixDatagram),
+    Ready(UnixStream),
 }
 
 fn sender_slot() -> std::sync::MutexGuard<'static, Option<Sock>> {
@@ -143,46 +179,129 @@ fn sender_slot() -> std::sync::MutexGuard<'static, Option<Sock>> {
     SLOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn resolve() -> Sock {
+/// The slot's next state.
+///
+/// `None` is "nothing to cache, ask again on the next event". It is what a
+/// connect that could not complete *right now* deserves — a daemon whose
+/// listen backlog is momentarily full is behind, not absent, and writing
+/// telemetry off for the life of an MCP server over one stutter would be the
+/// wrong trade. Everything else, `ENOENT` above all, is the permanent answer
+/// and caches as `Missing`.
+fn resolve() -> Option<Sock> {
     let Some(path) = socket_path() else {
-        return Sock::Missing;
+        return Some(Sock::Missing);
     };
     match connect_nonblocking(&path) {
-        Ok(s) => Sock::Ready(s),
-        Err(e) if e.kind() == ErrorKind::NotFound => Sock::Missing,
-        Err(_) => Sock::Missing,
+        Ok(s) => Some(Sock::Ready(s)),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINPROGRESS)) => None,
+        Err(_) => Some(Sock::Missing),
     }
 }
 
-fn connect_nonblocking(path: &Path) -> io::Result<std::os::unix::net::UnixDatagram> {
-    let sock = std::os::unix::net::UnixDatagram::unbound()?;
+/// `connect(2)` to the daemon on a socket that is non-blocking *before* the
+/// connect, not after.
+///
+/// Hand-rolled rather than `UnixStream::connect` + `set_nonblocking` because
+/// that order has a hole in it: `connect(2)` on a unix stream whose listener
+/// has a full backlog parks the caller until the daemon accepts, and parking a
+/// tool call inside telemetry is the one thing this module may not do. A
+/// wedged daemon is exactly the case the invariant exists for.
+///
+/// `SOCK_NONBLOCK` would fold this into the `socket(2)` call, but it is a
+/// Linux extension; `fcntl` is portable, which is the whole reason this
+/// transport exists.
+///
+/// Every failure — `ENOENT` for no daemon, `ECONNREFUSED` for a stale socket
+/// or (on the BSDs) a full backlog, `EINPROGRESS`/`EAGAIN` for a connect that
+/// has not finished — is one thing to the caller: not connected, try again on
+/// the next event. Nothing here waits.
+fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
+    use std::os::unix::io::FromRawFd;
+    let addr = sockaddr_un(path)?;
+    // SAFETY: a plain `socket(2)`; the fd is adopted below before any other
+    // fallible step, so no early return can leak it.
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh socket owned by nobody else.
+    let sock = unsafe { UnixStream::from_raw_fd(fd) };
     sock.set_nonblocking(true)?;
-    sock.connect(path)?;
+    // SAFETY: `addr` is a zeroed `sockaddr_un` this process filled in, and the
+    // length passed is its own size.
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of_val(&addr) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    raise_buf(fd, libc::SO_SNDBUF, SNDBUF);
     Ok(sock)
+}
+
+/// A zeroed `sockaddr_un` naming `path`.
+///
+/// `sun_path` is 108 bytes on Linux and 104 on macOS, and a path that does not
+/// fit is a configuration error rather than a transport one — reported as
+/// `InvalidInput` so `resolve` files it under "no daemon" like every other
+/// failure.
+fn sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is plain data; all-zero is a valid value for it,
+    // and zeroing is what leaves `sun_path` NUL-terminated below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(ErrorKind::InvalidInput, "live socket path is too long"));
+    }
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src as libc::c_char;
+    }
+    Ok(addr)
+}
+
+/// One event, framed: a 4-byte little-endian length, then the JSON.
+///
+/// Built into a single contiguous buffer on purpose. The length and the
+/// payload have to reach the kernel together or not at all — a writer that
+/// managed the header and then died would leave the reader waiting on bytes
+/// nobody will send.
+fn frame(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bytes.len());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
 }
 
 fn emit_bytes(bytes: &[u8]) {
     let mut slot = sender_slot();
     if slot.is_none() {
-        *slot = Some(resolve());
+        *slot = resolve();
     }
-    match slot.as_mut() {
-        Some(Sock::Missing) | None => {}
-        Some(Sock::Ready(sock)) => {
-            // ConnectionRefused means the daemon restarted and unlinked the
-            // socket: forget the sender so the next emit re-resolves, which is
-            // the one permitted reconnect.  Every other error — EAGAIN,
-            // EMSGSIZE, anything else — drops the datagram and stays connected.
-            if sock.send(bytes).is_err_and(|e| e.kind() == ErrorKind::ConnectionRefused) {
-                *slot = None;
-            }
-        }
+    let Some(Sock::Ready(sock)) = slot.as_mut() else { return };
+    let buf = frame(bytes);
+    // Any write that did not put the whole frame on the wire ends the
+    // connection: a stream has no message boundaries to resynchronize on, so a
+    // reader left holding half a frame would misread the next one as a length.
+    // `WouldBlock` on a full send buffer is that same case — this is telemetry,
+    // there is no pending-buffer machinery, and the event is what gets dropped.
+    // Clearing the slot is also the reconnect path that `ConnectionRefused`
+    // used to be: the next emit re-resolves, and finds `Missing` if the daemon
+    // really is gone.
+    match sock.write(&buf) {
+        Ok(n) if n == buf.len() => {}
+        _ => *slot = None,
     }
 }
 
 /// `call.start` — resolved prompts. No-op for a silent record.
 ///
-/// `"v"` versions *this envelope* — the datagram on the socket — and has
+/// `"v"` versions *this envelope* — the framed event on the socket — and has
 /// nothing to do with `stats.rs`'s `"v":2`, which versions a `calls.jsonl`
 /// record. Two formats, two things being versioned.
 ///
@@ -260,10 +379,15 @@ pub fn emit_end(rec: &CallRecord, response: Option<&str>) {
 /// payload costs something to build can skip building it. Answering "no" is
 /// one mutex acquisition after the first call — the same cached `Missing` that
 /// keeps a long-lived MCP server from re-`connect(2)`ing per event.
+///
+/// Answering "yes" now leaves a connection open, because on a stream socket
+/// that is what asking means. It is the same connection the emit would have
+/// used, held for the same lifetime, and the daemon caps how many of them it
+/// will service (`MAX_CONNS`).
 pub fn is_listening() -> bool {
     let mut slot = sender_slot();
     if slot.is_none() {
-        *slot = Some(resolve());
+        *slot = resolve();
     }
     matches!(slot.as_ref(), Some(Sock::Ready(_)))
 }
@@ -272,7 +396,7 @@ pub fn is_listening() -> bool {
 
 /// Coalescing window for `call.token` (docs/dashboard.md §2).
 ///
-/// ~1 content delta per token was measured (§5.5); one datagram per delta is
+/// ~1 content delta per token was measured (§5.5); one event per delta is
 /// 86 syscalls for a short reply where a 50 ms timer is ~40, and a browser
 /// cannot paint faster than a frame anyway.
 pub const TOKEN_COALESCE_MS: u64 = 50;
@@ -282,7 +406,7 @@ pub const TOKEN_COALESCE_MS: u64 = 50;
 /// The fail-open ladder in `fit_event` has to be re-checked against every new
 /// *shape* of payload (§7.6) — and a token event's shape is one long string
 /// with no structure to shrink intelligently. Bounding the buffer well under
-/// `MAX_DGRAM` means the elision path is unreachable in practice rather than
+/// `MAX_EVENT` means the elision path is unreachable in practice rather than
 /// merely handled.
 pub const MAX_TOKEN_CHUNK: usize = 8 * 1024;
 
@@ -305,7 +429,7 @@ impl<E: FnMut(&str, u64)> Coalescer<E> {
     }
 
     /// Append one delta, flushing if the window has closed or the buffer is
-    /// full. Never allocates a datagram per token, never blocks.
+    /// full. Never sends an event per token, never blocks.
     pub fn push(&mut self, delta: &str) {
         self.buf.push_str(delta);
         if self.buf.len() >= MAX_TOKEN_CHUNK || self.last.elapsed() >= self.interval {
@@ -410,10 +534,10 @@ pub(crate) fn now_ts() -> f64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// Shrink body fields until the serialized event fits in `MAX_DGRAM`.
+/// Shrink body fields until the serialized event fits in `MAX_EVENT`.
 fn fit_event(mut v: Value) -> Vec<u8> {
     let mut bytes = v.to_string().into_bytes();
-    if bytes.len() <= MAX_DGRAM {
+    if bytes.len() <= MAX_EVENT {
         return bytes;
     }
     for key in ["system", "user", "response", "text"] {
@@ -422,7 +546,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
         }
     }
     bytes = v.to_string().into_bytes();
-    if bytes.len() <= MAX_DGRAM {
+    if bytes.len() <= MAX_EVENT {
         return bytes;
     }
     // Still too big: keep shrinking the longest body field.
@@ -439,7 +563,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
             *s = elide(s, len / 2);
         }
         bytes = v.to_string().into_bytes();
-        if bytes.len() <= MAX_DGRAM {
+        if bytes.len() <= MAX_EVENT {
             return bytes;
         }
     }
@@ -460,7 +584,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
             obj.insert("truncated".into(), Value::Bool(true));
         }
         bytes = v.to_string().into_bytes();
-        if bytes.len() <= MAX_DGRAM {
+        if bytes.len() <= MAX_EVENT {
             return bytes;
         }
     }
@@ -472,8 +596,8 @@ fn fit_event(mut v: Value) -> Vec<u8> {
         }
     }
     let mut bytes = v.to_string().into_bytes();
-    if bytes.len() > MAX_DGRAM {
-        bytes.truncate(MAX_DGRAM);
+    if bytes.len() > MAX_EVENT {
+        bytes.truncate(MAX_EVENT);
     }
     bytes
 }
@@ -526,11 +650,12 @@ fn ceil_char(s: &str, mut start: usize) -> &str {
 /// Bind the live socket for the daemon on `port`. Not fatal for the daemon if
 /// this fails.
 ///
-/// Owner-only, both the socket and any directory created for it.  A datagram
+/// Owner-only, both the socket and any directory created for it.  A listening
 /// socket at the process umask is world-writable enough for any other local
-/// process to send it forged `call.start`/`call.end` events and spoof rows in
-/// somebody else's dashboard — integrity rather than confidentiality, and low
-/// stakes on a single-user box, but it costs two lines.
+/// process to connect and send it forged `call.start`/`call.end` events and
+/// spoof rows in somebody else's dashboard — integrity rather than
+/// confidentiality, and low stakes on a single-user box, but it costs two
+/// lines.
 ///
 /// The directory mode is set only when we create it (`DirBuilder::mode`), not
 /// stamped onto one that already exists: `$XDG_RUNTIME_DIR` is already 0700 by
@@ -538,14 +663,14 @@ fn ceil_char(s: &str, mut start: usize) -> &str {
 /// not this function's business.  The socket's own mode is set right after
 /// `bind(2)` rather than by juggling the umask, which is process-global and
 /// would race any other thread creating a file.
-pub fn bind_socket(port: u16) -> io::Result<std::os::unix::net::UnixDatagram> {
+pub fn bind_socket(port: u16) -> io::Result<UnixListener> {
     let path = socket_path_for(port).ok_or_else(|| io::Error::other("no live socket path"))?;
     if let Some(parent) = path.parent() {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
     let _ = std::fs::remove_file(&path);
-    let sock = std::os::unix::net::UnixDatagram::bind(&path)?;
+    let sock = UnixListener::bind(&path)?;
     // The window between `bind` and this chmod is a few microseconds wide and,
     // for the `$XDG_RUNTIME_DIR` layout, sits behind a 0700 directory nothing
     // else can traverse. Binding elsewhere and `rename`ing into place would
@@ -556,22 +681,30 @@ pub fn bind_socket(port: u16) -> io::Result<std::os::unix::net::UnixDatagram> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    let _ = sock.set_nonblocking(true);
-    raise_rcvbuf(&sock);
+    // Accepted connections inherit the listener's buffer sizes, so raising it
+    // here raises it for every writer that arrives. Blocking accept and
+    // blocking reads are both fine on this side: the daemon's whole job is
+    // waiting, and it does it on threads of its own.
+    {
+        use std::os::unix::io::AsRawFd;
+        raise_buf(sock.as_raw_fd(), libc::SO_RCVBUF, RCVBUF);
+    }
     Ok(sock)
 }
 
-fn raise_rcvbuf(sock: &std::os::unix::net::UnixDatagram) {
-    use std::os::unix::io::AsRawFd;
-    let fd = sock.as_raw_fd();
-    let buf = RCVBUF;
+/// Best-effort `SO_SNDBUF`/`SO_RCVBUF`. A host that refuses the size keeps its
+/// default, which costs throughput and nothing else — the failure mode on both
+/// sides is a dropped event, never a stall.
+fn raise_buf(fd: std::os::unix::io::RawFd, opt: libc::c_int, bytes: libc::c_int) {
+    // SAFETY: `fd` is an open socket owned by the caller, and the value
+    // pointed at is a live `c_int` of the length declared.
     unsafe {
         libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            (&raw const buf).cast::<libc::c_void>(),
-            std::mem::size_of_val(&buf) as libc::socklen_t,
+            opt,
+            (&raw const bytes).cast::<libc::c_void>(),
+            std::mem::size_of_val(&bytes) as libc::socklen_t,
         );
     }
 }
@@ -999,29 +1132,88 @@ fn apply_end(row: &mut Row, v: &Value) {
     }
 }
 
-/// Drain datagrams into `store` until the process exits.
-pub fn recv_loop(sock: &std::os::unix::net::UnixDatagram, store: &LiveStore) {
-    let mut buf = vec![0u8; MAX_DGRAM];
+/// Accept writers and drain their frames into `store` until the process exits.
+///
+/// One thread per connection, each of them blocking on `read`. That is the
+/// shape a stream wants and it is strictly cheaper than what the datagram
+/// version did, which was a non-blocking `recv` that slept 8 ms every time it
+/// found nothing — a permanent 125 Hz wakeup and up to 8 ms of latency on
+/// every event, in exchange for nothing.
+///
+/// Connections are capped at `MAX_CONNS`. Past that an accepted writer is
+/// closed immediately: its next emit reconnects, and if the cap is still full
+/// then, its events are dropped like any other failure here.
+pub fn accept_loop(listener: &UnixListener, store: &Arc<LiveStore>) {
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
-        match sock.recv(&mut buf) {
-            Ok(n) => {
-                if let Ok(text) = std::str::from_utf8(&buf[..n]) {
-                    store.apply_json(text);
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if live.load(Ordering::Relaxed) >= MAX_CONNS {
+                    drop(stream);
+                    continue;
+                }
+                live.fetch_add(1, Ordering::Relaxed);
+                let store = Arc::clone(store);
+                let done = Arc::clone(&live);
+                let spawned = std::thread::Builder::new()
+                    .name("scout-live".into())
+                    .spawn(move || {
+                        conn_loop(stream, &store);
+                        done.fetch_sub(1, Ordering::Relaxed);
+                    })
+                    .is_ok();
+                if !spawned {
+                    // Nobody will run the decrement above, so do it here or the
+                    // cap ratchets shut.
+                    live.fetch_sub(1, Ordering::Relaxed);
                 }
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
-                std::thread::sleep(Duration::from_millis(8));
-            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
     }
 }
 
+/// Read frames off one writer until it goes away.
+///
+/// Every exit from here is the same exit: EOF, a short read, a length past
+/// `MAX_EVENT`, a payload that is not UTF-8. A frame torn off mid-payload —
+/// the writer died between the header and the body, or dropped the connection
+/// on a short write — is silently discarded, which is this transport's version
+/// of a lost datagram and just as unremarkable.
+fn conn_loop(mut stream: UnixStream, store: &LiveStore) {
+    // macOS hands `accept(2)` a socket that inherits the listener's
+    // `O_NONBLOCK`; Linux does not. Say which one we want rather than
+    // depending on the difference.
+    let _ = stream.set_nonblocking(false);
+    let mut buf = Vec::new();
+    while read_frame(&mut stream, &mut buf).is_ok() {
+        if let Ok(text) = std::str::from_utf8(&buf) {
+            store.apply_json(text);
+        }
+    }
+}
+
+/// One frame into `buf`: a 4-byte little-endian length, then that many bytes.
+///
+/// A declared length of zero or one past `MAX_EVENT` is not a big event, it is
+/// a stream this reader can no longer follow — nothing writes either — so it
+/// ends the connection rather than allocating whatever the bytes asked for.
+fn read_frame(stream: &mut UnixStream, buf: &mut Vec<u8>) -> io::Result<()> {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header)?;
+    let len = u32::from_le_bytes(header) as usize;
+    if len == 0 || len > MAX_EVENT {
+        return Err(io::Error::new(ErrorKind::InvalidData, "live frame length out of bounds"));
+    }
+    buf.clear();
+    buf.resize(len, 0);
+    stream.read_exact(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixDatagram;
-    use std::sync::Arc;
 
     // Env vars and the process-global sender are shared; serialise tests
     // that touch either.
@@ -1063,6 +1255,61 @@ mod tests {
         }
         reset_sender();
         out
+    }
+
+    /// A stand-in daemon: the socket a writer will find, with a non-blocking
+    /// `accept` so a test that asserts *nothing* arrived says so instead of
+    /// hanging.
+    ///
+    /// Every writer in these tests emits on the test's own thread, so by the
+    /// time an assertion runs the `connect(2)` and the `write` behind it have
+    /// both already happened.
+    fn listen(path: &Path) -> UnixListener {
+        let l = UnixListener::bind(path).expect("bind the test daemon's socket");
+        l.set_nonblocking(true).expect("non-blocking accept");
+        l
+    }
+
+    /// Take the one connection a writer made, ready for blocking frame reads.
+    fn accept_one(listener: &UnixListener) -> UnixStream {
+        let (conn, _) = listener.accept().expect("a writer connected");
+        // macOS accepts with the listener's `O_NONBLOCK`; Linux does not.
+        conn.set_nonblocking(false).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        conn
+    }
+
+    /// One event off the wire: accept the writer, read its first frame, and
+    /// hand back the payload — the daemon's read path, minus the store.
+    fn recv_frame(listener: &UnixListener) -> Vec<u8> {
+        let mut conn = accept_one(listener);
+        next_frame(&mut conn)
+    }
+
+    fn next_frame(conn: &mut UnixStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        read_frame(conn, &mut buf).expect("a whole frame");
+        buf
+    }
+
+    fn recv_event(listener: &UnixListener) -> Value {
+        serde_json::from_slice(&recv_frame(listener)).expect("the frame is JSON")
+    }
+
+    /// Did anything at all reach the socket? Distinguishes "no writer
+    /// connected" from "a writer connected and sent nothing", because with a
+    /// stream those are two different silences and only the first is what an
+    /// `is_listening` probe leaves behind.
+    fn nothing_arrived(listener: &UnixListener) -> bool {
+        match listener.accept() {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => true,
+            Ok((mut conn, _)) => {
+                conn.set_nonblocking(true).unwrap();
+                let mut byte = [0u8; 1];
+                matches!(conn.read(&mut byte), Err(e) if e.kind() == ErrorKind::WouldBlock)
+            }
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
     }
 
     /// The configured default port, and some other port that is not it.
@@ -1118,13 +1365,11 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
+        let listener = listen(&path);
         with_sock_env(&path, || {
             emit_start(&rec("grep").endpoint("qwen3:27b", "http://localhost:11434/v1"), "s", "u");
         });
-        let mut buf = vec![0u8; MAX_DGRAM];
-        let n = listener.recv(&mut buf).unwrap();
-        let ev: Value = serde_json::from_slice(&buf[..n]).unwrap();
+        let ev = recv_event(&listener);
         assert_eq!(ev["endpoint"], "http://localhost:11434/v1");
         assert_eq!(ev["model"], "qwen3:27b");
 
@@ -1158,18 +1403,14 @@ mod tests {
 
             // A writer knows only the default port; it must still land on the
             // primary, and the interloper must hear nothing.
-            let w = connect_nonblocking(&socket_path().unwrap()).unwrap();
-            w.send(start_ev(1).as_bytes()).unwrap();
+            let mut w = connect_nonblocking(&socket_path().unwrap()).unwrap();
+            w.write_all(&frame(start_ev(1).as_bytes())).unwrap();
 
-            let mut buf = vec![0u8; 4096];
-            primary.set_nonblocking(false).unwrap();
-            primary.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            let n = primary.recv(&mut buf).expect("the primary, not the interloper");
-            assert!(String::from_utf8_lossy(&buf[..n]).contains("call.start"));
-            match interloper.recv(&mut buf) {
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                other => panic!("the interloper intercepted the primary's traffic: {other:?}"),
-            }
+            primary.set_nonblocking(true).unwrap();
+            interloper.set_nonblocking(true).unwrap();
+            let got = recv_frame(&primary);
+            assert!(String::from_utf8_lossy(&got).contains("call.start"));
+            assert!(nothing_arrived(&interloper), "the interloper intercepted the primary's traffic");
 
             // And stopping it — `on_terminate` unlinks its socket path
             // unconditionally — takes only its own name with it.
@@ -1234,18 +1475,12 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let listener = listen(&path);
         with_sock_env(&path, || {
             let mut r = rec("grep");
             r.silent = true;
             emit_start(&r, "sys", "user");
-            let mut buf = [0u8; 256];
-            match listener.recv(&mut buf) {
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Ok(n) => panic!("silent emit sent {n} bytes"),
-                Err(e) => panic!("unexpected recv error: {e}"),
-            }
+            assert!(nothing_arrived(&listener), "a silent record reached the socket");
         });
     }
 
@@ -1254,15 +1489,11 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        listener.set_nonblocking(false).unwrap();
-        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        let listener = listen(&path);
         with_sock_env(&path, || {
             let r = rec("check_output");
             emit_start(&r, "SYSTEM", "USER PROMPT");
-            let mut buf = vec![0u8; MAX_DGRAM];
-            let n = listener.recv(&mut buf).expect("datagram");
-            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            let v = recv_event(&listener);
             assert_eq!(v["kind"], "call.start");
             assert_eq!(v["id"], r.id);
             assert_eq!(v["op"], r.op);
@@ -1273,33 +1504,97 @@ mod tests {
         });
     }
 
+    /// The cached-slot design, restated for a connection-oriented transport:
+    /// one `connect(2)` per process, then every event of every call down the
+    /// same stream, in the order they were emitted. A reconnect per event
+    /// would be a syscall pair in `shell_safety`'s critical path.
     #[test]
-    fn a_full_receive_buffer_does_not_block_the_sender() {
+    fn one_connection_carries_every_event_of_a_call_in_order() {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        // Tiny receive buffer so a handful of 8 KiB payloads fill it.
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = listener.as_raw_fd();
-            let buf: libc::c_int = 2048;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVBUF,
-                    (&raw const buf).cast::<libc::c_void>(),
-                    std::mem::size_of_val(&buf) as libc::socklen_t,
-                );
-            }
-        }
-        listener.set_nonblocking(true).unwrap();
+        let listener = listen(&path);
+        with_sock_env(&path, || {
+            let r = rec("check_output");
+            emit_start(&r, "SYSTEM", "USER");
+            emit_end(&r, Some("REPLY"));
+
+            let mut conn = accept_one(&listener);
+            let first: Value = serde_json::from_slice(&next_frame(&mut conn)).unwrap();
+            let second: Value = serde_json::from_slice(&next_frame(&mut conn)).unwrap();
+            assert_eq!(first["kind"], "call.start");
+            assert_eq!(second["kind"], "call.end");
+            assert_eq!(second["response"], "REPLY");
+            assert_eq!(first["id"], second["id"], "both halves of one call");
+            assert!(
+                first["seq"].as_u64() < second["seq"].as_u64(),
+                "the stream preserves the order `seq` records"
+            );
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == ErrorKind::WouldBlock),
+                "a second connection: the sender is reconnecting per event"
+            );
+        });
+    }
+
+    /// The reader's half of the framing contract: whole frames become events,
+    /// and one that stops mid-payload — a writer killed between the header and
+    /// the body — takes the connection with it and leaves nothing behind. That
+    /// is this transport's lost datagram.
+    #[test]
+    fn a_torn_frame_is_discarded_and_the_whole_ones_before_it_are_not() {
+        let (mut w, r) = UnixStream::pair().unwrap();
+        let store = LiveStore::new();
+        std::thread::scope(|s| {
+            s.spawn(|| conn_loop(r, &store));
+            w.write_all(&frame(start_ev(1).as_bytes())).unwrap();
+            w.write_all(&frame(start_ev(2).as_bytes())).unwrap();
+            // A header promising 64 bytes, and five of them.
+            w.write_all(&64u32.to_le_bytes()).unwrap();
+            w.write_all(b"{\"id\"").unwrap();
+            drop(w);
+        });
+        let ids: Vec<String> = store.inflight_rows().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 2, "the two whole frames landed: {ids:?}");
+        assert!(ids.contains(&"id-1".to_string()) && ids.contains(&"id-2".to_string()));
+    }
+
+    /// A length past `MAX_EVENT` is not a large event — nothing writes one —
+    /// it is a stream that has lost its place, and trusting it would mean
+    /// allocating whatever the four bytes happened to say.
+    #[test]
+    fn a_frame_longer_than_the_bound_ends_the_connection() {
+        let (mut w, r) = UnixStream::pair().unwrap();
+        let store = LiveStore::new();
+        std::thread::scope(|s| {
+            s.spawn(|| conn_loop(r, &store));
+            w.write_all(&((MAX_EVENT + 1) as u32).to_le_bytes()).unwrap();
+            // Never read: the reader gave up on the header above.
+            let _ = w.write_all(&frame(start_ev(1).as_bytes()));
+            drop(w);
+        });
+        assert!(store.inflight_rows().is_empty(), "the corrupt stream was followed anyway");
+    }
+
+    /// A daemon that never reads is the shape of every failure this module
+    /// exists to survive — a wedged dashboard, a socket whose accept loop died.
+    /// The writer's send buffer fills, `write` comes back `WouldBlock`, and the
+    /// event is dropped: several megabytes of telemetry aimed at nobody must
+    /// cost the caller no more than the syscalls it took to find that out.
+    #[test]
+    fn a_daemon_that_never_reads_does_not_block_the_sender() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        // Bound, never accepted, never read.
+        let _listener = listen(&path);
         with_sock_env(&path, || {
             let r = rec("grep");
             let fat = "x".repeat(4000);
             let start = std::time::Instant::now();
-            for _ in 0..64 {
+            // Comfortably past `SNDBUF`, so this really does run out of buffer
+            // rather than merely fitting.
+            for _ in 0..512 {
                 emit_start(&r, &fat, &fat);
             }
             assert!(start.elapsed() < Duration::from_secs(2), "sender blocked on a full buffer");
@@ -1307,20 +1602,18 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_prompt_is_elided_under_the_datagram_cap() {
+    fn a_huge_prompt_is_elided_under_the_event_cap() {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        let listener = listen(&path);
         with_sock_env(&path, || {
             let r = rec("check_output");
             let huge = "α".repeat(80_000); // 200 KiB of UTF-8, not ASCII
             emit_start(&r, "sys", &huge);
-            let mut buf = vec![0u8; MAX_DGRAM + 1024];
-            let n = listener.recv(&mut buf).expect("datagram");
-            assert!(n <= MAX_DGRAM, "datagram was {n} bytes");
-            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            let payload = recv_frame(&listener);
+            assert!(payload.len() <= MAX_EVENT, "frame payload was {} bytes", payload.len());
+            let v: Value = serde_json::from_slice(&payload).unwrap();
             let user = v["user"].as_str().unwrap();
             assert!(user.contains("elided") || user.contains("bytes"), "{user}");
             assert!(user.starts_with('α') || user.starts_with('…'), "head survived");
@@ -1639,7 +1932,7 @@ mod tests {
     #[test]
     fn a_run_of_deltas_larger_than_the_chunk_cap_flushes_early() {
         // The timer alone cannot bound the payload — a fast host can produce
-        // more text in one window than a datagram can carry.
+        // more text in one window than one event may carry.
         let (mut co, out) = collect(Duration::from_secs(3600));
         let block = "x".repeat(1024);
         for _ in 0..12 {
@@ -1648,7 +1941,7 @@ mod tests {
         let got = out.lock().unwrap().clone();
         assert!(!got.is_empty(), "the size cap never fired");
         for (text, _) in &got {
-            assert!(text.len() < MAX_DGRAM, "a chunk would not fit a datagram");
+            assert!(text.len() < MAX_EVENT, "a chunk would not fit one event");
         }
         assert!(got.iter().map(|(t, _)| t.len()).sum::<usize>() >= 8 * 1024);
         assert_eq!(got[0].1, 0);
@@ -1662,8 +1955,7 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
+        let listener = listen(&path);
         with_sock_env(&path, || {
             let mut r = rec("grep");
             r.silent = true;
@@ -1672,12 +1964,7 @@ mod tests {
                     sink("token ");
                 }
             });
-            let mut buf = vec![0u8; MAX_DGRAM];
-            match listener.recv(&mut buf) {
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Ok(n) => panic!("a silent record sent {n} bytes"),
-                Err(e) => panic!("unexpected recv error: {e}"),
-            }
+            assert!(nothing_arrived(&listener), "a silent record streamed tokens");
         });
     }
 
@@ -1686,17 +1973,14 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        let listener = listen(&path);
         with_sock_env(&path, || {
             let r = rec("check_output");
             with_token_stream(&r, |sink| {
                 sink("Hello, ");
                 sink("world");
             });
-            let mut buf = vec![0u8; MAX_DGRAM];
-            let n = listener.recv(&mut buf).expect("datagram");
-            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            let v = recv_event(&listener);
             assert_eq!(v["kind"], "call.token");
             assert_eq!(v["id"], r.id, "the row id, so the pane knows where to append");
             assert_eq!(v["op"], r.op);
@@ -1793,14 +2077,11 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        let listener = listen(&path);
         with_sock_env(&path, || {
             assert!(is_listening());
             emit_find("op-7", 2, "reflect", &json!({"answered": false, "patterns": ["draw"]}));
-            let mut buf = vec![0u8; MAX_DGRAM];
-            let n = listener.recv(&mut buf).expect("datagram");
-            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            let v = recv_event(&listener);
             assert_eq!(v["kind"], "find.reflect");
             assert_eq!(v["op"], "op-7");
             assert_eq!(v["id"], "op-7", "no row id exists; the op stands in");
@@ -1816,18 +2097,16 @@ mod tests {
         let _g = lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live.sock");
-        let listener = UnixDatagram::bind(&path).unwrap();
-        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        let listener = listen(&path);
         with_sock_env(&path, || {
-            // A pathological keep list: far past MAX_DGRAM in one array.
+            // A pathological keep list: far past MAX_EVENT in one array.
             let keeps: Vec<Value> = (0..4000)
                 .map(|i| json!({"file": format!("src/{i}/{}.rs", "long".repeat(20)), "line": i, "why": "y".repeat(120)}))
                 .collect();
             emit_find("op-big", 1, "rerank", &json!({"keeps": keeps}));
-            let mut buf = vec![0u8; MAX_DGRAM + 4096];
-            let n = listener.recv(&mut buf).expect("datagram");
-            assert!(n <= MAX_DGRAM, "datagram was {n} bytes");
-            let v: Value = serde_json::from_slice(&buf[..n]).expect("still valid JSON");
+            let payload = recv_frame(&listener);
+            assert!(payload.len() <= MAX_EVENT, "frame payload was {} bytes", payload.len());
+            let v: Value = serde_json::from_slice(&payload).expect("still valid JSON");
             assert_eq!(v["kind"], "find.rerank");
             assert_eq!(v["truncated"], true, "a shortened list says so");
             let kept = v["keeps"].as_array().unwrap().len();

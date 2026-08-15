@@ -853,7 +853,7 @@ fn the_rerank_event_reads_the_payload_the_caller_gets() {
     assert_eq!(k[0]["score"], 3);
     assert_eq!(k[0]["why"], "the definition");
     // The excerpt itself stays out: the row's body already carries it, and a
-    // keep list of full context blocks is what blows the datagram cap.
+    // keep list of full context blocks is what blows the event size cap.
     assert!(k[0].get("context").is_none());
 }
 

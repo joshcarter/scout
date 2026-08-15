@@ -8,9 +8,10 @@
 // the tail delta.  A pleasant consequence is that the view works retroactively
 // over calls made before it was started, and survives its own restart.
 //
-// P3 adds the live channel (§2.5): a unix datagram the writers sendto, an
-// in-memory body cache, in-flight rows overlaid on the log, and `/api/stream`
-// as SSE. Token streams (P5) and `find` internals (P4) reuse the same pipe.
+// P3 adds the live channel (§2.5): a unix stream socket the writers connect to
+// and send length-prefixed events over, an in-memory body cache, in-flight rows
+// overlaid on the log, and `/api/stream` as SSE. Token streams (P5) and `find`
+// internals (P4) reuse the same pipe.
 
 use crate::record::Row;
 use crate::stats;
@@ -1359,7 +1360,7 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
     });
 
     if let Some(sock) = live_sock {
-        std::thread::spawn(move || crate::live::recv_loop(&sock, &live));
+        std::thread::spawn(move || crate::live::accept_loop(&sock, &live));
     }
 
     if let Some(pidfile) = pid_path_for(port) {
@@ -2559,7 +2560,7 @@ mod tests {
         let path = dir.path().join("live.sock");
         assert!(!socket_still_bound(&path), "nothing bound yet");
 
-        let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        let sock = std::os::unix::net::UnixListener::bind(&path).unwrap();
         assert!(socket_still_bound(&path));
 
         // What `on_terminate` and `bind_socket` both do, unconditionally.

@@ -79,32 +79,53 @@ watching.**
 ```
 short-lived scout procs ──append──> calls.jsonl ──tail──> daemon ──poll──> browser
          │                        (durable, thin)          │
-         └──sendto (if listening)─> unix datagram ──────────┘──SSE──> browser
+         └──write (if listening)──> unix stream ───────────┘──SSE──> browser
                                    (ephemeral, fat)
 ```
 
 ### Transport
 
-A **non-blocking `SOCK_DGRAM` unix socket** at
+A **non-blocking `SOCK_STREAM` unix socket** at
 `$XDG_RUNTIME_DIR/scout/live.sock` (falling back to the state dir),
-created by the daemon on start and unlinked on clean exit.
+created by the daemon on start and unlinked on clean exit. Each event is
+one frame: a 4-byte little-endian length, then the JSON.
 
-Datagram, not stream, and non-blocking, for one reason: **it is
-structurally incapable of slowing scout down or failing it.** No connect
-handshake, no framing, message boundaries preserved for free. Nobody
-listening is an instant `ENOENT`; a stale socket after a crash is an
-instant `ECONNREFUSED`; a daemon too slow to drain is `EAGAIN`. All three
-are handled identically — **drop the event and move on**. Dropping
-telemetry is always the correct answer here.
+This was `SOCK_DGRAM` until it met macOS, and the argument for datagrams
+was a good one — no connect handshake, no framing, message boundaries
+preserved for free. It was also wrong about portability. macOS caps a
+unix datagram at 2048 bytes via `net.local.dgram.maxdgram`, whatever
+`SO_SNDBUF` says, so every event past 2 KiB (which is nearly all of
+them) failed `EMSGSIZE` and the dashboard stayed empty. `SOCK_SEQPACKET`
+would have kept the boundaries, but macOS does not support it for
+`AF_UNIX` either. One transport for every platform beats two, so:
+stream, with the boundary carried explicitly.
+
+What does not change is the property the datagram was chosen for: **it
+is structurally incapable of slowing scout down or failing it.** The
+socket is non-blocking before the `connect(2)`, not after, so not even a
+full listen backlog can park a writer. Nobody listening is an instant
+`ENOENT`; a stale socket after a crash is an instant `ECONNREFUSED`; a
+daemon too slow to drain is `EAGAIN` on the write. All three are handled
+identically — **drop the event and move on**, and drop the connection
+with it so the next event reconnects and the reader is never left
+holding half a frame. Dropping telemetry is always the correct answer
+here.
 
 That matters most for the highest-frequency writer, `shell_safety`,
 which sits in the critical path of every Bash tool call the agent makes.
-A connection-oriented channel would put a connect timeout there in
-exchange for nothing.
+A connect that could wait would put a timeout there in exchange for
+nothing.
 
-The socket resolves **once per process** into an `Option<UnixDatagram>`,
-not per event, so a long-lived MCP server does not retry a missing
-socket hundreds of times.
+The socket resolves **once per process** into an `Option<UnixStream>`,
+not per event, so a long-lived MCP server neither retries a missing
+socket hundreds of times nor reconnects per event.
+
+The daemon side is an accept loop with **one thread per connection**,
+each blocking on `read`. A frame torn off mid-payload — a writer killed
+between the header and the body — is discarded, which is this
+transport's version of a lost datagram. A declared length past the
+64 KiB event bound is treated as a stream that has lost its place, and
+ends the connection.
 
 ### Events
 
@@ -128,10 +149,10 @@ search converge live is also the only practical way to tune
 `max_patterns`, `degenerate_hit_cap`, and `reflect` against real
 questions.
 
-**`call.token` is coalesced** on a ~50 ms timer rather than one datagram
+**`call.token` is coalesced** on a ~50 ms timer rather than one event
 per token. The browser cannot render faster than a frame anyway, and it
 keeps the SSE fan-out cheap. Measured: a real `extract` sent 187
-completion tokens as 62 datagrams — the local 35B is slower than the
+completion tokens as 62 events — the local 35B is slower than the
 window, so the timer mostly bundles two or three tokens and the saving is
 a third rather than the 5× a faster host would see.
 
@@ -668,7 +689,7 @@ Four properties, each of which the obvious alternative gives up:
 The sink is **best-effort and must not block** — it runs inside the HTTP
 read loop, where a slow consumer stalls the model call itself. The one
 implementation scout ships is a buffer append plus an occasional
-non-blocking `sendto`.
+non-blocking `write` of one frame.
 
 ### Verdict, and the escape hatch
 
@@ -832,7 +853,7 @@ phase existed.
 |---|---|
 | **P1** | the enriched record — `op`/`run`/`id`, `via`, `tool`, `input`, `outcome`, the `Ledger` and byte accounting, rotation |
 | **P2** | the detached daemon and the HTTP server, over the log alone |
-| **P3** | the live channel — unix datagram, SSE, prompt/response bodies, in-flight calls |
+| **P3** | the live channel — unix stream socket, SSE, prompt/response bodies, in-flight calls |
 | **P4** | `find` refinement events and the round tab strip |
 | **P5** | token streaming — `call.token` deltas coalesced at 50 ms, `[llm] stream` |
 | **P6** | bodies sidecar (`persist_bodies`) — optional, unbuilt |

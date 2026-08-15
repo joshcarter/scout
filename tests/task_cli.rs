@@ -18,7 +18,7 @@ mod support;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
@@ -89,23 +89,48 @@ fn drip_feeding_server() -> String {
 
 /// Bind the live channel's socket so the run under test has a listener, which
 /// is what makes the token sink more than a no-op.
-fn bind_live_socket(path: &Path) -> UnixDatagram {
-    let sock = UnixDatagram::bind(path).expect("bind the live socket");
-    sock.set_read_timeout(Some(Duration::from_millis(200))).expect("read timeout");
+///
+/// Non-blocking `accept`, because nothing here waits for a writer: the child
+/// has come and gone before anything is read, so its connection is already
+/// queued and `accept` either has it or there is nothing to have.
+fn bind_live_socket(path: &Path) -> UnixListener {
+    let sock = UnixListener::bind(path).expect("bind the live socket");
+    sock.set_nonblocking(true).expect("non-blocking accept");
     sock
 }
 
-/// Every event the run sent, in arrival order. The child has exited by the
-/// time this is called, so everything it sent is already queued.
-fn drain(sock: &UnixDatagram) -> Vec<serde_json::Value> {
+/// Every event the run sent, in arrival order.
+///
+/// The channel is a unix *stream* carrying length-prefixed frames (see
+/// `live.rs`), so this is the daemon's read path in miniature: take each
+/// connection the child made and read frames off it until EOF.
+fn drain(listener: &UnixListener) -> Vec<serde_json::Value> {
     let mut events = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    while let Ok(n) = sock.recv(&mut buf) {
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
-            events.push(v);
+    while let Ok((mut conn, _)) = listener.accept() {
+        // macOS accepts with the listener's `O_NONBLOCK`; Linux does not.
+        conn.set_nonblocking(false).expect("blocking reads");
+        conn.set_read_timeout(Some(Duration::from_millis(500))).expect("read timeout");
+        while let Some(frame) = next_frame(&mut conn) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&frame) {
+                events.push(v);
+            }
         }
     }
     events
+}
+
+/// One frame: a 4-byte little-endian length, then that many bytes. `None` at
+/// EOF or on anything that does not look like a frame.
+fn next_frame(conn: &mut UnixStream) -> Option<Vec<u8>> {
+    let mut header = [0u8; 4];
+    conn.read_exact(&mut header).ok()?;
+    let len = u32::from_le_bytes(header) as usize;
+    if len == 0 || len > 64 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    conn.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 fn kind<'a>(events: &'a [serde_json::Value], want: &str) -> Vec<&'a serde_json::Value> {
