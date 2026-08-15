@@ -918,13 +918,66 @@ fn respond_json(stream: &mut TcpStream, status: u16, body: &Value) {
     respond(stream, status, "application/json", body.to_string().as_bytes());
 }
 
+/// Bytes and wall-clock `lingering_close` will spend swallowing the rest of a
+/// request nobody is going to read.  Both are backstops against a client that
+/// just keeps talking, not budgets any honest request comes near.
+const MAX_DRAIN_BYTES: usize = 64 * 1024;
+const DRAIN_DEADLINE: Duration = Duration::from_secs(1);
+
+/// Close the way a server has to close when it answered *early*.
+///
+/// Every reject path in `serve` returns with the rest of the request still
+/// unread — the tail of an over-long request line, the headers past the 64th,
+/// whatever followed a second `Host`.  Dropping a `TcpStream` whose receive
+/// queue is non-empty does not send FIN, it sends **RST**, and a BSD kernel
+/// handed an RST discards the receiving socket's queue: the client loses the
+/// response we just wrote, *including bytes already sitting in its buffer*.
+/// macOS drops the body and fails the read with `ECONNRESET`; Linux hands the
+/// application its buffered data first and only then reports the reset, which
+/// is the whole reason this was invisible on one machine and three red tests
+/// on another.  The rejection worked either way — it was only ever the
+/// explanatory body that went missing.
+///
+/// So: FIN first (`shutdown(Write)`), which releases the client to read a
+/// complete response and close its end, then read until that close lands.
+/// Draining to EOF is what leaves the queue empty, and an empty queue is what
+/// makes the final `close(2)` a FIN.  Overrunning either bound means an RST
+/// after all, which is the right answer to a client still shouting after it
+/// has been told no.
+///
+/// This is the classic lingering close (Apache spells it `lingering_close`),
+/// and it is here for exactly the reason Apache has it.
+fn lingering_close(stream: &mut TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = std::time::Instant::now() + DRAIN_DEADLINE;
+    let mut sink = [0u8; 4096];
+    let mut budget = MAX_DRAIN_BYTES;
+    while budget > 0 {
+        let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => return,
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        let cap = sink.len().min(budget);
+        match stream.read(&mut sink[..cap]) {
+            // `Ok(0)` is the peer's own close, and the good ending: the queue
+            // is drained, so our `close` sends FIN.  An error means we stop
+            // trying, and the RST it implies is already the lesser problem.
+            Ok(0) | Err(_) => return,
+            Ok(n) => budget -= n,
+        }
+    }
+}
+
 /// SSE: hold the connection, `data: {...}\n\n` per event, comment keepalives.
 ///
 /// This is the one route that must not go through `respond` / `HTTP/1.0
 /// Connection: close`. The handler thread lives as long as the tab.
-fn handle_stream(state: &Arc<State>, mut stream: TcpStream) {
+fn handle_stream(state: &Arc<State>, stream: &mut TcpStream) {
     if !state.live.try_acquire_stream() {
-        respond_json(&mut stream, 503, &json!({"error": "too many live streams"}));
+        respond_json(stream, 503, &json!({"error": "too many live streams"}));
         return;
     }
     let rx = state.live.subscribe();
@@ -1104,14 +1157,26 @@ fn origin_is_ours(origin: &str, port: u16) -> bool {
 ///
 /// `HTTP/1.0 Connection: close` throughout — everything here is a GET of a
 /// small body, and there is no state to mutate.
+///
+/// Owning the socket here, and handing `serve` only a borrow, is what lets the
+/// close be deliberate: `serve` has a dozen early returns and every one of
+/// them has to leave through `lingering_close`, which is easy to guarantee
+/// once and hopeless to remember at each `return`.
 fn handle(state: &Arc<State>, mut stream: TcpStream) {
+    serve(state, &mut stream);
+    lingering_close(&mut stream);
+}
+
+/// Route one request, writing the response into `stream`.  Closing it is
+/// `handle`'s job — see `lingering_close` for why that is not just a drop.
+fn serve(state: &Arc<State>, stream: &mut TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let deadline = std::time::Instant::now() + HEADER_PHASE_DEADLINE;
 
-    let request_line = match read_header_line(&mut stream, MAX_HEADER_LINE_BYTES, deadline) {
+    let request_line = match read_header_line(stream, MAX_HEADER_LINE_BYTES, deadline) {
         LineOutcome::Line(l) => l,
         LineOutcome::TooLong => {
-            respond(&mut stream, 431, "text/plain", b"request line too large");
+            respond(stream, 431, "text/plain", b"request line too large");
             return;
         }
         // A client that vanished, or one that went silent past the
@@ -1127,12 +1192,12 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
     let mut host: Option<String> = None;
     let mut origin: Option<String> = None;
     loop {
-        match read_header_line(&mut stream, MAX_HEADER_LINE_BYTES, deadline) {
+        match read_header_line(stream, MAX_HEADER_LINE_BYTES, deadline) {
             LineOutcome::Line(l) if l.trim().is_empty() => break, // end of headers
             LineOutcome::Line(l) => {
                 header_count += 1;
                 if header_count > MAX_HEADER_COUNT {
-                    respond(&mut stream, 431, "text/plain", b"too many headers");
+                    respond(stream, 431, "text/plain", b"too many headers");
                     return;
                 }
                 let Some((name, value)) = l.split_once(':') else { continue };
@@ -1141,7 +1206,7 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
                         // Two `Host`s is ambiguous by construction, and picking
                         // either one is how a check like this gets walked past.
                         if host.is_some() {
-                            respond(&mut stream, 403, "text/plain", b"ambiguous Host header\n");
+                            respond(stream, 403, "text/plain", b"ambiguous Host header\n");
                             return;
                         }
                         host = Some(value.trim().to_string());
@@ -1151,7 +1216,7 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
                 }
             }
             LineOutcome::TooLong => {
-                respond(&mut stream, 431, "text/plain", b"header too large");
+                respond(stream, 431, "text/plain", b"header too large");
                 return;
             }
             LineOutcome::Eof | LineOutcome::TimedOut => return,
@@ -1161,18 +1226,18 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
     // Before the route, before the method: a rebound page must not reach any
     // of them. See `authority_is_ours`.
     if !authority_is_ours(host.as_deref(), state.port) {
-        respond(&mut stream, 403, "text/plain", b"forbidden: Host is not this dashboard\n");
+        respond(stream, 403, "text/plain", b"forbidden: Host is not this dashboard\n");
         return;
     }
     if origin.as_deref().is_some_and(|o| !origin_is_ours(o, state.port)) {
-        respond(&mut stream, 403, "text/plain", b"forbidden: cross-origin request\n");
+        respond(stream, 403, "text/plain", b"forbidden: cross-origin request\n");
         return;
     }
 
     let mut parts = request_line.split_whitespace();
     let (Some(method), Some(target)) = (parts.next(), parts.next()) else { return };
     if method != "GET" {
-        respond_json(&mut stream, 405, &json!({"error": "only GET is served"}));
+        respond_json(stream, 405, &json!({"error": "only GET is served"}));
         return;
     }
     let (path, query) = match target.split_once('?') {
@@ -1183,22 +1248,22 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
 
     match path {
         "/" | "/index.html" => {
-            respond(&mut stream, 200, "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes());
+            respond(stream, 200, "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes());
         }
-        "/api/status" => respond_json(&mut stream, 200, &state.status_json()),
+        "/api/status" => respond_json(stream, 200, &state.status_json()),
         "/api/history" => {
             let mut tail = state.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tail.refresh();
             let body = history_with_live(&tail, Some(state.live.as_ref()), &params);
             drop(tail);
-            respond_json(&mut stream, 200, &body);
+            respond_json(stream, 200, &body);
         }
         "/api/stats" => {
             let mut tail = state.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tail.refresh();
             let body = stats_json(&tail);
             drop(tail);
-            respond_json(&mut stream, 200, &body);
+            respond_json(stream, 200, &body);
         }
         "/api/stream" => {
             handle_stream(state, stream);
@@ -1210,11 +1275,11 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
             let found = call_with_live(&tail, Some(state.live.as_ref()), &id);
             drop(tail);
             match found {
-                Some(v) => respond_json(&mut stream, 200, &v),
-                None => respond_json(&mut stream, 404, &json!({"error": "no such call", "id": id})),
+                Some(v) => respond_json(stream, 200, &v),
+                None => respond_json(stream, 404, &json!({"error": "no such call", "id": id})),
             }
         }
-        _ => respond_json(&mut stream, 404, &json!({"error": "not found", "path": path})),
+        _ => respond_json(stream, 404, &json!({"error": "not found", "path": path})),
     }
 }
 
@@ -2323,7 +2388,17 @@ mod tests {
     fn send_built(build: impl FnOnce(u16) -> Vec<u8>) -> String {
         let (mut c, _) = serve_one(Arc::new(crate::live::LiveStore::new()), build);
         let mut buf = Vec::new();
-        c.read_to_end(&mut buf).unwrap_or(0);
+        // Not `unwrap_or(0)`.  Swallowing the error here turns "the peer reset
+        // the connection and the body is gone" into "the body did not contain
+        // the expected string", so three tests blamed the response text for a
+        // close-path bug.  See `lingering_close`.
+        c.read_to_end(&mut buf).unwrap_or_else(|e| {
+            panic!(
+                "read_to_end: {e:?} after {} bytes: {:?}",
+                buf.len(),
+                String::from_utf8_lossy(&buf)
+            )
+        });
         String::from_utf8_lossy(&buf).into_owned()
     }
 
