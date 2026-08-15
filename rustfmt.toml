@@ -1,0 +1,22 @@
+# The one setting that matters here.
+#
+# rustfmt's defaults cap a *function call's* arguments at 60 columns
+# (`fn_call_width`) independently of `max_width`, so it explodes calls that fit
+# a line comfortably:
+#
+#     return Ok(timeout_verdict(ctx, &command, language, &capture, kind, secs));
+#
+# is 89 columns and still gets torn into eight lines. This codebase was written
+# by hand and consistently keeps a short call, a short assert, or a short
+# `let` on one line, which reads better and is the style throughout.
+# `use_small_heuristics = "Max"` sets every one of those sub-widths to
+# `max_width`, so the only question rustfmt asks is "does the line fit".
+#
+# Measured before adopting: 581 reformatted hunks at the defaults, 181 with
+# this. The remaining 181 are genuine — lines actually past 100 columns, and
+# places rustfmt wraps differently than a person did.
+#
+# `max_width` is left at the default 100 deliberately. Raising it makes things
+# *worse*: 202 hunks at 110, 284 at 120, because a wider limit lets rustfmt
+# re-join lines that were split on purpose for readability.
+use_small_heuristics = "Max"
