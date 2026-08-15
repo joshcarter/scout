@@ -42,6 +42,19 @@ Exit codes follow the grep convention:
   irrelevant); the stderr message distinguishes the two
 - `2` — error (bad pattern, LLM failure with no bypass)
 
+Two paths this list did not mention, and now does because `tests/grep_cli.rs`
+pins them:
+
+- A **usage error** — no pattern, or conflicting flags such as `--intent`
+  with `--no-filter` — also exits `2`. That is clap's default rather than
+  anything scout chose, but it agrees with "2 means error", so it is worth
+  stating rather than leaving to coincidence.
+- **`--type-list`** exits `0`. It prints and stops; it is not a search, so
+  "no hits" would be the wrong answer.
+
+The code is the same in every `--format`: the format decides what stdout
+looks like, never whether the search succeeded.
+
 ## 2. Human output
 
 Rerank mode — the model was involved, so each hit has a `why`:
