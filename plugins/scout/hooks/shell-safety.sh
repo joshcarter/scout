@@ -20,6 +20,16 @@
 #        verdict "allow"  → emit permissionDecision:allow + log "allow"
 #        anything else    → log verdict, exit (fail-to-ask)
 #
+# Shadow mode: set $SCOUT_SHELL_SAFETY_SHADOW, or touch
+# ~/.claude/scout-shell-safety.shadow, and step 3's "allow" is logged as
+# "allow-shadow" without being emitted — the command falls through to the
+# harness's own permission decision instead. Everything else (classification,
+# logging, the deny floor) behaves identically. This exists to measure what the
+# hook is actually buying now that Claude Code has an auto-approve mode of its
+# own: every "allow-shadow" row is a command this hook would have approved, so
+# a prompt seen on one is a case the harness did not cover by itself. Shadow is
+# strictly less permissive than normal operation, so it is safe to leave on.
+#
 # Hard invariant: fail-open. Any error, timeout, missing binary, or parse
 # failure → exit 0, emit nothing → normal permission prompt. The hook only
 # ever *adds* an allow — it never denies or blocks. A missing/unreachable
@@ -75,6 +85,51 @@ _log() {
   printf '{"ts":"%s","command":%s,"cwd":%s,"expansion":%s,"decision":%s%s}\n' \
     "$TS_VAL" "$CMD_JSON" "$CWD_JSON" "$HAS_EXPANSION" "$DECISION_JSON" "$extras" \
     >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# _unwrap_json TEXT — print the JSON object embedded in an LLM reply.
+#
+# `scout run` prints the model's reply verbatim (src/run_cmd.rs) because it is a
+# generic preset runner and has no business massaging preset output — so peeling
+# a fenced or prose-wrapped reply is this hook's job. The shell counterpart of
+# src/select.rs::parse_selector_json, and needed for the same reason: the preset
+# forbids fences, and the model emits them anyway. The audit log had 513
+# `parse-failure` rows whose recorded output began "```json\n{\"verdict\":
+# \"allow\"" — valid verdicts thrown away for their wrapping.
+#
+# Drops <think>...</think> blocks and fence lines, then keeps the first '{'
+# through the last '}'. Prints nothing when there is no brace pair, which the
+# caller treats as an unparsable reply (fail-to-ask), same as before.
+#
+# Known limitation: the <think> strip is line-wise and greedy, so two complete
+# think spans on one line take the text between them with it. Real replies put
+# the block on its own lines, and anything this mangles was already a
+# parse-failure — it can only turn non-answers into answers, never the reverse.
+_unwrap_json() {
+  printf '%s' "$1" | awk '
+    { lines[NR] = $0 }
+    END {
+      body = ""; think = 0
+      for (i = 1; i <= NR; i++) {
+        l = lines[i]
+        if (think) {
+          if (l ~ /<\/think>/) { sub(/^.*<\/think>/, "", l); think = 0 } else continue
+        }
+        while (l ~ /<think>.*<\/think>/) sub(/<think>.*<\/think>/, "", l)
+        if (l ~ /<think>/) { sub(/<think>.*$/, "", l); think = 1 }
+        if (l ~ /^[ \t]*```/) continue
+        body = body l "\n"
+      }
+      first = index(body, "{")
+      if (first == 0) exit
+      last = 0
+      for (i = length(body); i > 0; i--) {
+        if (substr(body, i, 1) == "}") { last = i; break }
+      }
+      if (last <= first) exit
+      printf "%s", substr(body, first, last - first + 1)
+    }
+  ' 2>/dev/null || true
 }
 
 # Load [shell_safety].deny list from config.toml; prints one entry per line.
@@ -363,9 +418,29 @@ LLM_OUTPUT=$(_timeout "$SCOUT_BIN" run \
 VERDICT=$(printf '%s' "$LLM_OUTPUT" | jq -r '.verdict // empty' 2>/dev/null) || VERDICT=""
 REASON=$(printf '%s' "$LLM_OUTPUT" | jq -r '.reason // ""' 2>/dev/null) || REASON=""
 
+# Retry through _unwrap_json when the reply did not parse as bare JSON. Logged
+# as `unwrapped` so the audit trail distinguishes a clean reply from a rescued
+# one — if that field is never true, the model has stopped fencing and this
+# fallback can go.
+UNWRAPPED=false
+if [ -z "$VERDICT" ] && [ -n "$LLM_OUTPUT" ]; then
+  UNWRAPPED_JSON=$(_unwrap_json "$LLM_OUTPUT")
+  if [ -n "$UNWRAPPED_JSON" ]; then
+    VERDICT=$(printf '%s' "$UNWRAPPED_JSON" | jq -r '.verdict // empty' 2>/dev/null) || VERDICT=""
+    REASON=$(printf '%s' "$UNWRAPPED_JSON" | jq -r '.reason // ""' 2>/dev/null) || REASON=""
+    [ -n "$VERDICT" ] && UNWRAPPED=true
+  fi
+fi
+
 case "$VERDICT" in
   allow)
-    _log "allow" reason "$REASON"
+    # Shadow mode (see header): classify and log as usual, withhold the allow.
+    if [ -n "${SCOUT_SHELL_SAFETY_SHADOW:-}" ] ||
+       [ -f "${HOME}/.claude/scout-shell-safety.shadow" ]; then
+      _log "allow-shadow" reason "$REASON" unwrapped "$UNWRAPPED"
+      exit 0  # emit nothing → harness decides on its own
+    fi
+    _log "allow" reason "$REASON" unwrapped "$UNWRAPPED"
     jq -n '{
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -374,7 +449,7 @@ case "$VERDICT" in
     }'
     ;;
   ask|deny)
-    _log "$VERDICT" reason "$REASON"
+    _log "$VERDICT" reason "$REASON" unwrapped "$UNWRAPPED"
     exit 0  # emit nothing → normal prompt
     ;;
   *)
