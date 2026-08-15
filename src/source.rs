@@ -41,6 +41,16 @@ pub struct FileContent {
 /// Returns `Err` with a caller-facing message for anything that makes the
 /// read useless: missing file, a directory, a non-UTF-8 (binary) file, or a
 /// file past `max_bytes`.  Callers fail open on `Err`.
+///
+/// `metadata().is_dir()` alone is not enough of a gate: FIFOs, character
+/// devices, block devices and sockets all report `len() == 0`, so an
+/// `is_dir()`-only check lets them sail past the size cap into a `fs::read`
+/// that never returns (a FIFO with nothing writing to it) or that grows
+/// without bound (`/dev/zero`). The pre-check below is a cheap early-out, not
+/// the enforcement — the real cap is the bounded read through `.take`, which
+/// also closes the TOCTOU between the `metadata` call and the read (a file
+/// growing between the two, which is exactly the shape of the "tail a log"
+/// use case `extract` is meant to support).
 pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileContent, String> {
     let raw = Path::new(file);
     let abs: PathBuf = if raw.is_absolute() { raw.to_path_buf() } else { project.join(raw) };
@@ -49,6 +59,13 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
     if meta.is_dir() {
         return Err(format!("{} is a directory, not a file", abs.display()));
     }
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", abs.display()));
+    }
+    // Cheap early-out: skip opening/reading a file `stat` already says is
+    // too big. Not the enforcement on its own — `meta` can be stale by the
+    // time the read below runs (a file growing between the two calls), which
+    // is why the bounded `.take` read is the real cap.
     if meta.len() > max_bytes {
         return Err(format!(
             "{} is {} bytes, past the {max_bytes}-byte read cap",
@@ -57,7 +74,27 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
         ));
     }
 
-    let bytes = std::fs::read(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(&abs).map_err(|e| format!("{}: {e}", abs.display()))?;
+    // Re-check after open: a symlink or mount swapped underfoot between the
+    // `metadata` call above and this `open` would otherwise still reach the
+    // unbounded read below.
+    let opened_meta = f.metadata().map_err(|e| format!("{}: {e}", abs.display()))?;
+    if !opened_meta.is_file() {
+        return Err(format!("{} is not a regular file", abs.display()));
+    }
+    let mut bytes = Vec::new();
+    f.by_ref()
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("{}: {e}", abs.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{} is past the {max_bytes}-byte read cap",
+            abs.display()
+        ));
+    }
+
     if is_binary(&bytes) {
         return Err(format!("{} looks like a binary file", abs.display()));
     }

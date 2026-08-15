@@ -96,6 +96,38 @@ fn read_file_reports_missing_directory_binary_and_oversize() {
     assert!(e.contains("read cap"), "{e}");
 }
 
+/// A FIFO with nothing writing to it must be rejected promptly, never read.
+///
+/// Before the fix, `read_file` checked only `is_dir()`: a FIFO reports
+/// `len() == 0`, so it sailed past the size cap into `std::fs::read`, whose
+/// internal `File::open` blocks forever waiting for a writer that never
+/// shows up. This is run on its own thread with a bounded `recv_timeout` so
+/// a regression fails the test (by timing out) instead of hanging the whole
+/// suite — see the bug writeup for the reproduction against the old code.
+#[test]
+#[cfg(unix)]
+fn read_file_rejects_a_fifo_promptly_instead_of_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let fifo_path = dir.path().join("fifo");
+    let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+    let dir_path = dir.path().to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = read_file(&dir_path, "fifo", 1 << 20);
+        // The receiver may already be gone if we timed out below — that's
+        // fine, there's nothing left to report to.
+        let _ = tx.send(result);
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("read_file must reject a FIFO promptly instead of hanging on the open/read");
+    let e = result.unwrap_err();
+    assert!(e.contains("not a regular file"), "{e}");
+}
+
 #[test]
 fn split_lines_handles_crlf_and_empty_input() {
     assert_eq!(split_lines("a\r\nb\r\n"), vec!["a", "b"]);

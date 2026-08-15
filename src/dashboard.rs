@@ -16,7 +16,7 @@ use crate::stats::{self, Outcome};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -761,22 +761,28 @@ fn bind_with_retry(port: u16) -> std::io::Result<TcpListener> {
 }
 
 /// Percent-decode a query value.
+///
+/// Works on `bytes` throughout and never slices `s` as a `&str`: `%` is
+/// itself ASCII, but the two bytes after it are arbitrary and can land
+/// mid-codepoint when the input isn't well-formed percent-encoding (e.g. a
+/// literal multi-byte UTF-8 character right after a stray `%`, as in `%€`).
+/// `&s[i+1..i+3]` would panic on that char boundary; `bytes.get(i+1..i+3)`
+/// plus a byte-level hex parse cannot, because it never asks `str` to agree
+/// the slice is valid UTF-8. See `live.rs`'s and `source.rs`'s boundary
+/// handling for the same rule applied elsewhere in this codebase.
 fn url_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            },
+            b'%' if matches!(bytes.get(i + 1..i + 3), Some(pair) if pair.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                let hi = (bytes[i + 1] as char).to_digit(16).unwrap();
+                let lo = (bytes[i + 2] as char).to_digit(16).unwrap();
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
             b'+' => {
                 out.push(b' ');
                 i += 1;
@@ -990,6 +996,7 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8])
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        431 => "Request Header Fields Too Large",
         501 => "Not Implemented",
         503 => "Service Unavailable",
         _ => "Error",
@@ -1042,27 +1049,122 @@ fn handle_stream(state: &Arc<State>, mut stream: TcpStream) {
     state.live.release_stream();
 }
 
+/// One line off the header phase (§ below `read_header_line`).
+enum LineOutcome {
+    /// A complete line, `\r\n`- or `\n`-terminated, terminator stripped.
+    Line(String),
+    /// The peer closed (or the socket errored) before a newline arrived.
+    Eof,
+    /// The line grew past `MAX_HEADER_LINE_BYTES` without a newline.
+    TooLong,
+    /// `HEADER_PHASE_DEADLINE` elapsed before a newline arrived.
+    TimedOut,
+}
+
+/// Hard cap on one header-phase line (the request line, or one header),
+/// enforced byte-by-byte so a line that never sends `\n` cannot grow the
+/// buffer without bound.
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+
+/// Hard cap on the number of header lines. A per-line byte budget alone does
+/// not stop a client sending thousands of short header lines.
+const MAX_HEADER_COUNT: usize = 64;
+
+/// Wall-clock budget for the *whole* header phase (request line + every
+/// header), independent of how many bytes have arrived.
+///
+/// `set_read_timeout` bounds one syscall, not the phase: a client that
+/// trickles a single byte in just under that window, forever, keeps every
+/// individual read succeeding while never finishing a request — 17 GB of RSS
+/// in 12 seconds was reproduced this way against the old per-syscall-only
+/// timeout. This deadline is what actually closes such a connection.
+const HEADER_PHASE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Read one `\n`-terminated line directly off `stream`, bounded by
+/// `max_bytes` and by `deadline`.
+///
+/// Byte-at-a-time on purpose: the alternative (`BufReader::read_line`) has no
+/// hook to recheck a wall-clock deadline between the syscalls it makes while
+/// hunting for the delimiter, which is exactly the gap this function exists
+/// to close. Traffic on this socket is a handful of short header lines per
+/// request on loopback, so the extra syscalls are not a real cost.
+fn read_header_line(stream: &mut TcpStream, max_bytes: usize, deadline: std::time::Instant) -> LineOutcome {
+    let mut line: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let remaining = match deadline.checked_duration_since(std::time::Instant::now()) {
+            Some(d) if !d.is_zero() => d,
+            _ => return LineOutcome::TimedOut,
+        };
+        // Never let one syscall block past what remains of the deadline,
+        // even though the connection's own read timeout (set once, in
+        // `handle`) is longer.
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return LineOutcome::Eof;
+        }
+        match stream.read(&mut byte) {
+            Ok(0) => return LineOutcome::Eof, // peer closed
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    if line.last() == Some(&b'\r') {
+                        line.pop();
+                    }
+                    return LineOutcome::Line(String::from_utf8_lossy(&line).into_owned());
+                }
+                line.push(byte[0]);
+                if line.len() > max_bytes {
+                    return LineOutcome::TooLong;
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return LineOutcome::TimedOut;
+            }
+            Err(_) => return LineOutcome::Eof,
+        }
+    }
+}
+
 /// One connection: request line, discard headers, route, close.
 ///
 /// `HTTP/1.0 Connection: close` throughout — everything here is a GET of a
 /// small body, and there is no state to mutate.
 fn handle(state: &Arc<State>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut request_line = String::new();
-    {
-        let mut reader = BufReader::new(&stream);
-        if reader.read_line(&mut request_line).is_err() {
+    let deadline = std::time::Instant::now() + HEADER_PHASE_DEADLINE;
+
+    let request_line = match read_header_line(&mut stream, MAX_HEADER_LINE_BYTES, deadline) {
+        LineOutcome::Line(l) => l,
+        LineOutcome::TooLong => {
+            respond(&mut stream, 431, "text/plain", b"request line too large");
             return;
         }
-        // Headers are read and dropped: no route takes a body.
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) if line.trim().is_empty() => break,
-                Ok(_) => continue,
-                Err(_) => return,
+        // A client that vanished, or one that went silent past the
+        // deadline, gets nothing back — there is no well-formed request to
+        // answer, and a still-open socket is not implied by either case.
+        LineOutcome::Eof | LineOutcome::TimedOut => return,
+    };
+
+    // Headers are read and dropped: no route takes a body. Bounded the same
+    // way as the request line, plus a count cap of its own.
+    let mut header_count = 0usize;
+    loop {
+        match read_header_line(&mut stream, MAX_HEADER_LINE_BYTES, deadline) {
+            LineOutcome::Line(l) if l.trim().is_empty() => break, // end of headers
+            LineOutcome::Line(_) => {
+                header_count += 1;
+                if header_count > MAX_HEADER_COUNT {
+                    respond(&mut stream, 431, "text/plain", b"too many headers");
+                    return;
+                }
             }
+            LineOutcome::TooLong => {
+                respond(&mut stream, 431, "text/plain", b"header too large");
+                return;
+            }
+            LineOutcome::Eof | LineOutcome::TimedOut => return,
         }
     }
 
@@ -2125,6 +2227,19 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_before_a_multibyte_char_does_not_panic() {
+        // `%` followed by `€` (a 3-byte UTF-8 character) used to slice
+        // `&s[i+1..i+3]` as a `&str` and land mid-codepoint: "byte index 3 is
+        // not a char boundary". Neither byte of the pair is a hex digit, so
+        // this is not valid percent-encoding and must be passed through.
+        assert_eq!(url_decode("%€"), "%€");
+        // Reachable end to end via `parse_query`, e.g.
+        // `GET /api/history?since=%€`.
+        let p = parse_query("since=%€");
+        assert_eq!(p["since"], "%€");
+    }
+
+    #[test]
     fn the_status_marker_is_what_a_probe_looks_for() {
         let state = State {
             tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
@@ -2169,6 +2284,70 @@ mod tests {
         // after we drop the client; that bound is the leak test. Asserting it
         // here would stall the suite for a quarter of a minute.
         drop(c);
+    }
+
+    /// Spin up a real listener on `handle`, send `request` over a real
+    /// socket, and return whatever comes back before the peer closes.
+    ///
+    /// Exercises the bounded header reader (`read_header_line`) exactly as a
+    /// real client would drive it — through `TcpStream`, not by calling
+    /// internal parsing functions directly — since the bug this guards
+    /// against (unbounded growth reading the request line and headers off
+    /// the wire) only shows up at that layer.
+    fn send_raw(request: &[u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(State {
+            tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
+            live: Arc::new(crate::live::LiveStore::new()),
+            reach: Mutex::new(Reach::default()),
+            started: SystemTime::now(),
+            port: addr.port(),
+        });
+        std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle(&state, s);
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(request).unwrap();
+        let mut buf = Vec::new();
+        c.read_to_end(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[test]
+    fn an_over_long_request_line_is_rejected_without_unbounded_growth() {
+        // Comfortably past `MAX_HEADER_LINE_BYTES` (8 KiB), but small enough
+        // to fit in one write without needing a concurrent reader — this is
+        // about proving the *server* stops growing its buffer at the cap,
+        // not about proving TCP flow control.
+        let path = "/".to_string() + &"a".repeat(MAX_HEADER_LINE_BYTES + 1000);
+        let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+        let resp = send_raw(request.as_bytes());
+        assert!(resp.starts_with("HTTP/1.0 431"), "{resp}");
+        assert!(resp.contains("too large"), "{resp}");
+    }
+
+    #[test]
+    fn too_many_headers_is_rejected() {
+        let mut request = String::from("GET /api/status HTTP/1.1\r\n");
+        for i in 0..(MAX_HEADER_COUNT + 10) {
+            request.push_str(&format!("X-Custom-{i}: v\r\n"));
+        }
+        request.push_str("\r\n");
+        let resp = send_raw(request.as_bytes());
+        assert!(resp.starts_with("HTTP/1.0 431"), "{resp}");
+        assert!(resp.contains("too many headers"), "{resp}");
+    }
+
+    #[test]
+    fn a_well_formed_request_still_routes_normally_through_the_bounded_reader() {
+        let resp = send_raw(b"GET /api/status HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n");
+        assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
+        let body = resp.split("\r\n\r\n").nth(1).expect("a body after the headers");
+        let v: Value = serde_json::from_str(body).expect("a JSON status body");
+        assert_eq!(v["service"], SERVICE);
     }
 
     #[test]
