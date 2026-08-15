@@ -243,7 +243,6 @@
       <div class="pane-head">
         <h2>Command history</h2>
         <div class="filter-bar">
-          <button class="toggle" id="f-hooks" title="shell_safety fires on every Bash tool call and dominates by volume">hook traffic</button>
           <button class="toggle" id="f-failed">failures only</button>
           <select id="f-tool"><option value="">all tools</option></select>
           <select id="f-via"><option value="">all via</option></select>
@@ -289,11 +288,11 @@
   const checked = new Set();      // op ids ticked for copy
   let selectMode = false;
 
-  const filters = {
-    // shell_safety fires on every Bash tool call and will dominate by
-    // volume, so the view opens on what Claude deliberately did.
-    hooks: false, failed: false, tool: '', via: '', project: '',
-  };
+  // The view opens on everything. Hook traffic is high-volume — shell_safety
+  // fires on every Bash tool call — but hiding it by default made the history
+  // silently incomplete, and the `via` select already narrows to one source
+  // when that is what you want.
+  const filters = { failed: false, tool: '', via: '', project: '' };
 
   // ── Formatting ───────────────────────────────────────────────────────
   // Escapes quotes as well as markup: half of these values are interpolated
@@ -367,9 +366,6 @@
 
   // ── Filtering ────────────────────────────────────────────────────────
   function matches(o) {
-    // The hook toggle is a global exclusion, but an explicit `via: hook`
-    // choice is the user asking for it and wins.
-    if (!filters.hooks && filters.via !== 'hook' && o.via === 'hook') return false;
     if (filters.failed && o.ok) return false;
     if (filters.tool && o.tool !== filters.tool) return false;
     if (filters.via && (o.via || '') !== filters.via) return false;
@@ -682,7 +678,6 @@
     el.addEventListener('click', () => { filters[key] = !filters[key]; sync(); afterFilterChange(); });
     sync();
   }
-  bindToggle('f-hooks', 'hooks');
   bindToggle('f-failed', 'failed');
   for (const [id, key] of [['f-tool', 'tool'], ['f-via', 'via'], ['f-project', 'project']]) {
     $(id).addEventListener('change', e => { filters[key] = e.target.value; afterFilterChange(); });
@@ -948,9 +943,7 @@
     const row = e.target.closest('[data-kind]');
     if (!row) return;
     filters.failed = true;
-    filters.hooks = true;      // a failure is worth seeing wherever it came from
     $('f-failed').classList.add('on');
-    $('f-hooks').classList.add('on');
     afterFilterChange();
   });
 

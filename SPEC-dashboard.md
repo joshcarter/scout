@@ -478,9 +478,14 @@ project-scoped (it's a CLI that runs in any subdirectory), so the
 dashboard never narrows to `$PWD`. `project` is a column, shown when the
 visible rows span more than one; filters across the top are by tool, by
 `via`, by project, and failures-only.
-`shell_safety` will dominate by volume — default the `via:hook` filter
-to *off* so the view opens on what Claude deliberately did, with a
-toggle to bring hook traffic back in.
+`shell_safety` dominates by volume, and the first cut of this defaulted
+the `via:hook` filter to *off* so the view opened on what Claude
+deliberately did, with a toggle to bring hook traffic back in.
+**Reverted:** hiding the highest-volume source by default made the
+history quietly incomplete — a call you just watched happen was simply
+absent, with nothing on screen saying so, and the toggle only offered
+hook-only or hook-excluded rather than everything. The view now opens on
+all traffic; the `via` select already narrows to one source on demand.
 
 **Detail** (right column). The fully resolved system and user prompt,
 the raw model response, then usage, timings, model, project, and the
