@@ -12,7 +12,8 @@
 // in-memory body cache, in-flight rows overlaid on the log, and `/api/stream`
 // as SSE. Token streams (P5) and `find` internals (P4) reuse the same pipe.
 
-use crate::stats::{self, Outcome};
+use crate::record::Row;
+use crate::stats;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -111,115 +112,6 @@ fn rotated_path(path: &Path) -> PathBuf {
 /// The port, in precedence order: `--port`, `[dashboard] port`, 13001.
 fn resolve_port(flag: Option<u16>) -> u16 {
     flag.unwrap_or_else(|| crate::filter_config::load_dashboard().port)
-}
-
-// ── One log row ─────────────────────────────────────────────────────────────
-
-/// One parsed call-log line, always a current-schema (`"v":2`) one — see
-/// `Row::parse`, which drops anything older.
-#[derive(Debug, Clone)]
-struct Row {
-    id: String,
-    /// The operation this row belongs to — the grouping key, stamped by the
-    /// writer's ledger.  A row from before `op` was recorded falls back to its
-    /// own `id`, which makes it an operation of one; see `group_ops`.
-    op: String,
-    run: String,
-    ts: f64,
-    via: String,
-    tool: String,
-    preset: String,
-    attempt: u64,
-    project: Option<String>,
-    model: Option<String>,
-    endpoint: Option<String>,
-    input: Value,
-    kind: String,
-    summary: Option<String>,
-    raw_bytes: u64,
-    returned_bytes: u64,
-    tokens_in: u64,
-    tokens_out: u64,
-    ms: u64,
-    ok: bool,
-}
-
-impl Row {
-    /// Parse one line, or `None` if it is not a current-schema record.
-    ///
-    /// The dashboard reads only lines carrying `"v":2` — the shape that has
-    /// `id`, `op`, `via` and `input`.  Older lines are skipped rather than
-    /// padded out with synthesized identity and an empty `input`, which is
-    /// what made a pre-`input` record indistinguishable in the UI from a call
-    /// that genuinely had no arguments.  They stay in the log; `scout stats`
-    /// still counts them, and the dashboard simply has nothing to show for a
-    /// row whose arguments, prompt and response were never recorded.
-    fn parse(line: &str) -> Option<Row> {
-        let v: Value = serde_json::from_str(line).ok()?;
-        if v.get("v").and_then(Value::as_u64) != Some(2) {
-            return None;
-        }
-        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-        let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        let preset = s("preset").unwrap_or_else(|| "unknown".to_string());
-        let id = s("id")?;
-        let kind = v["outcome"]["kind"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| if ok { "ok" } else { "unknown" }.to_string());
-        Some(Row {
-            op: s("op").unwrap_or_else(|| id.clone()),
-            run: s("run").unwrap_or_else(|| id.clone()),
-            id,
-            ts: v.get("ts").and_then(Value::as_f64).unwrap_or(0.0),
-            via: s("via").unwrap_or_default(),
-            tool: s("tool").unwrap_or_else(|| preset.clone()),
-            preset,
-            attempt: v.get("attempt").and_then(Value::as_u64).unwrap_or(1),
-            project: s("project"),
-            model: s("model"),
-            endpoint: s("endpoint"),
-            input: v.get("input").cloned().unwrap_or_else(|| json!({})),
-            kind,
-            summary: v["outcome"]["summary"].as_str().map(str::to_string),
-            raw_bytes: n("raw_bytes"),
-            returned_bytes: n("returned_bytes"),
-            tokens_in: n("tokens_in"),
-            tokens_out: n("tokens_out"),
-            ms: n("ms"),
-            ok,
-        })
-    }
-
-    fn bypassed(&self) -> bool {
-        self.kind == Outcome::Bypassed.as_str()
-    }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "id": self.id,
-            "op": self.op,
-            "run": self.run,
-            "ts": self.ts,
-            "via": self.via,
-            "tool": self.tool,
-            "preset": self.preset,
-            "attempt": self.attempt,
-            "project": self.project,
-            "model": self.model,
-            "endpoint": self.endpoint,
-            "input": self.input,
-            "kind": self.kind,
-            "summary": self.summary,
-            "raw_bytes": self.raw_bytes,
-            "returned_bytes": self.returned_bytes,
-            "tokens_in": self.tokens_in,
-            "tokens_out": self.tokens_out,
-            "ms": self.ms,
-            "ok": self.ok,
-        })
-    }
 }
 
 // ── The tailing reader ──────────────────────────────────────────────────────
@@ -544,6 +436,14 @@ fn overview(tail: &Tail) -> Value {
 
 /// `/api/stats` — the `scout stats` table, as JSON.
 ///
+/// Nothing in this repo fetches it: `dashboard.html` uses `/api/call`,
+/// `/api/history`, `/api/status` and `/api/stream`, and no doc, hook or skill
+/// names it either.  It is here for a person with `curl` — the one view of the
+/// log you can get out of a running daemon without a browser — and it is kept
+/// rather than deleted because that is a real use and it costs one route arm.
+/// Do not read the parallel implementation below as an accident to be tidied
+/// away into `stats::parse_log`; see why not:
+///
 /// Recomputed from the in-memory rows rather than calling into `stats.rs`:
 /// that module's reader is file-based and prints, and re-reading 8 MB per poll
 /// to render a table the daemon already holds would be the one expensive thing
@@ -840,37 +740,6 @@ fn parse_query(query: &str) -> HashMap<String, String> {
     params
 }
 
-/// `/api/history` — operations, newest first.
-///
-/// `since` is the opaque `last_id` of the newest operation the caller already
-/// has.  An id that is no longer in the log — the caller slept through a
-/// rotation — falls back to a full page rather than an error, which is the only
-/// behavior that lets a browser tab recover on its own.
-fn row_from_live(r: &crate::live::LiveRow) -> Row {
-    Row {
-        id: r.id.clone(),
-        op: r.op.clone(),
-        run: r.run.clone(),
-        ts: r.ts,
-        via: r.via.clone(),
-        tool: r.tool.clone(),
-        preset: r.preset.clone(),
-        attempt: r.attempt,
-        project: r.project.clone(),
-        model: r.model.clone(),
-        endpoint: r.endpoint.clone(),
-        input: r.input.clone(),
-        kind: r.kind.clone(),
-        summary: r.summary.clone(),
-        raw_bytes: r.raw_bytes,
-        returned_bytes: r.returned_bytes,
-        tokens_in: r.tokens_in,
-        tokens_out: r.tokens_out,
-        ms: r.ms,
-        ok: r.ok,
-    }
-}
-
 /// Log rows plus any inflight rows the log has not yet absorbed.
 ///
 /// Reaping happens here because it is driven by what the log now contains.
@@ -882,9 +751,12 @@ fn merged_rows(tail: &Tail, live: &crate::live::LiveStore) -> Vec<Row> {
     live.reap(tail.rows.iter().map(|r| r.id.as_str()));
     let mut rows = tail.rows.clone();
     let have: std::collections::HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
+    // No conversion step: `live` synthesizes the same `record::Row` the log
+    // parses into.  This used to call `row_from_live`, twenty lines of
+    // field-by-field copying between two identical structs.
     for r in live.inflight_rows() {
         if !have.contains(&r.id) {
-            rows.push(row_from_live(&r));
+            rows.push(r);
         }
     }
     rows
@@ -929,6 +801,12 @@ fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
     history_with_live(tail, None, params)
 }
 
+/// `/api/history` — operations, newest first.
+///
+/// `since` is the opaque `last_id` of the newest operation the caller already
+/// has.  An id that is no longer in the log — the caller slept through a
+/// rotation — falls back to a full page rather than an error, which is the only
+/// behavior that lets a browser tab recover on its own.
 fn history_with_live(
     tail: &Tail,
     live: Option<&crate::live::LiveStore>,

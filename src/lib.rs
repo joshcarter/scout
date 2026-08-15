@@ -29,7 +29,7 @@
 //!   endpoint.
 //! * `source`, `render`, `edit` — search, human rendering, `$EDITOR` handoff.
 //! * `stats`, `live`, `dashboard` — the call log, its live IPC feed, and the
-//!   web view over both.
+//!   web view over both, over the one row type in `record`.
 //! * `classify_command`, `verify`, `run_cmd` — hook plumbing, subprocess
 //!   capture, and `scout run`.  (`scout task`, the other direct-to-model verb,
 //!   is a dozen lines in `cli` now that it shares `select::round_trip`; the
@@ -56,6 +56,10 @@ pub mod grep;
 pub(crate) mod live;
 pub mod mcp_server;
 pub mod presets;
+// The read-side row `dashboard` renders and `live` synthesizes.  It sits below
+// both so neither has to copy the other's fields; like `live`, it describes an
+// internal shape and nothing outside the crate speaks it.
+pub(crate) mod record;
 pub mod render;
 pub mod run_cmd;
 pub mod select;

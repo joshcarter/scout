@@ -148,8 +148,42 @@ impl Outcome {
     /// The v1 `ok` boolean, still written so a reader that predates `outcome`
     /// keeps working: did scout answer the caller?  A bypass and a
     /// "none relevant" verdict both did.
+    ///
+    /// The single home of that rule.  `live::apply_end` used to carry its own
+    /// copy of the list, which is a bug waiting for the next variant — it
+    /// parses the kind back into an `Outcome` and calls this instead.
     pub fn is_ok(self) -> bool {
         matches!(self, Outcome::Ok | Outcome::Bypassed | Outcome::NoneRelevant)
+    }
+
+    /// Every variant.  Exists so a test can sweep all of them rather than
+    /// restate a list that would drift the same way `is_ok`'s did; see
+    /// `all_lists_every_outcome`, which is what keeps this honest.
+    pub const ALL: &'static [Outcome] = &[
+        Outcome::Ok,
+        Outcome::Bypassed,
+        Outcome::NoneRelevant,
+        Outcome::EmptyResponse,
+        Outcome::ParseFailure,
+        Outcome::EndpointUnreachable,
+        Outcome::Timeout,
+        Outcome::HttpError,
+        Outcome::SubprocessTimeout,
+    ];
+}
+
+/// The inverse of `as_str`, for the one reader that gets an outcome back as a
+/// string: the live channel puts `as_str` on the wire, and the daemon has to
+/// return to the value to ask it anything.
+///
+/// `Err(())` for a string no `Outcome` produced — `live::ABANDONED`, or a kind
+/// from some future build.  There is nothing to say about such a value beyond
+/// "not one of ours", so the error carries nothing.
+impl std::str::FromStr for Outcome {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Outcome, ()> {
+        Outcome::ALL.iter().copied().find(|o| o.as_str() == s).ok_or(())
     }
 }
 
@@ -1078,6 +1112,40 @@ mod tests {
         assert_eq!(a["id"], b["id"], "id is minted once, at construction");
         assert_eq!(a["id"], rec.id);
         assert_ne!(a["id"], a["op"], "id and op are distinct next_id() calls");
+    }
+
+    #[test]
+    fn all_lists_every_outcome() {
+        // The compiler is the enforcement, not the loop.  Adding a tenth
+        // variant makes this `match` non-exhaustive and the crate stops
+        // building here, which is the moment to add it to `ALL` too — and
+        // `ALL` is what the sweep tests (`FromStr` below, and
+        // `live::apply_end_agrees_with_outcome_is_ok`) iterate.
+        for o in Outcome::ALL {
+            match o {
+                Outcome::Ok
+                | Outcome::Bypassed
+                | Outcome::NoneRelevant
+                | Outcome::EmptyResponse
+                | Outcome::ParseFailure
+                | Outcome::EndpointUnreachable
+                | Outcome::Timeout
+                | Outcome::HttpError
+                | Outcome::SubprocessTimeout => {}
+            }
+        }
+        assert_eq!(Outcome::ALL.len(), 9);
+    }
+
+    #[test]
+    fn every_outcome_survives_the_round_trip_through_its_string() {
+        // `live` puts `as_str` on the wire and parses it back to ask
+        // `is_ok`; a variant that did not round-trip would read as a failure.
+        for o in Outcome::ALL {
+            assert_eq!(o.as_str().parse::<Outcome>(), Ok(*o), "{} lost", o.as_str());
+        }
+        assert_eq!("abandoned".parse::<Outcome>(), Err(()), "a daemon-synthesized kind");
+        assert_eq!("".parse::<Outcome>(), Err(()));
     }
 
     #[test]

@@ -113,7 +113,7 @@ log carries, which is what makes reconciliation possible.
 
 | `kind` | Carries |
 |---|---|
-| `call.start` | tool, preset, via, project, model, resolved system + user prompt |
+| `call.start` | tool, preset, via, project, model, endpoint, resolved system + user prompt |
 | `call.token` | text delta (coalesced — below) |
 | `call.end` | full response, usage, ms, outcome |
 | `find.patterns` | round, guessed patterns |

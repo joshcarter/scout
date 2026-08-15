@@ -9,7 +9,12 @@
 //! Bodies and in-flight rows live only in the daemon's memory. A restart
 //! loses them; that is accepted.
 
-use crate::stats::{self, CallRecord};
+// The synthetic rows this module hands the history overlay are the same
+// `record::Row` the log parses into.  They used to be a `LiveRow` copy of it,
+// declared here "without creating a module cycle" — the cycle was real, the
+// copy was not the way out of it, and `record` is the leaf both sides share.
+use crate::record::Row;
+use crate::stats::{self, CallRecord, Outcome};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, ErrorKind};
@@ -181,6 +186,17 @@ fn emit_bytes(bytes: &[u8]) {
 }
 
 /// `call.start` — resolved prompts. No-op for a silent record.
+///
+/// `"v"` versions *this envelope* — the datagram on the socket — and has
+/// nothing to do with `stats.rs`'s `"v":2`, which versions a `calls.jsonl`
+/// record. Two formats, two things being versioned.
+///
+/// Changing the envelope's shape means restarting the dashboard: a freshly
+/// built scout emits to whatever daemon is already running, and there is no
+/// reader here that accepts both an old shape and a new one. That is a
+/// deliberate omission, not an oversight — scout has one user, who can
+/// relaunch the daemon, and a tolerant reader would be permanent weight
+/// carried for a transient.
 pub fn emit_start(rec: &CallRecord, system: &str, user: &str) {
     if rec.silent {
         return;
@@ -198,6 +214,12 @@ pub fn emit_start(rec: &CallRecord, system: &str, user: &str) {
         "via": rec.via,
         "project": rec.project,
         "model": rec.model,
+        // `endpoint` was read by `row_from_start` and never written here, so
+        // every live row carried `None` for it and the UI showed an em dash
+        // until the log poll replaced the row with the real one. Both the
+        // operation detail panel and the SSE path in `dashboard.html` render
+        // it, so the fix was to emit it, not to stop reading it.
+        "endpoint": rec.endpoint,
         "attempt": rec.attempt,
         "input": rec.input,
         "system": system,
@@ -589,32 +611,6 @@ pub struct Bodies {
     pub response: Option<String>,
 }
 
-/// A synthetic row the history overlay can render. Mirrors `dashboard::Row`
-/// without creating a module cycle.
-#[derive(Clone, Debug)]
-pub struct LiveRow {
-    pub id: String,
-    pub op: String,
-    pub run: String,
-    pub ts: f64,
-    pub via: String,
-    pub tool: String,
-    pub preset: String,
-    pub attempt: u64,
-    pub project: Option<String>,
-    pub model: Option<String>,
-    pub endpoint: Option<String>,
-    pub input: Value,
-    pub kind: String,
-    pub summary: Option<String>,
-    pub raw_bytes: u64,
-    pub returned_bytes: u64,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
-    pub ms: u64,
-    pub ok: bool,
-}
-
 pub struct LiveStore {
     inner: Mutex<Inner>,
     streams: AtomicUsize,
@@ -626,7 +622,7 @@ pub struct LiveStore {
 }
 
 struct Inner {
-    inflight: HashMap<String, LiveRow>,
+    inflight: HashMap<String, Row>,
     body_order: VecDeque<String>,
     bodies: HashMap<String, Bodies>,
     /// `op` → round → part name (`patterns` … `reflect`) → the event.
@@ -875,7 +871,7 @@ impl LiveStore {
         (inner.inflight.len() - abandoned, abandoned)
     }
 
-    pub fn inflight_rows(&self) -> Vec<LiveRow> {
+    pub fn inflight_rows(&self) -> Vec<Row> {
         self.lock().inflight.values().cloned().collect()
     }
 
@@ -963,9 +959,9 @@ fn opt_s(v: &Value, k: &str) -> Option<String> {
     v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
-fn row_from_start(v: &Value, id: &str) -> LiveRow {
+fn row_from_start(v: &Value, id: &str) -> Row {
     let op = opt_s(v, "op").unwrap_or_else(|| id.to_string());
-    LiveRow {
+    Row {
         id: id.to_string(),
         op,
         run: s(v, "run"),
@@ -989,16 +985,24 @@ fn row_from_start(v: &Value, id: &str) -> LiveRow {
     }
 }
 
-fn row_from_end(v: &Value, id: &str) -> LiveRow {
+fn row_from_end(v: &Value, id: &str) -> Row {
     let mut row = row_from_start(v, id);
     apply_end(&mut row, v);
     row
 }
 
-fn apply_end(row: &mut LiveRow, v: &Value) {
+fn apply_end(row: &mut Row, v: &Value) {
     if let Some(kind) = v["outcome"]["kind"].as_str() {
         row.kind = kind.to_string();
-        row.ok = kind == "ok" || kind == "bypassed" || kind == "none_relevant";
+        // Ask `Outcome`, never restate it.  This line used to spell out
+        // `kind == "ok" || "bypassed" || "none_relevant"` — a hand-copy of
+        // `Outcome::is_ok`'s list that a ninth variant would have silently
+        // desynchronized, and `SubprocessTimeout` was a ninth variant.
+        //
+        // A kind that is not an `Outcome` is not ok: `ABANDONED` is the one
+        // the daemon itself synthesizes, and anything else is a string no
+        // build of scout writes.
+        row.ok = matches!(kind.parse::<Outcome>(), Ok(o) if o.is_ok());
     }
     row.summary = v["outcome"]["summary"].as_str().map(str::to_string);
     row.ms = v.get("ms").and_then(Value::as_u64).unwrap_or(row.ms);
@@ -1081,6 +1085,63 @@ mod tests {
 
     fn rec(tool: &str) -> CallRecord {
         CallRecord::new(tool, tool)
+    }
+
+    /// The rule for "did scout answer the caller?" lives on `Outcome` and
+    /// must live nowhere else.
+    ///
+    /// `apply_end` used to restate `Outcome::is_ok`'s list as a string
+    /// comparison, so the two agreed only for as long as nobody added a
+    /// variant — and `SubprocessTimeout` was added.  This sweeps `Outcome::ALL`
+    /// (which `stats::all_lists_every_outcome` keeps complete, by making the
+    /// crate fail to build when a variant is missing) and demands the two
+    /// answers match for every one of them.
+    ///
+    /// Confirmed to catch the drift: with `apply_end` restored to the old
+    /// hand-written comparison and a tenth, successful variant added to
+    /// `Outcome`, this fails on that variant — `apply_end` reports `false`
+    /// where `is_ok` reports `true`.  Against the current code it passes.
+    #[test]
+    fn apply_end_agrees_with_outcome_is_ok() {
+        for o in Outcome::ALL {
+            let mut row = row_from_start(&json!({}), "x-1");
+            apply_end(&mut row, &json!({ "outcome": { "kind": o.as_str() } }));
+            assert_eq!(row.kind, o.as_str());
+            assert_eq!(row.ok, o.is_ok(), "apply_end disagrees about {}", o.as_str());
+        }
+    }
+
+    /// A kind no `Outcome` produces is not a success.  `ABANDONED` is the
+    /// daemon's own synthesis, so it is the case that actually occurs.
+    #[test]
+    fn a_kind_that_is_not_an_outcome_is_not_ok() {
+        for kind in [ABANDONED, "something_a_later_build_invented"] {
+            let mut row = row_from_start(&json!({}), "x-1");
+            apply_end(&mut row, &json!({ "outcome": { "kind": kind } }));
+            assert!(!row.ok, "{kind} must not read as a success");
+            assert_eq!(row.kind, kind);
+        }
+    }
+
+    /// `endpoint` was in the row and in the UI but never on the wire, so it
+    /// was `None` in every live row ever built.
+    #[test]
+    fn call_start_carries_the_endpoint_it_used() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        with_sock_env(&path, || {
+            emit_start(&rec("grep").endpoint("qwen3:27b", "http://localhost:11434/v1"), "s", "u");
+        });
+        let mut buf = vec![0u8; MAX_DGRAM];
+        let n = listener.recv(&mut buf).unwrap();
+        let ev: Value = serde_json::from_slice(&buf[..n]).unwrap();
+        assert_eq!(ev["endpoint"], "http://localhost:11434/v1");
+        assert_eq!(ev["model"], "qwen3:27b");
+
+        let row = row_from_start(&ev, "x-1");
+        assert_eq!(row.endpoint.as_deref(), Some("http://localhost:11434/v1"));
     }
 
     /// Two daemons, two sockets. With one shared path the interloper's
