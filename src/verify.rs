@@ -141,6 +141,12 @@ impl TimeoutKind {
 #[derive(Debug, Clone)]
 pub struct Capture {
     pub exit_ok: bool,
+    /// The child's own status code, or `None` when there was never one to
+    /// report: a command scout killed, one a signal killed, one that failed to
+    /// spawn.  `wrap` passes it through uninterpreted (docs/wrap-watch.md §3.1)
+    /// — `grep` exiting 1 and `diff` exiting 1 are not failures, and the
+    /// `exit_ok` boolean cannot say which 1 this was.
+    pub exit_code: Option<i32>,
     pub output: String,
     pub timed_out: Option<TimeoutKind>,
     pub elapsed: Duration,
@@ -233,6 +239,7 @@ pub fn capture_with_deadlines(
         Err(e) => {
             return Capture {
                 exit_ok: false,
+                exit_code: None,
                 output: format!("sh: failed to spawn: {e}"),
                 timed_out: None,
                 elapsed: started.elapsed(),
@@ -267,12 +274,14 @@ pub fn capture_with_deadlines(
     }
 
     let mut exit_ok = false;
+    let mut exit_code = None;
     let mut timed_out = None;
     let mut wait_error = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 exit_ok = status.success();
+                exit_code = status.code();
                 break;
             }
             Ok(None) => {}
@@ -312,6 +321,7 @@ pub fn capture_with_deadlines(
     if let Some(msg) = wait_error {
         return Capture {
             exit_ok: false,
+            exit_code: None,
             output: msg,
             timed_out: None,
             elapsed: started.elapsed(),
@@ -326,7 +336,7 @@ pub fn capture_with_deadlines(
     let mut output = format!("{stdout}\n{stderr}").trim().to_string();
     truncate_diagnostic(&mut output, max_output_bytes);
 
-    Capture { exit_ok, output, timed_out, elapsed: started.elapsed() }
+    Capture { exit_ok, exit_code, output, timed_out, elapsed: started.elapsed() }
 }
 
 /// Take a buffer lock, ignoring poisoning: a panicked reader loses its own
@@ -646,6 +656,7 @@ mod tests {
             MAX_OUTPUT_BYTES,
         );
         assert!(c.exit_ok, "expected exit 0");
+        assert_eq!(c.exit_code, Some(0));
         assert!(c.timed_out.is_none(), "a fast command must not report a deadline");
         assert!(c.output.contains("hello-from-capture"), "stdout not captured: {}", c.output);
     }
@@ -660,6 +671,7 @@ mod tests {
             MAX_OUTPUT_BYTES,
         );
         assert!(!c.exit_ok, "expected non-zero exit");
+        assert_eq!(c.exit_code, Some(1), "the real status, not just the boolean");
         assert!(c.timed_out.is_none(), "a non-zero exit is not a timeout");
         assert!(c.output.contains("error-text"), "stderr/stdout not captured: {}", c.output);
     }
@@ -687,6 +699,7 @@ mod tests {
             MAX_OUTPUT_BYTES,
         );
         assert!(!c.exit_ok, "expected timeout failure");
+        assert_eq!(c.exit_code, None, "a killed command never reported a status");
         assert_eq!(
             c.timed_out,
             Some(TimeoutKind::WallClock),

@@ -1,14 +1,16 @@
 // scout config loader.
 //
 // Single file, single format: `$XDG_CONFIG_HOME/scout/config.toml` (default
-// `~/.config/scout/config.toml`), `[llm]` section. Override the whole file
-// path with `$SCOUT_CONFIG`.
+// `~/.config/scout/config.toml`), `[llm]`, `[spool]` and `[wrap]` sections.
+// Override the whole file path with `$SCOUT_CONFIG`.
 //
 // This is the sole config parser in scout, and deliberately so: two parsers
 // with independently drifting timeout clamps is a bug waiting to happen. The
 // clamp lives here, once, at 1s..3600s.
 
 use crate::client::Config;
+use crate::spool::SpoolConfig;
+use crate::wrap::WrapConfig;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -210,6 +212,102 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     })
 }
 
+/// Parse a `SpoolConfig` from the `[spool]` section of `path`.
+///
+/// Strict where it can be and permissive where the alternative would be
+/// useless: both keys have defaults, so a missing file and a missing section
+/// are simply "the defaults" — `scout gc` has to work before anyone has
+/// written a config, and the spool is not an LLM feature. What *is* an error
+/// is a key that is present and unusable: a wrong-typed or negative bound is a
+/// typo, and silently substituting a default for it is how a user ends up
+/// believing they raised a retention window they did not
+/// (docs/wrap-watch.md §2.3). Callers on the write path swallow the error and
+/// take the defaults anyway — a bad `[spool]` must never cost a command its
+/// result — but `scout gc` prints it, which is where a human will see it.
+pub fn load_spool_config(path: &Path) -> Result<SpoolConfig, String> {
+    let Some(root) = read_toml(path)? else {
+        return Ok(SpoolConfig::default());
+    };
+    let Some(section) = root.get("spool") else {
+        return Ok(SpoolConfig::default());
+    };
+
+    let defaults = SpoolConfig::default();
+    Ok(SpoolConfig {
+        max_age_days: bound(section, "spool", "max_age_days", defaults.max_age_days)?,
+        max_total_bytes: bound(section, "spool", "max_total_bytes", defaults.max_total_bytes)?,
+    })
+}
+
+/// Parse a `WrapConfig` from the `[wrap]` section of `path`.
+///
+/// Strict, on the `[spool]` rule and for the `[spool]` reasons: every key has a
+/// default, so an absent file or section is simply the defaults, while a key
+/// that is present and unusable is a typo worth reporting rather than a
+/// silently-restored default. It rides this parser rather than
+/// `filter_config.rs` per docs/wrap-watch.md §7 and TODO.md's "Do the parser
+/// unification first" — a new section must not pick the lenient semantics by
+/// accident.
+///
+/// `wrap::run` swallows the error and takes the defaults anyway: a mistyped
+/// bound must never cost the caller the command's result (§3.5).
+pub fn load_wrap_config(path: &Path) -> Result<WrapConfig, String> {
+    let Some(root) = read_toml(path)? else {
+        return Ok(WrapConfig::default());
+    };
+    let Some(section) = root.get("wrap") else {
+        return Ok(WrapConfig::default());
+    };
+
+    let defaults = WrapConfig::default();
+    Ok(WrapConfig {
+        passthrough_max_lines: bound(
+            section,
+            "wrap",
+            "passthrough_max_lines",
+            defaults.passthrough_max_lines,
+        )?,
+        passthrough_max_bytes: bound(
+            section,
+            "wrap",
+            "passthrough_max_bytes",
+            defaults.passthrough_max_bytes,
+        )?,
+        model_input_bytes: bound(section, "wrap", "model_input_bytes", defaults.model_input_bytes)?,
+    })
+}
+
+/// The parsed config file, or `None` when there is no file at all.
+///
+/// Absent is not the same as unreadable, and only one of them is normal.
+/// `filter_config`'s `read_to_string(...).ok()` conflates the two, which is how
+/// a permission error there becomes an invisible reset to defaults (TODO.md,
+/// "Do the parser unification first").
+fn read_toml(path: &Path) -> Result<Option<toml::Value>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
+    };
+    toml::from_str(&content).map(Some).map_err(|e| format!("config parse error: {e}"))
+}
+
+/// One strictly-parsed non-negative bound from `section`.
+///
+/// Read as i64 and reject the negative rather than clamping it: unlike
+/// `[llm]`'s timeouts, which have a defensible floor, "minus one day of
+/// retention" has no reading at all — and `v as u64` on a negative would wrap
+/// to a bound that never fires.
+fn bound(section: &toml::Value, table: &str, key: &str, default: u64) -> Result<u64, String> {
+    match section.get(key) {
+        None => Ok(default),
+        Some(v) => match v.as_integer() {
+            Some(n) if n >= 0 => Ok(n.unsigned_abs()),
+            _ => Err(format!("config: [{table}] {key} must be a non-negative integer")),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +376,130 @@ mod tests {
         assert!(
             DEFAULT_CONFIG.contains("# stream = true"),
             "config.example.toml is the only place a user learns the knob exists"
+        );
+    }
+
+    // ── [spool] ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn spool_bounds_default_when_the_file_or_the_section_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // `scout gc` runs before anyone has written a config.
+        assert_eq!(
+            load_spool_config(&dir.path().join("nope.toml")).unwrap(),
+            SpoolConfig::default()
+        );
+        let path = write_config(&dir, "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n");
+        assert_eq!(load_spool_config(&path).unwrap(), SpoolConfig::default());
+        assert_eq!(SpoolConfig::default().max_age_days, 7, "docs/wrap-watch.md §2.3");
+        assert_eq!(SpoolConfig::default().max_total_bytes, 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn spool_bounds_parse_and_a_single_key_leaves_the_other_at_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load_spool_config(&write_config(&dir, "[spool]\nmax_age_days = 2\n")).unwrap();
+        assert_eq!(cfg.max_age_days, 2);
+        assert_eq!(cfg.max_total_bytes, SpoolConfig::default().max_total_bytes);
+
+        let cfg = load_spool_config(&write_config(
+            &dir,
+            "[spool]\nmax_age_days = 0\nmax_total_bytes = 1048576\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.max_age_days, 0, "zero is a valid bound: keep nothing");
+        assert_eq!(cfg.max_total_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn a_present_but_unusable_spool_bound_errors_rather_than_silently_defaulting() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["max_age_days = -1", "max_total_bytes = \"500MB\"", "max_age_days = 1.5"] {
+            let err = load_spool_config(&write_config(&dir, &format!("[spool]\n{bad}\n")))
+                .expect_err("an unusable bound must be reported");
+            assert!(err.contains("[spool]"), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn a_config_that_exists_but_cannot_be_read_is_reported_not_silently_defaulted() {
+        // /dev/null/config.toml is not "absent", it is unreadable, and the two
+        // must not report the same thing.
+        let err = load_spool_config(Path::new("/dev/null/config.toml"))
+            .expect_err("an unreadable config must be reported");
+        assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_the_spool_bounds() {
+        assert!(DEFAULT_CONFIG.contains("# max_age_days = 7"));
+        assert!(DEFAULT_CONFIG.contains("# max_total_bytes = 524288000"));
+        // The shipped default must be a config both parsers accept, and its
+        // commented-out values must be the defaults they claim to show.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(&dir, DEFAULT_CONFIG);
+        assert_eq!(load_spool_config(&path).unwrap(), SpoolConfig::default());
+    }
+
+    // ── [wrap] ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_bounds_default_when_the_file_or_the_section_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_wrap_config(&dir.path().join("nope.toml")).unwrap(), WrapConfig::default());
+        let path = write_config(&dir, "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n");
+        assert_eq!(load_wrap_config(&path).unwrap(), WrapConfig::default());
+        assert_eq!(WrapConfig::default().passthrough_max_lines, 200, "docs/wrap-watch.md §3.2");
+        assert_eq!(WrapConfig::default().passthrough_max_bytes, 16 * 1024);
+        assert_eq!(WrapConfig::default().model_input_bytes, 16 * 1024);
+    }
+
+    #[test]
+    fn wrap_bounds_parse_and_a_single_key_leaves_the_others_at_their_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg =
+            load_wrap_config(&write_config(&dir, "[wrap]\npassthrough_max_lines = 40\n")).unwrap();
+        assert_eq!(cfg.passthrough_max_lines, 40);
+        assert_eq!(cfg.passthrough_max_bytes, WrapConfig::default().passthrough_max_bytes);
+        assert_eq!(cfg.model_input_bytes, WrapConfig::default().model_input_bytes);
+
+        let cfg = load_wrap_config(&write_config(
+            &dir,
+            "[wrap]\npassthrough_max_lines = 0\npassthrough_max_bytes = 1\nmodel_input_bytes = 4096\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.passthrough_max_lines, 0, "zero is a valid bound: filter everything");
+        assert_eq!(cfg.passthrough_max_bytes, 1);
+        assert_eq!(cfg.model_input_bytes, 4096);
+    }
+
+    #[test]
+    fn a_present_but_unusable_wrap_bound_errors_rather_than_silently_defaulting() {
+        // The strict parser's rule, and the reason [wrap] rides it (TODO.md,
+        // "Do the parser unification first"): a typo must not read as a setting.
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "passthrough_max_lines = -1",
+            "model_input_bytes = \"16k\"",
+            "passthrough_max_bytes = 1.5",
+        ] {
+            let err = load_wrap_config(&write_config(&dir, &format!("[wrap]\n{bad}\n")))
+                .expect_err("an unusable bound must be reported");
+            assert!(err.contains("[wrap]"), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_the_wrap_bounds() {
+        // config.example.toml is the only place a user learns a knob exists.
+        assert!(DEFAULT_CONFIG.contains("# passthrough_max_lines = 200"));
+        assert!(DEFAULT_CONFIG.contains("# passthrough_max_bytes = 16384"));
+        assert!(DEFAULT_CONFIG.contains("# model_input_bytes = 16384"));
+        // ...and its commented-out values must be the defaults they claim.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_wrap_config(&write_config(&dir, DEFAULT_CONFIG)).unwrap(),
+            WrapConfig::default()
         );
     }
 

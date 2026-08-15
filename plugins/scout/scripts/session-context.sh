@@ -34,12 +34,15 @@ fi
 GUIDANCE="Prefer scout over raw Bash/Read/Grep for token-heavy work: it runs the job against a local model and only a short summary enters this conversation.
 
   check_output(command)    run a build/test command, get {ok, summary, first_error, suggested_next_step}. CLI: scout check \"<cmd>\"
+  wrap(command, question?) run any OTHER verbose command (git log/diff, docker logs, journalctl, curl, find over a big tree, long scripts) and get {exit_code, filtered, summary, answer, notable, lines_total, lines_dropped, bytes_total, raw_path}. CLI: scout wrap \"<cmd>\" [\"<question>\"]
   extract(file, question)  answer a specific question about a large file instead of reading it whole. CLI: scout extract <file> \"<question>\"
   grep(pattern, intent)    intent-filtered grep when a raw pattern match would return too many irrelevant hits. CLI: scout grep <pattern> \"<intent>\"
   scout task \"<prompt>\"                ad-hoc escape hatch straight to the local LLM
   scout run --preset <name> --arg k=v  raw preset invocation (used by hooks/scripts, e.g. quality_review, test_review)
 
-Those three are MCP tools; the names above are unqualified. Their full names carry a plugin-derived prefix (mcp__plugin_<plugin>_<server>__check_output). If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
+Those four are MCP tools; the names above are unqualified. Their full names carry a plugin-derived prefix (mcp__plugin_<plugin>_<server>__check_output). If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
+
+wrap is safe to guess with, and its filtering is recoverable. Output at or under ~200 lines comes back verbatim (filtered:false), so a wrong \"this will be long\" guess costs only the exec. When it does filter, the complete raw output is written to raw_path — a plain file, kept about a week — and the payload states how many lines were dropped. If the summary does not answer your question, Read raw_path (offset/limit) or ask extract(raw_path, question); do not re-run the command, which may be slow or non-idempotent. Build/test commands stay with check_output: it renders a verdict, wrap does retrieval.
 
 Where extract/grep pay: text no code index covers, and match sets too large to skim — logs and run output, generated or vendored trees, long prose and config, plus intent-filtering a big result set. If a structural code tool (LSP, tree-sitter indexer) is available, prefer it for indexed source: outlines, call graphs and \"find every caller\" have exact answers and need no model. See the scout skill for the full boundary.
 

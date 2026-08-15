@@ -1,7 +1,7 @@
 // Preset subsystem for scout.
 //
 // Presets are named, parameterized prompt templates stored as TOML files.
-// scout embeds its 8 built-in presets at compile time and advertises them
+// scout embeds its 9 built-in presets at compile time and advertises them
 // on the CLI (`scout run --preset <name>`) and, in a later step, as MCP
 // tools.
 //
@@ -109,12 +109,12 @@ pub struct ContextDef {
 
 // ── Built-in presets (embedded at compile time) ─────────────────────────────
 
-/// The 8 built-in presets, embedded so a binary-only install always has
-/// them. The last two, `find_patterns` and `find_reflect`
-/// (docs/search-cli.md §5), back `scout find`'s two model stages and are
-/// deliberately CLI-only.
+/// The 9 built-in presets, embedded so a binary-only install always has
+/// them. `find_patterns` and `find_reflect` (docs/search-cli.md §5) back
+/// `scout find`'s two model stages and are deliberately CLI-only.
 const BUILTIN_TOML: &[&str] = &[
     include_str!("../../presets/check_output.toml"),
+    include_str!("../../presets/wrap.toml"),
     include_str!("../../presets/shell_safety.toml"),
     include_str!("../../presets/extract.toml"),
     include_str!("../../presets/grep.toml"),
@@ -180,10 +180,13 @@ pub fn load(dir: &Path) -> Vec<Preset> {
 /// `quality_review`, `test_review`, `find_patterns`, `find_reflect`) are
 /// CLI-only by design.
 ///
+/// Order is the order `tools/list` advertises them in, so `wrap` sits next to
+/// the tool it generalizes.
+///
 /// It lives here rather than in `mcp_server.rs`, where it started, because the
 /// overlay below needs it: whether a preset is advertised to a model is what
 /// decides whether its schema is load-bearing.
-pub const MCP_PRESETS: &[&str] = &["check_output", "extract", "grep"];
+pub const MCP_PRESETS: &[&str] = &["check_output", "wrap", "extract", "grep"];
 
 /// Load the embedded built-in presets, then overlay any user presets found
 /// in `user_dir` (if given and it exists) — a user preset whose
@@ -259,7 +262,7 @@ fn inherit_mcp_schema(user: &mut Preset, shadowed: &Preset) {
     user.declared_input_schema = Some(schema);
 }
 
-/// Load the preset set scout uses everywhere: the 8 embedded built-ins,
+/// Load the preset set scout uses everywhere: the 9 embedded built-ins,
 /// overlaid with any user overrides from `config::config_dir()/presets/`
 /// — honors `$XDG_CONFIG_HOME`, default `~/.config/scout/presets/` —
 /// (or `$SCOUT_PRESET_DIR`, for tests and non-standard installs).

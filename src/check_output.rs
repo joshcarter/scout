@@ -322,6 +322,7 @@ mod tests {
         let ctx = offline_ctx(".");
         let capture = verify::Capture {
             exit_ok: false,
+            exit_code: None,
             output: "Compiling serde v1.0.197\n".to_string(),
             timed_out: Some(verify::TimeoutKind::Idle),
             elapsed: Duration::from_secs(140),

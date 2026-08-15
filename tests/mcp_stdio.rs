@@ -230,9 +230,13 @@ fn tools_list_advertises_the_expected_tool_set() {
         .collect();
 
     // Order is part of the contract only incidentally; membership is not. These
-    // four are what `MCP_PRESETS` plus the built-in `ping` produce, and a tool
+    // five are what `MCP_PRESETS` plus the built-in `ping` produce, and a tool
     // silently dropping off this list is the failure this test exists to catch.
-    assert_eq!(names, vec!["ping", "check_output", "extract", "grep"], "advertised tools changed");
+    assert_eq!(
+        names,
+        vec!["ping", "check_output", "wrap", "extract", "grep"],
+        "advertised tools changed"
+    );
 }
 
 #[test]
@@ -287,6 +291,7 @@ fn each_tools_required_args_match_what_its_handler_reads() {
     // it and the tool fails at call time with no schema violation to point at.
     for (tool, required) in [
         ("check_output", vec!["command"]),
+        ("wrap", vec!["command"]),
         ("extract", vec!["file", "question"]),
         ("grep", vec!["pattern", "intent"]),
     ] {

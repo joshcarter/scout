@@ -24,8 +24,12 @@ fn main() -> anyhow::Result<()> {
         Command::Check { command, cwd, timeout_seconds, project } => {
             cli::run_check(&command, cwd.as_deref(), timeout_seconds, project)
         }
+        Command::Wrap { command, question, cwd, timeout, project } => {
+            cli::run_wrap(&command, question.as_deref(), cwd.as_deref(), timeout, project)
+        }
         Command::ClassifyCommand => classify_command::run_subcommand(),
         Command::Stats => stats::print_report(),
+        Command::Gc { all } => cli::run_gc(all),
         Command::Dashboard(args) => dashboard::run(&args),
     }
 }

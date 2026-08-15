@@ -45,6 +45,10 @@ pub struct Row {
     pub summary: Option<String>,
     pub raw_bytes: u64,
     pub returned_bytes: u64,
+    /// The spool blob behind a filtered result, when the writer recorded one
+    /// (docs/wrap-watch.md §6).  Absent on every row that filtered nothing,
+    /// which is most of them.
+    pub raw_path: Option<String>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub ms: u64,
@@ -91,6 +95,7 @@ impl Row {
             summary: v["outcome"]["summary"].as_str().map(str::to_string),
             raw_bytes: n("raw_bytes"),
             returned_bytes: n("returned_bytes"),
+            raw_path: s("raw_path"),
             tokens_in: n("tokens_in"),
             tokens_out: n("tokens_out"),
             ms: n("ms"),
@@ -120,6 +125,7 @@ impl Row {
             "summary": self.summary,
             "raw_bytes": self.raw_bytes,
             "returned_bytes": self.returned_bytes,
+            "raw_path": self.raw_path,
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
             "ms": self.ms,

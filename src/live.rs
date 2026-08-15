@@ -964,6 +964,7 @@ fn row_from_start(v: &Value, id: &str) -> Row {
         summary: None,
         raw_bytes: 0,
         returned_bytes: 0,
+        raw_path: opt_s(v, "raw_path"),
         tokens_in: 0,
         tokens_out: 0,
         ms: 0,

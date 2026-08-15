@@ -219,6 +219,10 @@ pub fn input_summary(preset: &str, args: &Value) -> Value {
 
     match preset {
         "check_output" | "shell_safety" => put_str(&mut m, "command", "command"),
+        "wrap" => {
+            put_str(&mut m, "command", "command");
+            put_str(&mut m, "question", "question");
+        }
         "extract" => {
             put_str(&mut m, "file", "file");
             put_str(&mut m, "question", "question");
@@ -266,6 +270,10 @@ pub struct CallRecord {
     pub summary: Option<String>,
     pub raw_bytes: Option<u64>,
     pub returned_bytes: Option<u64>,
+    /// Where the full captured output was spooled, for a call that filtered one
+    /// (docs/wrap-watch.md §6).  It joins the row rather than living only in the
+    /// payload so the dashboard gets raw-output drill-down for free.
+    pub raw_path: Option<String>,
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub ms: u64,
@@ -295,6 +303,7 @@ impl CallRecord {
             summary: None,
             raw_bytes: None,
             returned_bytes: None,
+            raw_path: None,
             tokens_in: 0,
             tokens_out: 0,
             ms: 0,
@@ -372,6 +381,14 @@ impl CallRecord {
         self
     }
 
+    /// The spool blob this call's payload was condensed from
+    /// (docs/wrap-watch.md §2.1).  Set only when the spool write succeeded —
+    /// a row must never name a path that does not exist.
+    pub fn raw_path(mut self, path: &Path) -> Self {
+        self.raw_path = Some(path.display().to_string());
+        self
+    }
+
     /// Serialize to the on-disk shape.  Absent fields are omitted rather than
     /// written as null: the log is read far more often than it is written, and
     /// an absent field is unambiguous.
@@ -389,9 +406,12 @@ impl CallRecord {
         m.insert("tool".into(), Value::from(self.tool.clone()));
         m.insert("preset".into(), Value::from(self.preset.clone()));
         m.insert("attempt".into(), Value::from(self.attempt));
-        for (key, value) in
-            [("project", &self.project), ("model", &self.model), ("endpoint", &self.endpoint)]
-        {
+        for (key, value) in [
+            ("project", &self.project),
+            ("model", &self.model),
+            ("endpoint", &self.endpoint),
+            ("raw_path", &self.raw_path),
+        ] {
             if let Some(v) = value {
                 m.insert(key.into(), Value::from(v.clone()));
             }
@@ -843,7 +863,10 @@ fn parse_log(path: &Path) -> std::io::Result<Report> {
 
 /// Byte counts a human reads at a glance — the context-saved line is the whole
 /// point of the report and `18874368 → 219136` is not a number anyone parses.
-fn human_bytes(n: u64) -> String {
+///
+/// `pub(crate)` for `scout gc`, which reports spool bytes and has no business
+/// growing a second opinion about how to spell a megabyte.
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [(u64, &str); 3] = [(1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")];
     for (scale, unit) in UNITS {
         if n >= scale {

@@ -20,7 +20,7 @@
 //!
 //! * `cli` — the clap definition and the terminal-only rendering on top of it.
 //! * `mcp_server` — the same pipelines, served over stdio to Claude Code.
-//! * `check_output`, `extract`, `grep`, `find` — the four filter pipelines.
+//! * `check_output`, `wrap`, `extract`, `grep`, `find` — the filter pipelines.
 //!   Each takes a `select::Ctx` and a JSON argument object and returns a
 //!   payload, so the CLI and the MCP server run identical code.
 //! * `select` — the shared LLM round-trip (`round_trip`, which `scout run` and
@@ -64,5 +64,13 @@ pub mod render;
 pub mod run_cmd;
 pub mod select;
 pub mod source;
+// The raw spool: the full captured output behind a filtered result, so the
+// caller can escalate past the summary without re-running the command
+// (docs/wrap-watch.md §2).
+pub mod spool;
 pub mod stats;
 pub mod verify;
+// Run any verbose command and return its output condensed, with the full
+// capture spooled (docs/wrap-watch.md §3).  `check_output`'s sibling: same
+// capture, different job — retrieval rather than a verdict.
+pub mod wrap;

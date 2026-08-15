@@ -8,11 +8,19 @@ files and search results without dumping them into the big model's
 context.
 
 **Status: working, pre-1.0.** The MCP server exposes `check_output`,
-`extract` and `grep` (plus `ping` for wiring checks); the PreToolUse
-hooks that steer Claude Code toward them are in place; the CLI covers
-`grep` / `find` / `edit` / `extract` / `check` / `task`; and `scout
-dashboard` serves a local web view of everything the local model has
-been asked. Design records for each of those live in [`docs/`](docs/).
+`wrap`, `extract` and `grep` (plus `ping` for wiring checks); the
+PreToolUse hooks that steer Claude Code toward them are in place; the
+CLI covers `grep` / `find` / `edit` / `extract` / `check` / `wrap` /
+`task`; and `scout dashboard` serves a local web view of everything the
+local model has been asked. Design records for each of those live in
+[`docs/`](docs/).
+
+`wrap` is the general form of `check_output`: run any verbose command —
+`git log`, `docker logs`, `curl` — and get a condensed result instead of
+the scrollback. Where `check_output` renders a verdict on a build,
+`wrap` retrieves; the full raw output is kept on disk at the `raw_path`
+it returns, so a summary that missed something is one read away from the
+truth rather than a re-run.
 
 ## Shape
 
@@ -25,8 +33,9 @@ been asked. Design records for each of those live in [`docs/`](docs/).
 - **CLI**: first-class human surface, same code path as the MCP tools:
   `scout grep <pattern> "<intent>"`, `scout find "<question>"`,
   `scout edit "<question>"`, `scout extract <file> "<question>"`,
-  `scout check "<build cmd>"`, `scout task "<prompt>"`, plus
-  `scout run --preset ...` for hooks and `scout stats`.
+  `scout check "<build cmd>"`, `scout wrap "<cmd>" ["<question>"]`,
+  `scout task "<prompt>"`, plus `scout run --preset ...` for hooks and
+  `scout stats`.
 
 `find` is the intent-only end of the search spectrum: state what you
 want and the local model guesses the patterns, scout runs every guess

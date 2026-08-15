@@ -1,14 +1,14 @@
 // MCP stdio server (rmcp 3.1).
 //
-// Four tools: `ping` (wiring check), plus the three that do the work —
-// `check_output`, `extract`, `grep`.  Short names on purpose: Claude Code
+// Five tools: `ping` (wiring check), plus the four that do the work —
+// `check_output`, `wrap`, `extract`, `grep`.  Short names on purpose: Claude Code
 // prefixes them with the server namespace on its own, so what the model sees is
 // `mcp__plugin_<plugin>_<server>__check_output`.  Nothing on this side should
 // hardcode that qualified form (see CLAUDE.md) — it is derived from names this code
 // never reads, and the model resolves it via `ToolSearch` anyway.
 //
 // `ServerHandler` is implemented by hand rather than via `#[tool_router]` /
-// `#[tool_handler]`: the three real tools advertise the `description` and
+// `#[tool_handler]`: the four real tools advertise the `description` and
 // `input_schema` written in their preset TOMLs, which are loaded at runtime
 // and cannot be baked into a macro attribute.  One steering surface, one
 // source of truth — editing a preset changes what the model is told about it.
@@ -119,6 +119,7 @@ impl Scout {
         };
         let result = match tool {
             "check_output" => crate::check_output::run(&ctx, args),
+            "wrap" => crate::wrap::run(&ctx, args),
             "extract" => crate::extract::run(&ctx, args),
             "grep" => crate::grep::run(&ctx, args),
             other => Err(crate::select::ToolError::new(
@@ -278,9 +279,9 @@ mod tests {
     }
 
     #[test]
-    fn advertises_ping_and_the_three_filters() {
+    fn advertises_ping_and_the_four_filters() {
         let names: Vec<String> = server().tools().iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(names, vec!["ping", "check_output", "extract", "grep"]);
+        assert_eq!(names, vec!["ping", "check_output", "wrap", "extract", "grep"]);
     }
 
     #[test]
@@ -297,6 +298,7 @@ mod tests {
         let tools = server().tools();
         for (name, required) in [
             ("check_output", vec!["command"]),
+            ("wrap", vec!["command"]),
             ("extract", vec!["file", "question"]),
             ("grep", vec!["pattern", "intent"]),
         ] {

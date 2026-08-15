@@ -151,6 +151,47 @@ model = "qwen3:27b"
 # call log. A daemon restart loses them; that is accepted. The persist_bodies
 # sidecar is a later, opt-in phase.
 
+# The raw spool — the full captured output behind every filtered result,
+# kept under ${XDG_CACHE_HOME:-~/.cache}/scout/raw/ so a summary that
+# dropped the one line you needed is a Read away instead of a re-run.
+# Cache, not state: disposable by design, unlike the call log.
+#
+# Pruned on every write and by `scout gc`, which needs no daemon and no
+# cron: blobs past max_age_days go first, then the oldest remaining until
+# the total is back under max_total_bytes. Expiry is a clean failure — a
+# reader arriving late gets file-not-found, which is honest — so the
+# window only has to comfortably outlive a working session.
+# `scout gc --all` empties the spool outright.
+#
+# Parsed strictly, like [llm] and unlike the filter tables above: a bound
+# that is present but not a non-negative integer is an error, not a
+# silently-restored default.
+
+[spool]
+# max_age_days = 7
+# max_total_bytes = 524288000
+
+# `wrap` — run any verbose command and get its output condensed, with the
+# full capture spooled to the raw path above. Parsed strictly, like [llm]
+# and [spool]: a bound that is present but not a non-negative integer is an
+# error, not a silently-restored default. A [wrap] scout cannot parse is
+# ignored on the write path all the same — a mistyped tunable must never be
+# why a command's result is lost.
+
+[wrap]
+# Output at or under *both* of these is returned whole and unfiltered: no
+# model call, nothing spooled, nothing dropped. That is what makes guessing
+# wrong about "this will be verbose" cost only the exec. The byte cap sits
+# alongside the line count because twenty 4 KB lines are not short.
+# passthrough_max_lines = 200
+# passthrough_max_bytes = 16384
+
+# How much of the capture the local model is shown, head+tail elided. The
+# spool always gets everything that was captured, however little of it the
+# model saw — the elision is a prompt-budget decision, the spool is ground
+# truth, and `raw_path` is what makes filtering recoverable.
+# model_input_bytes = 16384
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.

@@ -560,28 +560,69 @@ pub fn round_trip(
 /// one call-log row (docs/dashboard.md §3) via the context's ledger, which is
 /// what makes a `find`'s internal rounds visible as themselves.
 pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String, String> {
-    let client = ctx.require_client()?;
-    let preset = ctx.preset(preset_name)?;
     // Before `ctx.record`, deliberately: a context provider that failed means
     // there is no call to log, and no half-built prompt to send.
-    let (system, user) = presets::resolve(preset, args, &ctx.project)?;
+    let (client, system, user) = prepare(ctx, preset_name, args)?;
 
     let (rec, result) = round_trip(client, ctx.record(preset_name, args), &system, &user);
-    let empty = rec.outcome == crate::stats::Outcome::EmptyResponse;
+    let reply = reply_of(&rec, result);
     ctx.ledger.record(rec);
+    reply
+}
+
+/// `call_preset` for a caller that minted the record itself and parks it itself.
+///
+/// `wrap` needs both.  Its spool blob is named after the record's id
+/// (docs/wrap-watch.md §2.1) and is written *before* the model is asked
+/// anything, so the id has to exist first; and its fail-open path answers the
+/// caller with a payload rather than an error (§3.5), so it owns the row on
+/// every path — including the one where the call was never made, which
+/// `call_preset` deliberately leaves unlogged.  The record comes back untouched
+/// in that case, for the caller to stamp.
+pub fn call_preset_recorded(
+    ctx: &Ctx,
+    preset_name: &str,
+    args: &Value,
+    rec: CallRecord,
+) -> (CallRecord, Result<String, String>) {
+    let (client, system, user) = match prepare(ctx, preset_name, args) {
+        Ok(prepared) => prepared,
+        Err(e) => return (rec, Err(e)),
+    };
+    let (rec, result) = round_trip(client, rec, &system, &user);
+    let reply = reply_of(&rec, result);
+    (rec, reply)
+}
+
+/// Everything one preset round-trip needs before it can be made: the endpoint,
+/// and the two rendered halves of the prompt.
+fn prepare<'a>(
+    ctx: &'a Ctx,
+    preset_name: &str,
+    args: &Value,
+) -> Result<(&'a LlmClient, String, String), String> {
+    let client = ctx.require_client()?;
+    let preset = ctx.preset(preset_name)?;
+    let (system, user) = presets::resolve(preset, args, &ctx.project)?;
+    Ok((client, system, user))
+}
+
+/// The filters' reading of one round-trip's result.
+///
+/// A reply of nothing is logged as `empty_response`, but the filters still see
+/// it as the empty string they always saw, because every one of them already
+/// handles it and two of them handle it better than an `Err` would.
+/// `parse_selector_json("")` is `None` and `parse_candidates("")` is empty, so
+/// an empty reply lands on the same degrade branch either way in `extract`,
+/// `grep`, `check_output` and `wrap` — an `Err` there would buy nothing but
+/// different wording.  In `find` it would buy a regression:
+/// `call_preset(...).map_err(fail)?` ends the whole search, so one empty
+/// patterns reply would kill a multi-round `find` that today notes the failure
+/// and tries the next round.
+fn reply_of(rec: &CallRecord, result: Result<String, LlmError>) -> Result<String, String> {
     match result {
         Ok(text) => Ok(text),
-        // A reply of nothing is now logged as `empty_response`, but the filters
-        // still see it as the empty string they always saw, because every one of
-        // them already handles it and two of them handle it better than an `Err`
-        // would.  `parse_selector_json("")` is `None` and `parse_candidates("")`
-        // is empty, so an empty reply lands on the same degrade branch either
-        // way in `extract`, `grep` and `check_output` — an `Err` there would buy
-        // nothing but different wording.  In `find` it would buy a regression:
-        // `call_preset(...).map_err(fail)?` ends the whole search, so one empty
-        // patterns reply would kill a multi-round `find` that today notes the
-        // failure and tries the next round.
-        Err(_) if empty => Ok(String::new()),
+        Err(_) if rec.outcome == crate::stats::Outcome::EmptyResponse => Ok(String::new()),
         Err(e) => Err(format!("local LLM call failed: {e}")),
     }
 }

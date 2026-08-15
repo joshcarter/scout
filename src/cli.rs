@@ -15,7 +15,7 @@
 use crate::client::LlmClient;
 use crate::{
     check_output, config, dashboard, edit, extract, filter_config, find, grep, presets, render,
-    select, source, stats,
+    select, source, spool, stats, wrap,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
@@ -178,6 +178,28 @@ pub enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Run any verbose command and return its output condensed.
+    ///
+    /// `check_output`'s general form (docs/wrap-watch.md §3): no verdict, no
+    /// advice — a faithful summary, the lines worth quoting verbatim, and the
+    /// full raw output spooled to `raw_path` so nothing is lost behind the
+    /// summary. Output at or under `[wrap] passthrough_max_lines` comes back
+    /// whole, unfiltered.
+    Wrap {
+        /// The command to run, e.g. "git log --stat -n 200".
+        command: String,
+        /// Optional question to steer the condensation.
+        question: Option<String>,
+        /// Working directory for the command (default: the project root).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Wall-clock ceiling in seconds (default 900, max 3600).
+        #[arg(long, value_name = "SECONDS", alias = "timeout-seconds")]
+        timeout: Option<u64>,
+        /// Project root (default: $PWD).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Classify a Bash command (read from stdin) as a build/test invocation.
     ///
     /// Hook-internal plumbing for hooks/prefer-local-llm.sh — deliberately not
@@ -188,6 +210,18 @@ pub enum Command {
     ClassifyCommand,
     /// Print the call log report (presets/tasks run so far).
     Stats,
+    /// Prune the raw spool: the same sweep every spooling write already does.
+    ///
+    /// Blobs past `[spool] max_age_days` go first, then the oldest remaining
+    /// until the spool is under `[spool] max_total_bytes`. Nothing here is
+    /// required for hygiene — the spool prunes itself on write
+    /// (docs/wrap-watch.md §2.3) — it is the manual handle for "reclaim it
+    /// now", and `--all` for "reclaim all of it".
+    Gc {
+        /// Empty the spool outright, ignoring both retention bounds.
+        #[arg(long)]
+        all: bool,
+    },
     /// Serve the local web view of the call log on 127.0.0.1:13001.
     ///
     /// Starts a detached daemon and prints the URL. Idempotent: if one is
@@ -354,6 +388,46 @@ pub fn run_check(
         &json!({ "command": command, "cwd": cwd, "timeout_seconds": timeout_seconds }),
         None,
     )
+}
+
+/// Handle `scout wrap` — the `wrap` pipeline, with the child's exit status
+/// passed on as scout's own.
+///
+/// docs/wrap-watch.md §8 left that leaning yes and it is decided yes: a wrapped
+/// command is the caller's command, and in a pipeline (`scout wrap "make -n" &&
+/// ...`) its status is the one that means something. scout's own failures — a
+/// bad argument, an unusable cwd — still exit 1, so the two are never confused:
+/// a payload printed means the command ran, and the code beside it is the
+/// command's.
+///
+/// It does not go through `run_filter` for exactly that reason; everything else
+/// about the run is identical.
+pub fn run_wrap(
+    command: &str,
+    question: Option<&str>,
+    cwd: Option<&str>,
+    timeout_seconds: Option<u64>,
+    project: Option<String>,
+) -> ! {
+    let args = json!({
+        "command": command,
+        "question": question,
+        "cwd": cwd,
+        "timeout_seconds": timeout_seconds,
+    });
+    match run_pipeline("wrap", "wrap", resolve_project(project), &args, false) {
+        Ok(payload) => {
+            println!("{}", pretty_json(&payload));
+            // A command scout killed, or one a signal killed, reported no
+            // status of its own; 1 is the honest stand-in for "did not exit 0".
+            let code = payload["exit_code"].as_i64().unwrap_or(1);
+            std::process::exit(i32::try_from(code).unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!("{}", e.text());
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Resolve `scout grep`'s flags against the `[cli]` / `[grep]` config tables
@@ -551,6 +625,7 @@ fn run_pipeline(
         "grep" => grep::run(&ctx, args),
         "find" => find::run(&ctx, args),
         "extract" => extract::run(&ctx, args),
+        "wrap" => wrap::run(&ctx, args),
         _ => check_output::run(&ctx, args),
     };
     // The payload's size is half the context-saved metric, and this is the
@@ -741,6 +816,31 @@ pub fn run_task(prompt: &str) -> ! {
     }
 }
 
+/// Handle `scout gc` — run the spool sweep and say what it freed.
+///
+/// Returns `Ok(())` even when nothing was deleted and when the spool does not
+/// exist at all: garbage collection has no failure mode a caller could act on,
+/// and a `[spool]` that will not parse is reported on stderr and then ignored,
+/// exactly as the write path ignores it (docs/wrap-watch.md §2.3).
+pub fn run_gc(all: bool) -> anyhow::Result<()> {
+    let cfg = config::load_spool_config(&config::config_path()).unwrap_or_else(|e| {
+        eprintln!("scout gc: {e}; using defaults");
+        spool::SpoolConfig::default()
+    });
+
+    let base = spool::cache_dir();
+    let swept = if all { spool::purge_in(&base) } else { spool::sweep_in(&base, &cfg) };
+
+    println!(
+        "scout gc: freed {} in {} file(s); {} left in {}",
+        stats::human_bytes(swept.bytes_freed),
+        swept.files_deleted,
+        stats::human_bytes(swept.bytes_remaining),
+        spool::raw_dir(&base).display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +883,47 @@ mod tests {
         assert!(Cli::try_parse_from(["scout", "task"]).is_err());
         let cli = Cli::try_parse_from(["scout", "task", "why is the sky blue"]).expect("parses");
         assert!(matches!(cli.command, Command::Task { prompt } if prompt == "why is the sky blue"));
+    }
+
+    #[test]
+    fn gc_defaults_to_the_bounded_sweep_and_takes_all_for_the_whole_spool() {
+        let bare = Cli::try_parse_from(["scout", "gc"]).expect("parses");
+        assert!(matches!(bare.command, Command::Gc { all: false }));
+        let all = Cli::try_parse_from(["scout", "gc", "--all"]).expect("parses");
+        assert!(matches!(all.command, Command::Gc { all: true }));
+    }
+
+    #[test]
+    fn wrap_takes_a_command_an_optional_question_and_the_check_style_flags() {
+        let cli = Cli::try_parse_from([
+            "scout",
+            "wrap",
+            "git log --stat",
+            "which commit changed the retry default?",
+            "--cwd",
+            "/tmp",
+            "--timeout",
+            "30",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Wrap { command, question, cwd, timeout, project } => {
+                assert_eq!(command, "git log --stat");
+                assert_eq!(question.as_deref(), Some("which commit changed the retry default?"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(timeout, Some(30));
+                assert_eq!(project, None);
+            }
+            _ => panic!("not the wrap subcommand"),
+        }
+
+        // The question is optional — a bare `scout wrap "<cmd>"` is the common
+        // shape — and `scout check`'s spelling of the deadline still works.
+        let bare =
+            Cli::try_parse_from(["scout", "wrap", "docker logs api", "--timeout-seconds", "5"])
+                .expect("parses");
+        assert!(matches!(bare.command, Command::Wrap { question: None, timeout: Some(5), .. }));
+        assert!(Cli::try_parse_from(["scout", "wrap"]).is_err(), "a command is required");
     }
 
     #[test]

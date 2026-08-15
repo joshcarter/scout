@@ -41,6 +41,29 @@ impl Sandbox {
         self.dir.path()
     }
 
+    /// The sandbox's `$XDG_CACHE_HOME`, which is where the raw spool lands
+    /// (docs/wrap-watch.md §2.1). Without the override in `scout()` below, a
+    /// test that filters anything would write blobs into the developer's own
+    /// `~/.cache/scout/raw/` and prune it on the way out.
+    pub fn cache(&self) -> PathBuf {
+        self.dir.path().join("cache")
+    }
+
+    /// Every blob currently in the sandbox's spool.
+    pub fn spooled(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(days) = std::fs::read_dir(self.cache().join("scout").join("raw")) else {
+            return out;
+        };
+        for day in days.flatten() {
+            if let Ok(entries) = std::fs::read_dir(day.path()) {
+                out.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// The directory the binary is run from — scout's "project".
     pub fn project(&self) -> PathBuf {
         self.dir.path().join("project")
@@ -84,6 +107,7 @@ impl Sandbox {
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_STATE_HOME", home.join(".state"))
+            .env("XDG_CACHE_HOME", self.cache())
             .env("XDG_RUNTIME_DIR", self.dir.path().join("run"))
             // An empty override directory, so the built-in presets compiled
             // into the binary are exactly what the test sees. Without this a
