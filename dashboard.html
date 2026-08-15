@@ -576,7 +576,14 @@
       html += '</div>';
     }
 
-    html += block('input', JSON.stringify(op.input, null, 2), false);
+    // `{}` renders as an empty block that reads like a bug rather than a fact,
+    // so say it in words. The reader drops pre-v2 records outright, so an empty
+    // input here really is "this call recorded no arguments" — see Row::parse.
+    if (!op.input || Object.keys(op.input).length === 0) {
+      html += block('input', 'no arguments recorded for this call.', true);
+    } else {
+      html += block('input', JSON.stringify(op.input, null, 2), false);
+    }
     const bodies = bodiesByRowId.get(r.id) || {};
     if (bodies.system || bodies.user) {
       html += block('system prompt', bodies.system || '', false);

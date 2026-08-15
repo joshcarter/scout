@@ -115,12 +115,8 @@ fn resolve_port(flag: Option<u16>) -> u16 {
 
 // ── One log row ─────────────────────────────────────────────────────────────
 
-/// One parsed call-log line.
-///
-/// A v1 line has none of the identity fields, so they are synthesized here
-/// rather than at every read site: a v1 row is its own operation, its `tool` is
-/// the only name it has (the preset), and its failure has no kind — the same
-/// `unknown` bucket `scout stats` puts it in.
+/// One parsed call-log line, always a current-schema (`"v":2`) one — see
+/// `Row::parse`, which drops anything older.
 #[derive(Debug, Clone)]
 struct Row {
     id: String,
@@ -149,15 +145,25 @@ struct Row {
 }
 
 impl Row {
-    /// Parse one line.  `fallback_id` is used only by v1 rows, which have no
-    /// identity of their own — see the struct's note.
-    fn parse(line: &str, fallback_id: &str) -> Option<Row> {
+    /// Parse one line, or `None` if it is not a current-schema record.
+    ///
+    /// The dashboard reads only lines carrying `"v":2` — the shape that has
+    /// `id`, `op`, `via` and `input`.  Older lines are skipped rather than
+    /// padded out with synthesized identity and an empty `input`, which is
+    /// what made a pre-`input` record indistinguishable in the UI from a call
+    /// that genuinely had no arguments.  They stay in the log; `scout stats`
+    /// still counts them, and the dashboard simply has nothing to show for a
+    /// row whose arguments, prompt and response were never recorded.
+    fn parse(line: &str) -> Option<Row> {
         let v: Value = serde_json::from_str(line).ok()?;
+        if v.get("v").and_then(Value::as_u64) != Some(2) {
+            return None;
+        }
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
         let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
         let preset = s("preset").unwrap_or_else(|| "unknown".to_string());
-        let id = s("id").unwrap_or_else(|| fallback_id.to_string());
+        let id = s("id")?;
         let kind = v["outcome"]["kind"]
             .as_str()
             .map(str::to_string)
@@ -237,6 +243,20 @@ struct Tail {
     reloads: u64,
     /// Rows dropped because they would not parse.
     parse_errors: u64,
+    /// Rows skipped because they predate the current record schema.  Counted
+    /// separately from `parse_errors` so a log with a long tail of old history
+    /// does not look corrupt on `/api/status`.
+    skipped_legacy: u64,
+}
+
+/// A line that parses as JSON but is not a current (`"v":2`) record.
+///
+/// Distinguishes "deliberately skipped" from "malformed" for the two counters
+/// above; `Row::parse` returns `None` for both.
+fn is_legacy_record(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .map(|v| v.get("v").and_then(Value::as_u64) != Some(2))
+        .unwrap_or(false)
 }
 
 /// `(dev, ino)` — the pair that identifies a file across a rename.
@@ -248,7 +268,15 @@ fn file_ident(meta: &std::fs::Metadata) -> (u64, u64) {
 
 impl Tail {
     fn new(path: PathBuf) -> Tail {
-        Tail { path, rows: Vec::new(), offset: 0, ident: None, reloads: 0, parse_errors: 0 }
+        Tail {
+            path,
+            rows: Vec::new(),
+            offset: 0,
+            ident: None,
+            reloads: 0,
+            parse_errors: 0,
+            skipped_legacy: 0,
+        }
     }
 
     /// Bring the in-memory rows up to date.  One `stat` when nothing changed,
@@ -269,8 +297,7 @@ impl Tail {
             return;
         }
         let from = self.offset;
-        let gen = format!("live:{from}");
-        let consumed = self.append_from(&self.path.clone(), from, &gen);
+        let consumed = self.append_from(&self.path.clone(), from);
         self.offset += consumed;
     }
 
@@ -283,17 +310,17 @@ impl Tail {
         self.offset = 0;
         self.parse_errors = 0;
         self.reloads += 1;
+        self.skipped_legacy = 0;
         let rotated = rotated_path(&self.path);
-        self.append_from(&rotated, 0, "prev");
-        let consumed = self.append_from(&self.path.clone(), 0, "live:0");
+        self.append_from(&rotated, 0);
+        let consumed = self.append_from(&self.path.clone(), 0);
         self.offset = consumed;
         self.ident = std::fs::metadata(&self.path).ok().map(|m| file_ident(&m));
     }
 
     /// Parse from `from` to EOF, returning the bytes of *complete* lines
-    /// consumed.  `gen` disambiguates the ids synthesized for v1 rows, which
-    /// carry none of their own.
-    fn append_from(&mut self, path: &Path, from: u64, gen: &str) -> u64 {
+    /// consumed.
+    fn append_from(&mut self, path: &Path, from: u64) -> u64 {
         let Ok(mut f) = std::fs::File::open(path) else { return 0 };
         if from > 0 && f.seek(SeekFrom::Start(from)).is_err() {
             return 0;
@@ -306,12 +333,15 @@ impl Tail {
         // record, and re-reading it next poll is free.
         let Some(end) = buf.iter().rposition(|b| *b == b'\n') else { return 0 };
         let text = String::from_utf8_lossy(&buf[..=end]);
-        for (i, line) in text.lines().enumerate() {
+        for line in text.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            match Row::parse(line, &format!("{gen}#{i}")) {
+            match Row::parse(line) {
                 Some(row) => self.rows.push(row),
+                // An older record is skipped on purpose, not broken — keep it
+                // out of the malformed count the status endpoint reports.
+                None if is_legacy_record(line) => self.skipped_legacy += 1,
                 None => self.parse_errors += 1,
             }
         }
@@ -507,6 +537,7 @@ fn overview(tail: &Tail) -> Value {
         "log_max_bytes": 8 * 1024 * 1024,
         "log_rotated": rotated_path(&tail.path).exists(),
         "parse_errors": tail.parse_errors,
+        "skipped_legacy": tail.skipped_legacy,
         "reloads": tail.reloads,
     })
 }
@@ -1413,7 +1444,7 @@ mod tests {
     use super::*;
 
     fn row(json: &str) -> Row {
-        Row::parse(json, "fallback").expect("fixture must parse")
+        Row::parse(json).expect("fixture must parse")
     }
 
     fn v2(id: &str, run: &str, ts: f64, extra: &str) -> String {
@@ -1424,29 +1455,45 @@ mod tests {
         .replace('\n', "")
     }
 
-    // ── Row parsing: both encodings ──────────────────────────────────────
+    // ── Row parsing ──────────────────────────────────────────────────────
 
     #[test]
-    fn a_v1_row_parses_with_synthesized_identity() {
-        // The six-field shape scout wrote before v2, integer ts and all.
-        let r = row(
-            r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#,
-        );
-        assert_eq!(r.id, "fallback", "a v1 row has no id of its own");
-        assert_eq!(r.op, "fallback", "...so it is its own operation");
-        assert_eq!(r.run, "fallback");
-        assert_eq!(r.tool, "grep", "the preset is the only name it has");
-        assert_eq!(r.kind, "ok");
-        assert_eq!(r.ts, 1_770_000_000.0, "an integer ts must not read as 0");
-        assert_eq!(r.tokens_in, 1840);
-        assert!(r.via.is_empty());
+    fn a_pre_v2_row_is_skipped_not_synthesized() {
+        // The six-field shape scout wrote before v2. It carries no `input`,
+        // no `id` and no `via`, and the panes have nothing to show for it —
+        // so the reader drops it rather than padding it out into a row whose
+        // empty `input` is indistinguishable from a call that had none.
+        let line =
+            r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#;
+        assert!(Row::parse(line).is_none());
+        assert!(is_legacy_record(line), "skipped on purpose, not malformed");
     }
 
     #[test]
-    fn a_v1_failure_lands_in_the_unknown_bucket() {
-        let r = row(r#"{"ts":1770000000,"preset":"grep","ok":false}"#);
-        assert_eq!(r.kind, "unknown", "the same bucket `scout stats` uses");
-        assert!(!r.ok);
+    fn a_malformed_line_is_not_mistaken_for_old_history() {
+        assert!(Row::parse("{not json").is_none());
+        assert!(!is_legacy_record("{not json"), "this one really is broken");
+    }
+
+    #[test]
+    fn skipped_and_malformed_lines_are_counted_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("calls.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"ts":1770000000,"preset":"grep","ok":true}"#,
+                "{not json",
+                v2("a-1", "a", 100.0, ""),
+            ),
+        )
+        .expect("write fixture");
+        let mut t = Tail::new(path);
+        t.reload();
+        assert_eq!(t.rows.len(), 1, "only the current-schema row is read");
+        assert_eq!(t.skipped_legacy, 1);
+        assert_eq!(t.parse_errors, 1);
     }
 
     #[test]
@@ -1472,7 +1519,9 @@ mod tests {
 
     #[test]
     fn a_bypassed_row_is_recognised_as_one() {
-        let r = row(r#"{"v":2,"preset":"extract","outcome":{"kind":"bypassed"},"ok":true,"ms":7}"#);
+        let r = row(
+            r#"{"v":2,"id":"x-1","preset":"extract","outcome":{"kind":"bypassed"},"ok":true,"ms":7}"#,
+        );
         assert!(r.bypassed());
         assert!(r.ok, "scout answered the caller — no model needed");
     }
@@ -1545,12 +1594,12 @@ mod tests {
 
     #[test]
     fn a_row_with_no_op_is_an_operation_of_one() {
-        // History written before `op` existed — and every v1 row, which has no
-        // identity at all.  Each stands alone rather than being guessed at.
+        // History written before `op` existed.  Each stands alone rather than
+        // being guessed at: `op` falls back to the row's own id.
         let rows: Vec<Row> = [
             v2("a-1", "a", 100.0, ""),
             v2("a-2", "a", 100.1, ""),
-            r#"{"ts":1770000000,"preset":"grep","ok":true}"#.to_string(),
+            r#"{"v":2,"id":"lone-1","ts":1770000000,"preset":"grep","ok":true}"#.to_string(),
         ]
         .iter()
         .map(|s| row(s))
