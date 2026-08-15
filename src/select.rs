@@ -277,6 +277,14 @@ pub struct SelectedRange {
 }
 
 impl SelectedRange {
+    /// Lines covered, inclusive of both ends.
+    ///
+    /// No `is_empty` to pair with it, which clippy asks for on exported types:
+    /// `validate_ranges` drops inverted and out-of-bounds selectors, so a
+    /// `SelectedRange` that exists covers at least one line and this can never
+    /// return 0.  An `is_empty` that is always `false` would invite a caller to
+    /// branch on something that never happens.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.end.saturating_sub(self.start) + 1
     }

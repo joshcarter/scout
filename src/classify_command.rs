@@ -49,7 +49,7 @@ pub(crate) struct Classification {
 /// Reads bytes and converts lossily rather than requiring UTF-8: a stray
 /// invalid byte in a command should still get classified, not fail the hook
 /// into its fail-open path.
-pub(crate) fn run_subcommand() -> anyhow::Result<()> {
+pub fn run_subcommand() -> anyhow::Result<()> {
     let mut raw = Vec::new();
     std::io::stdin().read_to_end(&mut raw)?;
     let command = String::from_utf8_lossy(&raw);

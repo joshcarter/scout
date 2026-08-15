@@ -5,6 +5,15 @@ edition = "2021"
 description = "Local-LLM scout for coding agents: classifies build/test output, screens shell commands, and answers targeted code questions so the cloud model doesn't have to."
 repository = "https://github.com/joshcarter/scout"
 
+# Everything lives in the library; the binary is argv parsing and dispatch.
+# The lib exists so integration tests can `use scout_llm::…` — see src/lib.rs.
+[lib]
+name = "scout_llm"
+path = "src/lib.rs"
+
+# The binary name is load-bearing and deliberately not the package name: the
+# hooks invoke `scout`, and `make build` copies target/release/scout into
+# plugins/scout/bin/scout.
 [[bin]]
 name = "scout"
 path = "src/main.rs"

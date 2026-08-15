@@ -89,7 +89,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 ///
 /// This function calls `std::process::exit` — it does not return.  All output
 /// goes to stdout (LLM response) or stderr (diagnostics).
-pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
+pub fn run_subcommand(raw_args: &[String]) -> ! {
     // Skip the "run" token if it's still present at the front.
     let tail: &[String] = if raw_args.first().map(|s| s.as_str()) == Some("run") {
         &raw_args[1..]
@@ -140,7 +140,7 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
 
     // Load presets from the same source the MCP server uses: embedded
     // built-ins overlaid with any user overrides.
-    let loaded = crate::load_presets();
+    let loaded = presets::load_presets();
     let preset = match loaded.iter().find(|p| p.name == preset_name) {
         Some(p) => p,
         None => {

@@ -172,6 +172,24 @@ pub fn load_all(user_dir: Option<&Path>) -> Vec<Preset> {
     presets
 }
 
+/// Load the preset set scout uses everywhere: the 8 embedded built-ins,
+/// overlaid with any user overrides from `config::config_dir()/presets/`
+/// — honors `$XDG_CONFIG_HOME`, default `~/.config/scout/presets/` —
+/// (or `$SCOUT_PRESET_DIR`, for tests and non-standard installs).
+///
+/// It belongs here, next to `load_all`, rather than in the binary root where
+/// it started: `mcp_server` and `run_cmd` both need it, and reaching up from a
+/// leaf service into `main.rs` inverted the dependency for the sake of one
+/// two-line convenience wrapper.
+pub fn load_presets() -> Vec<Preset> {
+    let user_dir = std::env::var("SCOUT_PRESET_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate::config::config_dir().join("presets"));
+    load_all(Some(&user_dir))
+}
+
 /// Execute a preset against the given caller args and project root.
 ///
 /// 1. For each context entry: substitute `${args.field}` in `_args` and extra

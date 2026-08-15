@@ -51,7 +51,7 @@ struct Scout {
 
 impl Scout {
     fn new() -> Self {
-        Scout { presets: Arc::new(crate::load_presets()) }
+        Scout { presets: Arc::new(crate::presets::load_presets()) }
     }
 
     fn ping(&self, message: Option<String>) -> String {
