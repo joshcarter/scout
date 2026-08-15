@@ -241,10 +241,20 @@ pub fn capture_with_deadlines(
 
     let mut readers = Vec::new();
     if let Some(pipe) = child.stdout.take() {
-        readers.push(spawn_reader(pipe, Arc::clone(&out_buf), Arc::clone(&last_output_ms), started));
+        readers.push(spawn_reader(
+            pipe,
+            Arc::clone(&out_buf),
+            Arc::clone(&last_output_ms),
+            started,
+        ));
     }
     if let Some(pipe) = child.stderr.take() {
-        readers.push(spawn_reader(pipe, Arc::clone(&err_buf), Arc::clone(&last_output_ms), started));
+        readers.push(spawn_reader(
+            pipe,
+            Arc::clone(&err_buf),
+            Arc::clone(&last_output_ms),
+            started,
+        ));
     }
 
     let mut exit_ok = false;

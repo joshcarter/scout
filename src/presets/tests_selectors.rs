@@ -24,7 +24,10 @@ const EXTRACT_TOML: &str = include_str!("../../presets/extract.toml");
 fn extract_toml_parses() {
     let preset = parse_builtin("extract", EXTRACT_TOML);
     assert_eq!(preset.name, "extract");
-    assert!(preset.context.is_empty(), "extract must have no context providers — caller injects everything");
+    assert!(
+        preset.context.is_empty(),
+        "extract must have no context providers — caller injects everything"
+    );
     assert!(preset.verify.is_none(), "extract is a selector preset, not a code-placement preset");
 }
 
@@ -52,7 +55,8 @@ fn extract_input_schema_advertises_only_caller_args() {
 #[test]
 fn extract_system_prompt_states_the_selector_contract() {
     let preset = parse_builtin("extract", EXTRACT_TOML);
-    let system = template::substitute_context(&preset.system_template, &std::collections::HashMap::new());
+    let system =
+        template::substitute_context(&preset.system_template, &std::collections::HashMap::new());
     // Schema braces survive the context pass verbatim.
     assert!(system.contains("\"ranges\""), "system: {system}");
     assert!(system.contains("\"not_found\""), "system: {system}");
@@ -104,7 +108,10 @@ const GREP_TOML: &str = include_str!("../../presets/grep.toml");
 fn grep_toml_parses() {
     let preset = parse_builtin("grep", GREP_TOML);
     assert_eq!(preset.name, "grep");
-    assert!(preset.context.is_empty(), "grep must have no context providers — caller injects everything");
+    assert!(
+        preset.context.is_empty(),
+        "grep must have no context providers — caller injects everything"
+    );
     assert!(preset.verify.is_none(), "grep is a selector preset, not a code-placement preset");
 }
 
@@ -122,10 +129,7 @@ fn grep_input_schema_advertises_only_caller_args() {
     let props = preset.input_schema()["properties"].as_object().expect("properties object");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(
-        keys,
-        vec!["globs", "intent", "max_hits", "pattern", "regex", "types", "types_not"]
-    );
+    assert_eq!(keys, vec!["globs", "intent", "max_hits", "pattern", "regex", "types", "types_not"]);
     assert!(!props.contains_key("hit_list"), "caller-injected arg must not be advertised");
     assert!(!props.contains_key("hits_considered"));
 
@@ -140,7 +144,8 @@ fn grep_input_schema_advertises_only_caller_args() {
 #[test]
 fn grep_system_prompt_states_the_selector_contract() {
     let preset = parse_builtin("grep", GREP_TOML);
-    let system = template::substitute_context(&preset.system_template, &std::collections::HashMap::new());
+    let system =
+        template::substitute_context(&preset.system_template, &std::collections::HashMap::new());
     assert!(system.contains("\"keep\""), "system: {system}");
     assert!(system.contains("\"none_relevant\""), "system: {system}");
     assert!(system.contains("INTENT, not the pattern"), "system: {system}");
@@ -171,7 +176,8 @@ fn grep_renders_injected_args() {
 #[test]
 fn grep_max_hits_defaults_when_caller_omits_it() {
     let preset = parse_builtin("grep", GREP_TOML);
-    let args = json!({"pattern": "x", "intent": "y", "hit_list": "[1] a.rs:1\n", "hits_considered": 20});
+    let args =
+        json!({"pattern": "x", "intent": "y", "hit_list": "[1] a.rs:1\n", "hits_considered": 20});
     let (_system, user) = resolve(&preset, &args, ".").unwrap();
     assert!(user.contains("Keep at most 10 hits"), "user: {user}");
 }

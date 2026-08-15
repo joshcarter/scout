@@ -125,7 +125,8 @@ fn render_hit(out: &mut String, hit: &Value, index: Option<(usize, usize)>, opts
         out.push_str(&format!("{file}:{line}"));
     }
     // Rerank mode only; the two bypass paths have no model verdict to show.
-    if let Some(why) = hit.get("why").and_then(Value::as_str).map(str::trim).filter(|w| !w.is_empty())
+    if let Some(why) =
+        hit.get("why").and_then(Value::as_str).map(str::trim).filter(|w| !w.is_empty())
     {
         out.push_str(&format!(" · {why}"));
     }

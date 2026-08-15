@@ -89,10 +89,7 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
         .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", abs.display()))?;
     if bytes.len() as u64 > max_bytes {
-        return Err(format!(
-            "{} is past the {max_bytes}-byte read cap",
-            abs.display()
-        ));
+        return Err(format!("{} is past the {max_bytes}-byte read cap", abs.display()));
     }
 
     if is_binary(&bytes) {
@@ -108,7 +105,8 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
 /// does not produce a final empty line, so the count matches what an editor
 /// reports.
 pub fn split_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
+    let mut lines: Vec<String> =
+        text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
     if lines.last().map(String::is_empty).unwrap_or(false) {
         lines.pop();
     }

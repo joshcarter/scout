@@ -89,11 +89,8 @@ pub fn socket_path() -> Option<PathBuf> {
 /// which knows nothing about ports — still finds the real daemon.
 pub fn socket_path_for(port: u16) -> Option<PathBuf> {
     let default = crate::filter_config::load_dashboard().port;
-    let name = if port == default {
-        DEFAULT_SOCKET_NAME.to_string()
-    } else {
-        format!("live-{port}.sock")
-    };
+    let name =
+        if port == default { DEFAULT_SOCKET_NAME.to_string() } else { format!("live-{port}.sock") };
     resolve_socket_path(&name)
 }
 
@@ -306,13 +303,7 @@ pub struct Coalescer<E: FnMut(&str, u64)> {
 
 impl<E: FnMut(&str, u64)> Coalescer<E> {
     pub fn new(interval: Duration, emit: E) -> Self {
-        Coalescer {
-            buf: String::new(),
-            index: 0,
-            last: std::time::Instant::now(),
-            interval,
-            emit,
-        }
+        Coalescer { buf: String::new(), index: 0, last: std::time::Instant::now(), interval, emit }
     }
 
     /// Append one delta, flushing if the window has closed or the buffer is
@@ -418,10 +409,7 @@ fn next_seq() -> u64 {
 }
 
 pub(crate) fn now_ts() -> f64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
 
 /// Shrink body fields until the serialized event fits in `MAX_DGRAM`.
@@ -600,8 +588,6 @@ pub fn socket_cstring(port: u16) -> Option<std::ffi::CString> {
     std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()
 }
 
-
-
 // ── Store ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
@@ -699,7 +685,9 @@ impl LiveStore {
     }
 
     pub fn release_stream(&self) {
-        self.streams.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1))).ok();
+        self.streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)))
+            .ok();
     }
 
     pub fn subscribe(&self) -> mpsc::Receiver<String> {
@@ -1314,10 +1302,7 @@ mod tests {
             for _ in 0..64 {
                 emit_start(&r, &fat, &fat);
             }
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "sender blocked on a full buffer"
-            );
+            assert!(start.elapsed() < Duration::from_secs(2), "sender blocked on a full buffer");
         });
     }
 

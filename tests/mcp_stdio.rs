@@ -121,10 +121,16 @@ impl McpServer {
             let line = match self.lines.recv_timeout(remaining) {
                 Ok(l) => l,
                 Err(RecvTimeoutError::Timeout) => {
-                    panic!("no response to {method:?} within {READ_TIMEOUT:?}{}", self.diagnostics())
+                    panic!(
+                        "no response to {method:?} within {READ_TIMEOUT:?}{}",
+                        self.diagnostics()
+                    )
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    panic!("scout mcp closed stdout before answering {method:?}{}", self.diagnostics())
+                    panic!(
+                        "scout mcp closed stdout before answering {method:?}{}",
+                        self.diagnostics()
+                    )
                 }
             };
             if line.trim().is_empty() {
@@ -216,8 +222,12 @@ fn tools_list_advertises_the_expected_tool_set() {
     handshake(&mut server);
 
     let result = server.request(2, "tools/list", json!({}));
-    let names: Vec<&str> =
-        result["tools"].as_array().expect("tools array").iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = result["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
 
     // Order is part of the contract only incidentally; membership is not. These
     // four are what `MCP_PRESETS` plus the built-in `ping` produce, and a tool
@@ -238,8 +248,9 @@ fn every_advertised_tool_carries_a_usable_input_schema() {
         let name = tool["name"].as_str().unwrap();
         let schema = &tool["inputSchema"];
         assert_eq!(schema["type"], "object", "{name}: schema is not an object schema: {schema}");
-        let props =
-            schema["properties"].as_object().unwrap_or_else(|| panic!("{name}: no properties: {schema}"));
+        let props = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: no properties: {schema}"));
         // `ping` is the only tool whose arguments are all optional; every other
         // tool with an empty property bag is unusable, and that is precisely
         // what a preset missing its `input_schema` produces — scout falls back
@@ -292,9 +303,9 @@ fn each_tools_required_args_match_what_its_handler_reads() {
         // must pass something with no indication of what.
         let props = schema["properties"].as_object().unwrap();
         for arg in required {
-            let prop = props
-                .get(arg)
-                .unwrap_or_else(|| panic!("{tool}: {arg} is required but has no property: {schema}"));
+            let prop = props.get(arg).unwrap_or_else(|| {
+                panic!("{tool}: {arg} is required but has no property: {schema}")
+            });
             assert!(
                 prop["description"].as_str().is_some_and(|d| !d.is_empty()),
                 "{tool}.{arg}: required with no description"
@@ -346,7 +357,11 @@ description = "A user's own wording for the grep tool, changing nothing about it
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert_eq!(required, vec!["pattern", "intent"], "schema-less override wiped the argument contract: {schema}");
+    assert_eq!(
+        required,
+        vec!["pattern", "intent"],
+        "schema-less override wiped the argument contract: {schema}"
+    );
     assert!(
         schema["properties"].as_object().is_some_and(|p| p.contains_key("pattern")),
         "grep advertised without a pattern property: {schema}"
@@ -369,7 +384,10 @@ fn the_server_shuts_down_when_its_stdin_closes() {
         match server.child.try_wait().expect("try_wait") {
             Some(_) => return,
             None if Instant::now() >= deadline => {
-                panic!("scout mcp still running {READ_TIMEOUT:?} after stdin closed{}", server.diagnostics())
+                panic!(
+                    "scout mcp still running {READ_TIMEOUT:?} after stdin closed{}",
+                    server.diagnostics()
+                )
             }
             None => std::thread::sleep(Duration::from_millis(25)),
         }

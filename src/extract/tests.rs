@@ -203,7 +203,8 @@ fn chunk_sel(
 
 #[test]
 fn merge_selections_single_chunk_passes_through() {
-    let merged = merge_selections(vec![chunk_sel(vec![sel_range(5, 9, 1)], Some("a"), false, 4)], 100);
+    let merged =
+        merge_selections(vec![chunk_sel(vec![sel_range(5, 9, 1)], Some("a"), false, 4)], 100);
     assert_eq!(merged.ranges.len(), 1);
     assert_eq!(merged.dropped_invalid, 4);
     assert_eq!(merged.answer.as_deref(), Some("a"));

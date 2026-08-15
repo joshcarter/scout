@@ -506,9 +506,7 @@ fn collect_globs(globs: &[String], dirs: &[String], exclude_dirs: &[String]) -> 
 /// `--project`, or `$PWD`.
 fn resolve_project(project: Option<String>) -> String {
     project.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string())
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
     })
 }
 
@@ -544,7 +542,8 @@ fn run_pipeline(
         tool: verb.to_string(),
         // Only the terminal paths want progress chatter, and only ever on
         // stderr — stdout carries the result and may be piped.
-        progress: progress.then(|| Box::new(|msg: &str| eprintln!("{msg}")) as select::ProgressSink),
+        progress: progress
+            .then(|| Box::new(|msg: &str| eprintln!("{msg}")) as select::ProgressSink),
         ..Default::default()
     };
 
@@ -626,7 +625,8 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
 /// through the pipeline: the payload already carries every counter a human
 /// wants, and keeping the derivation in one pure function makes it testable.
 fn grep_status(payload: &serde_json::Value, out: &GrepOutput) -> Vec<String> {
-    let num = |key: &str| payload.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let num =
+        |key: &str| payload.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
     let flag = |key: &str| payload.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false);
 
     let returned = payload.get("hits").and_then(|h| h.as_array()).map_or(0, Vec::len);
@@ -871,8 +871,10 @@ mod tests {
         assert_eq!(a.question, "where is config parsed?");
         assert_eq!(a.flags.r#type, vec!["rust"]);
         assert_eq!(a.flags.type_not, vec!["md"]);
-        assert_eq!(collect_globs(&a.flags.glob, &a.flags.dir, &a.flags.exclude_dir),
-                   vec!["src/**", "!vendor/**"]);
+        assert_eq!(
+            collect_globs(&a.flags.glob, &a.flags.dir, &a.flags.exclude_dir),
+            vec!["src/**", "!vendor/**"]
+        );
         assert_eq!(a.flags.max_hits, Some(5));
         assert_eq!(a.flags.context, Some(1));
         assert_eq!(a.flags.max_columns, Some(80));
@@ -891,7 +893,9 @@ mod tests {
         // made — neither exists on this verb.
         for flag in ["--no-filter", "--regex"] {
             match Cli::try_parse_from(["scout", "find", "a question", flag]) {
-                Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "flag: {flag}"),
+                Err(e) => {
+                    assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "flag: {flag}")
+                }
                 Ok(_) => panic!("find must not accept {flag}"),
             }
         }
@@ -922,7 +926,11 @@ mod tests {
         // ...and one attempt is singular, because a status line that says
         // "1 attempts" reads as a bug in the tool.
         let single = json!({"hits": [], "find_attempts": 1, "none_relevant": false});
-        assert!(grep_status(&single, &out)[0].contains("after 1 attempt —"), "{:?}", grep_status(&single, &out));
+        assert!(
+            grep_status(&single, &out)[0].contains("after 1 attempt —"),
+            "{:?}",
+            grep_status(&single, &out)
+        );
     }
 
     #[test]
@@ -953,7 +961,8 @@ mod tests {
     fn edit_takes_the_same_filter_flags_as_grep() {
         // The shared `SearchFlags` makes this structural; this pins it, and
         // pins that the arity positionals still land where they should.
-        let a = edit_args(&["load_config", "the toml parse", "-t", "rust", "--dir", "src", "-n", "5"]);
+        let a =
+            edit_args(&["load_config", "the toml parse", "-t", "rust", "--dir", "src", "-n", "5"]);
         assert_eq!(a.query.as_deref(), Some("load_config"));
         assert_eq!(a.intent.as_deref(), Some("the toml parse"));
         assert_eq!(a.flags.r#type, vec!["rust"]);

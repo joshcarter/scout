@@ -143,7 +143,9 @@ fn provider_file_read(args: &ProviderArgs) -> Result<String, String> {
     const MAX_BYTES: u64 = 1_048_576; // 1 MiB — guard against large/infinite files
     let mut file = std::fs::File::open(path).map_err(|e| format!("file_read '{path}': {e}"))?;
     let mut buf = Vec::with_capacity((MAX_BYTES + 1) as usize);
-    file.by_ref().take(MAX_BYTES + 1).read_to_end(&mut buf)
+    file.by_ref()
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| format!("file_read '{path}': {e}"))?;
     let truncated = buf.len() > MAX_BYTES as usize;
     if truncated {
@@ -262,10 +264,20 @@ fn run_bounded(
 
     let mut readers = Vec::new();
     if let Some(pipe) = child.stdout.take() {
-        readers.push(spawn_reader(pipe, Arc::clone(&out_buf), Arc::clone(&last_output_ms), started));
+        readers.push(spawn_reader(
+            pipe,
+            Arc::clone(&out_buf),
+            Arc::clone(&last_output_ms),
+            started,
+        ));
     }
     if let Some(pipe) = child.stderr.take() {
-        readers.push(spawn_reader(pipe, Arc::clone(&err_buf), Arc::clone(&last_output_ms), started));
+        readers.push(spawn_reader(
+            pipe,
+            Arc::clone(&err_buf),
+            Arc::clone(&last_output_ms),
+            started,
+        ));
     }
 
     let mut status = None;
@@ -435,11 +447,7 @@ mod tests {
     static EMPTY_NAMED: OnceLock<HashMap<String, serde_json::Value>> = OnceLock::new();
 
     fn empty_args(project_root: &str) -> ProviderArgs<'_> {
-        ProviderArgs {
-            positional: &[],
-            named: EMPTY_NAMED.get_or_init(HashMap::new),
-            project_root,
-        }
+        ProviderArgs { positional: &[], named: EMPTY_NAMED.get_or_init(HashMap::new), project_root }
     }
 
     #[test]
@@ -561,7 +569,8 @@ mod tests {
         let out = run_provider("file_read", &args).unwrap();
         assert!(
             out.contains("[file_read: output truncated at 1 MiB]"),
-            "file of MAX_BYTES+1 should be truncated: {}", &out[out.len().saturating_sub(80)..]
+            "file of MAX_BYTES+1 should be truncated: {}",
+            &out[out.len().saturating_sub(80)..]
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -622,7 +631,11 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert!(err.contains("wall_clock"), "expected the wall-clock kind: {err}");
-        assert!(start.elapsed() < Duration::from_secs(3), "deadline ignored: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "deadline ignored: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -639,7 +652,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("idle"), "expected the idle kind: {err}");
-        assert!(start.elapsed() < Duration::from_secs(3), "deadline ignored: {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "deadline ignored: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -706,7 +723,10 @@ mod tests {
         let marker = std::env::temp_dir().join("scout-flag-base-should-not-exist");
         let _ = std::fs::remove_file(&marker);
         let mut named = HashMap::new();
-        named.insert("base".to_string(), serde_json::json!(format!("--output={}", marker.display())));
+        named.insert(
+            "base".to_string(),
+            serde_json::json!(format!("--output={}", marker.display())),
+        );
         let args = ProviderArgs { positional: &[], named: &named, project_root: "." };
         for provider in ["git_diff_range", "git_diff_stat", "git_log_range"] {
             let err = run_provider(provider, &args).unwrap_err();

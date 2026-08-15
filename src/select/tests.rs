@@ -43,7 +43,8 @@ fn parses_prose_wrapped_json() {
 
 #[test]
 fn parses_json_after_think_block() {
-    let text = "<think>The user wants { braces } and mismatched } here</think>\n{\"keep\": [{\"id\": 2}]}";
+    let text =
+        "<think>The user wants { braces } and mismatched } here</think>\n{\"keep\": [{\"id\": 2}]}";
     let v = parse_selector_json(text).expect("think block should be stripped");
     assert_eq!(v["keep"][0]["id"], json!(2));
 }
@@ -143,12 +144,16 @@ fn overlapping_and_adjacent_ranges_merge() {
 #[test]
 fn ranges_exactly_merge_gap_apart_merge_but_one_more_does_not() {
     // [10,20] then [24,26]: gap = 3 (lines 21,22,23) -> merge.
-    let merged =
-        validate_ranges(&json!({"ranges": [{"start": 10, "end": 20}, {"start": 24, "end": 26}]}), 100);
+    let merged = validate_ranges(
+        &json!({"ranges": [{"start": 10, "end": 20}, {"start": 24, "end": 26}]}),
+        100,
+    );
     assert_eq!(merged.ranges.len(), 1);
     // [10,20] then [25,27]: gap = 4 -> separate.
-    let split =
-        validate_ranges(&json!({"ranges": [{"start": 10, "end": 20}, {"start": 25, "end": 27}]}), 100);
+    let split = validate_ranges(
+        &json!({"ranges": [{"start": 10, "end": 20}, {"start": 25, "end": 27}]}),
+        100,
+    );
     assert_eq!(split.ranges.len(), 2);
 }
 
@@ -293,7 +298,10 @@ fn ids_outside_the_batch_window_are_dropped() {
 
 #[test]
 fn tool_error_names_the_fallback_tool() {
-    let e = ToolError::new("scout grep: local LLM exploded", "the Grep tool for the unfiltered hit list");
+    let e = ToolError::new(
+        "scout grep: local LLM exploded",
+        "the Grep tool for the unfiltered hit list",
+    );
     let text = e.text();
     assert!(text.contains("Grep tool"), "fallback must be named: {text}");
     assert!(text.contains("fall back to"), "text: {text}");

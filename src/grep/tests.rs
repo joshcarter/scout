@@ -424,16 +424,15 @@ fn search_options_threads_the_filter_args_through() {
 
     // Empty arrays are the same as absent — a caller passing [] gets the
     // untouched walk, not a match-nothing filter.
-    let empty =
-        search_options(&cfg, false, root, &serde_json::json!({"types": [], "globs": [""]})).unwrap();
+    let empty = search_options(&cfg, false, root, &serde_json::json!({"types": [], "globs": [""]}))
+        .unwrap();
     assert!(empty.types.is_none() && empty.overrides.is_none());
 }
 
 #[test]
 fn a_bad_type_name_fails_open_rather_than_searching_nothing() {
     let ctx = offline_ctx(".");
-    let err =
-        run(&ctx, &serde_json::json!({"pattern": "needle", "types": ["rustt"]})).unwrap_err();
+    let err = run(&ctx, &serde_json::json!({"pattern": "needle", "types": ["rustt"]})).unwrap_err();
     let text = assert_fails_open(&err);
     assert!(text.contains("invalid file type"), "text: {text}");
 }

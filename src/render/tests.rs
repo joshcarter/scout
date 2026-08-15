@@ -219,13 +219,11 @@ fn body(out: &str) -> String {
 
 #[test]
 fn the_matched_pattern_is_highlighted_inside_the_matched_line() {
-    let out = render_human(&span_payload("abcNEEDLEdef", 3, 9), &RenderOpts { color: true, ..plain() });
+    let out =
+        render_human(&span_payload("abcNEEDLEdef", 3, 9), &RenderOpts { color: true, ..plain() });
     // Bold line, bold-red match, bold resumed after it — so the span never
     // reads as lighter than the line it sits in.
-    assert!(
-        out.contains("\x1b[1mabc\x1b[1;31mNEEDLE\x1b[0m\x1b[1mdef\x1b[0m"),
-        "{out:?}"
-    );
+    assert!(out.contains("\x1b[1mabc\x1b[1;31mNEEDLE\x1b[0m\x1b[1mdef\x1b[0m"), "{out:?}");
 }
 
 #[test]
@@ -339,7 +337,8 @@ fn a_match_wider_than_the_cap_is_shown_from_its_own_start() {
 #[test]
 fn a_cap_smaller_than_the_match_still_highlights_what_is_visible() {
     let text = format!("{}{}{}", "a".repeat(10), "X".repeat(100), "b".repeat(10));
-    let out = render_human(&span_payload(&text, 10, 110), &RenderOpts { color: true, ..capped(20) });
+    let out =
+        render_human(&span_payload(&text, 10, 110), &RenderOpts { color: true, ..capped(20) });
     // The whole window is match, so the highlight has no unhighlighted
     // neighbours inside it — but it is still painted.
     assert!(out.contains(&format!("\x1b[1;31m{}\x1b[0m", "X".repeat(20))), "{out:?}");
@@ -348,12 +347,10 @@ fn a_cap_smaller_than_the_match_still_highlights_what_is_visible() {
 #[test]
 fn the_highlight_survives_the_window_slice() {
     let text = format!("{}NEEDLE{}", "a".repeat(100), "b".repeat(100));
-    let out = render_human(&span_payload(&text, 100, 106), &RenderOpts { color: true, ..capped(20) });
+    let out =
+        render_human(&span_payload(&text, 100, 106), &RenderOpts { color: true, ..capped(20) });
     // Byte offsets 100..106 in the *line* become 7..13 in the window.
-    assert!(
-        out.contains("\x1b[1maaaaaaa\x1b[1;31mNEEDLE\x1b[0m\x1b[1mbbbbbbb\x1b[0m"),
-        "{out:?}"
-    );
+    assert!(out.contains("\x1b[1maaaaaaa\x1b[1;31mNEEDLE\x1b[0m\x1b[1mbbbbbbb\x1b[0m"), "{out:?}");
 }
 
 #[test]

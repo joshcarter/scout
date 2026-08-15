@@ -69,9 +69,12 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         // Logged, with no model behind it: an unlogged fast path is
         // indistinguishable from scout never having been called (§2).
         ctx.ledger.record(
-            ctx.record("extract", &serde_json::json!({
-                "file": resolved, "question": question, "file_lines": file_lines,
-            }))
+            ctx.record(
+                "extract",
+                &serde_json::json!({
+                    "file": resolved, "question": question, "file_lines": file_lines,
+                }),
+            )
             .outcome(crate::stats::Outcome::Bypassed)
             .summary("file is small enough to return whole")
             .ms(ctx.ledger.elapsed_ms()),
@@ -187,7 +190,12 @@ pub fn bypass_payload(resolved: &str, lines: &[String]) -> Value {
 }
 
 /// The model read the file and says it does not answer the question.
-fn not_found_payload(resolved: &str, file_lines: usize, question: &str, answer: Option<&str>) -> Value {
+fn not_found_payload(
+    resolved: &str,
+    file_lines: usize,
+    question: &str,
+    answer: Option<&str>,
+) -> Value {
     serde_json::json!({
         "mode": "extract",
         "file": resolved,

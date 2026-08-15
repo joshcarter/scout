@@ -30,7 +30,10 @@ fn parse_builtin(name: &str, source: &str) -> Preset {
 
 /// Render a preset with a pre-built context map, bypassing live providers.
 /// Equivalent to the Pass-2 half of resolve().
-fn render(preset: &Preset, context: &std::collections::HashMap<String, String>) -> (String, String) {
+fn render(
+    preset: &Preset,
+    context: &std::collections::HashMap<String, String>,
+) -> (String, String) {
     let system = template::substitute_context(&preset.system_template, context);
     let user = template::substitute_context(&preset.user_template, context);
     (system, user)
@@ -45,20 +48,36 @@ fn quality_review_toml_parses() {
     let preset = parse_builtin("quality_review", QUALITY_REVIEW_TOML);
     assert_eq!(preset.name, "quality_review");
     assert_eq!(preset.context.len(), 2);
-    let instr = preset.context.iter().find(|c| c.key == "review_instructions").expect("review_instructions context missing");
+    let instr = preset
+        .context
+        .iter()
+        .find(|c| c.key == "review_instructions")
+        .expect("review_instructions context missing");
     assert_eq!(instr.provider, "file_read");
-    assert!(instr.args.iter().any(|a| a.contains("${args.prompt_file}")), "prompt_file ref missing");
+    assert!(
+        instr.args.iter().any(|a| a.contains("${args.prompt_file}")),
+        "prompt_file ref missing"
+    );
     let diff = preset.context.iter().find(|c| c.key == "diff").expect("diff context missing");
     assert_eq!(diff.provider, "git_diff_range");
-    assert!(diff.args.iter().any(|a| a.contains("${args.git_diff_range}")), "git_diff_range ref missing");
+    assert!(
+        diff.args.iter().any(|a| a.contains("${args.git_diff_range}")),
+        "git_diff_range ref missing"
+    );
 }
 
 #[test]
 fn quality_review_input_schema_requires_both_args() {
     let preset = parse_builtin("quality_review", QUALITY_REVIEW_TOML);
     let required = preset.input_schema()["required"].as_array().expect("required array");
-    assert!(required.iter().any(|v| v.as_str() == Some("git_diff_range")), "should require git_diff_range");
-    assert!(required.iter().any(|v| v.as_str() == Some("prompt_file")), "should require prompt_file");
+    assert!(
+        required.iter().any(|v| v.as_str() == Some("git_diff_range")),
+        "should require git_diff_range"
+    );
+    assert!(
+        required.iter().any(|v| v.as_str() == Some("prompt_file")),
+        "should require prompt_file"
+    );
 }
 
 #[test]
@@ -72,12 +91,18 @@ fn quality_review_has_no_verify() {
 fn quality_review_renders_with_fixture() {
     let preset = parse_builtin("quality_review", QUALITY_REVIEW_TOML);
     let mut ctx = std::collections::HashMap::new();
-    ctx.insert("review_instructions".to_string(), "## Code Quality & Hygiene Review\n\nCheck for X, Y, Z.".to_string());
+    ctx.insert(
+        "review_instructions".to_string(),
+        "## Code Quality & Hygiene Review\n\nCheck for X, Y, Z.".to_string(),
+    );
     ctx.insert("diff".to_string(), "--- a/foo.rs\n+++ b/foo.rs\n+fn new() {}".to_string());
 
     let (_system, user) = render(&preset, &ctx);
 
-    assert!(user.contains("Code Quality & Hygiene Review"), "instructions missing from user: {user}");
+    assert!(
+        user.contains("Code Quality & Hygiene Review"),
+        "instructions missing from user: {user}"
+    );
     assert!(user.contains("--- a/foo.rs"), "diff missing from user: {user}");
 }
 
@@ -90,20 +115,36 @@ fn test_review_toml_parses() {
     let preset = parse_builtin("test_review", TEST_REVIEW_TOML);
     assert_eq!(preset.name, "test_review");
     assert_eq!(preset.context.len(), 2);
-    let instr = preset.context.iter().find(|c| c.key == "review_instructions").expect("review_instructions context missing");
+    let instr = preset
+        .context
+        .iter()
+        .find(|c| c.key == "review_instructions")
+        .expect("review_instructions context missing");
     assert_eq!(instr.provider, "file_read");
-    assert!(instr.args.iter().any(|a| a.contains("${args.prompt_file}")), "prompt_file ref missing");
+    assert!(
+        instr.args.iter().any(|a| a.contains("${args.prompt_file}")),
+        "prompt_file ref missing"
+    );
     let diff = preset.context.iter().find(|c| c.key == "diff").expect("diff context missing");
     assert_eq!(diff.provider, "git_diff_range");
-    assert!(diff.args.iter().any(|a| a.contains("${args.git_diff_range}")), "git_diff_range ref missing");
+    assert!(
+        diff.args.iter().any(|a| a.contains("${args.git_diff_range}")),
+        "git_diff_range ref missing"
+    );
 }
 
 #[test]
 fn test_review_input_schema_requires_both_args() {
     let preset = parse_builtin("test_review", TEST_REVIEW_TOML);
     let required = preset.input_schema()["required"].as_array().expect("required array");
-    assert!(required.iter().any(|v| v.as_str() == Some("git_diff_range")), "should require git_diff_range");
-    assert!(required.iter().any(|v| v.as_str() == Some("prompt_file")), "should require prompt_file");
+    assert!(
+        required.iter().any(|v| v.as_str() == Some("git_diff_range")),
+        "should require git_diff_range"
+    );
+    assert!(
+        required.iter().any(|v| v.as_str() == Some("prompt_file")),
+        "should require prompt_file"
+    );
 }
 
 #[test]
@@ -254,8 +295,12 @@ description = "USER OVERRIDE"
     assert_eq!(grep.description, "USER OVERRIDE");
     assert_eq!(grep.system_template, "overridden");
 
-    let required: Vec<&str> =
-        grep.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+    let required: Vec<&str> = grep.input_schema()["required"]
+        .as_array()
+        .expect("required array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
     assert_eq!(
         required,
         vec!["pattern", "intent"],
@@ -324,8 +369,12 @@ description = "What to look for."
     );
     let presets = load_all(Some(&tmp));
     let grep = find(&presets, "grep");
-    let required: Vec<&str> =
-        grep.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+    let required: Vec<&str> = grep.input_schema()["required"]
+        .as_array()
+        .expect("required array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
     assert_eq!(required, vec!["needle"], "a declared schema is the user's to get wrong");
     let props = grep.input_schema()["properties"].as_object().expect("properties object");
     assert!(props.contains_key("needle"));
@@ -336,12 +385,18 @@ description = "What to look for."
 #[test]
 fn builtin_schemas_are_unchanged_with_no_override_in_play() {
     let presets = load_all(None);
-    for (name, required) in
-        [("check_output", vec!["command"]), ("extract", vec!["file", "question"]), ("grep", vec!["pattern", "intent"])]
-    {
+    for (name, required) in [
+        ("check_output", vec!["command"]),
+        ("extract", vec!["file", "question"]),
+        ("grep", vec!["pattern", "intent"]),
+    ] {
         let p = find(&presets, name);
-        let got: Vec<&str> =
-            p.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+        let got: Vec<&str> = p.input_schema()["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert_eq!(got, required, "{name}: built-in schema drifted");
     }
 }
@@ -363,7 +418,10 @@ description = "USER OVERRIDE"
     );
     let presets = load_all(Some(&tmp));
     let qr = find(&presets, "quality_review");
-    assert!(qr.declared_input_schema.is_none(), "no inheritance for a preset scout never advertises");
+    assert!(
+        qr.declared_input_schema.is_none(),
+        "no inheritance for a preset scout never advertises"
+    );
     assert!(qr.input_schema()["properties"].as_object().expect("properties object").is_empty());
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -408,7 +466,11 @@ description = "Not a builtin."
 #[test]
 fn load_all_missing_user_dir_does_not_error() {
     let presets = load_all(Some(std::path::Path::new("/definitely/does/not/exist")));
-    assert_eq!(presets.len(), 8, "a missing override dir should silently fall back to builtins only");
+    assert_eq!(
+        presets.len(),
+        8,
+        "a missing override dir should silently fall back to builtins only"
+    );
 }
 
 // ── load() + resolve() unit tests ────────────────────────────────────────────
@@ -483,7 +545,8 @@ fn load_ignores_non_toml_files() {
 #[test]
 fn load_skips_invalid_toml_gracefully() {
     let bad_toml = "this is not valid toml [[[";
-    let good_toml = "system = \"s\"\nuser = \"u\"\n[preset]\nname = \"good\"\ndescription = \"Good.\"";
+    let good_toml =
+        "system = \"s\"\nuser = \"u\"\n[preset]\nname = \"good\"\ndescription = \"Good.\"";
     let tmp = tempfile_dir();
     std::fs::write(tmp.join("a_bad.toml"), bad_toml).unwrap();
     std::fs::write(tmp.join("b_good.toml"), good_toml).unwrap();

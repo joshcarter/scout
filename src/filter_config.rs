@@ -439,8 +439,9 @@ context_lines = 4
 
     #[test]
     fn cli_overrides_are_applied() {
-        let c =
-            parse_cli_overrides("[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\nmax_columns = 80\n");
+        let c = parse_cli_overrides(
+            "[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\nmax_columns = 80\n",
+        );
         assert_eq!(c.color, "never");
         assert_eq!(c.context, Some(4));
         assert_eq!(c.max_hits, 50);
@@ -511,7 +512,10 @@ context_lines = 4
             FindConfig::default()
         );
         assert_eq!(parse_find_overrides("[find]\nmax_patterns = -3\n"), FindConfig::default());
-        assert_eq!(parse_find_overrides("[find]\ntree_max_bytes = \"lots\"\n"), FindConfig::default());
+        assert_eq!(
+            parse_find_overrides("[find]\ntree_max_bytes = \"lots\"\n"),
+            FindConfig::default()
+        );
         assert_eq!(parse_find_overrides("not = = toml"), FindConfig::default());
         assert_eq!(parse_find_overrides(""), FindConfig::default());
     }

@@ -154,7 +154,8 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     // config costs no walk and reads as a config problem, not a failed search.
     ctx.require_client().map_err(|e| fail(&e))?;
 
-    let tree = sketch(&source::list_paths(root, &base, find_cfg.tree_max_bytes), find_cfg.tree_max_bytes);
+    let tree =
+        sketch(&source::list_paths(root, &base, find_cfg.tree_max_bytes), find_cfg.tree_max_bytes);
 
     let mut tried: Vec<String> = Vec::new();
     let mut whiffed: Vec<String> = Vec::new();
@@ -216,7 +217,8 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         candidates.extend(seed_candidates(&question, &candidates, &tried));
         live(ctx, round, "patterns", || patterns_event(&candidates, guessed, from_reflect));
 
-        let (results, kept, search_truncated) = search_candidates(root, &base, &candidates, &cfg, &find_cfg);
+        let (results, kept, search_truncated) =
+            search_candidates(root, &base, &candidates, &cfg, &find_cfg);
         ctx.note(&trying_line(&results));
         truncated |= search_truncated;
         for r in &results {
@@ -291,7 +293,9 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         // Every round failed to produce a single pattern: the model, not the
         // search, is what came up empty.  Fail open rather than reporting a
         // verdict scout never actually reached.
-        return Err(fail(&parse_error.unwrap_or_else(|| "local LLM returned no patterns".to_string())));
+        return Err(fail(
+            &parse_error.unwrap_or_else(|| "local LLM returned no patterns".to_string()),
+        ));
     }
     Ok(whiff_payload(&question, &tried, attempts))
 }
@@ -394,21 +398,144 @@ fn string_list(item: &Value, keys: &[&str]) -> Vec<String> {
 /// costs the answer.
 const STOPWORDS: &[&str] = &[
     // English function words and common verbs
-    "about", "after", "all", "and", "any", "are", "back", "been", "before", "being", "but", "call",
-    "called", "calls", "can", "did", "does", "doing", "done", "for", "from", "get", "gets", "getting",
-    "give", "had", "has", "have", "her", "here", "him", "his", "how", "into", "its", "just", "like",
-    "make", "makes", "many", "more", "most", "much", "must", "not", "now", "off", "one", "only",
-    "our", "out", "over", "own", "put", "puts", "same", "see", "set", "sets", "she", "should",
-    "some", "such", "than", "that", "the", "their", "them", "then", "there", "these", "they",
-    "thing", "things", "this", "those", "through", "under", "use", "used", "uses", "using", "very",
-    "was", "way", "were", "what", "when", "where", "which", "while", "who", "why", "will", "with",
-    "would", "you", "your",
+    "about",
+    "after",
+    "all",
+    "and",
+    "any",
+    "are",
+    "back",
+    "been",
+    "before",
+    "being",
+    "but",
+    "call",
+    "called",
+    "calls",
+    "can",
+    "did",
+    "does",
+    "doing",
+    "done",
+    "for",
+    "from",
+    "get",
+    "gets",
+    "getting",
+    "give",
+    "had",
+    "has",
+    "have",
+    "her",
+    "here",
+    "him",
+    "his",
+    "how",
+    "into",
+    "its",
+    "just",
+    "like",
+    "make",
+    "makes",
+    "many",
+    "more",
+    "most",
+    "much",
+    "must",
+    "not",
+    "now",
+    "off",
+    "one",
+    "only",
+    "our",
+    "out",
+    "over",
+    "own",
+    "put",
+    "puts",
+    "same",
+    "see",
+    "set",
+    "sets",
+    "she",
+    "should",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "thing",
+    "things",
+    "this",
+    "those",
+    "through",
+    "under",
+    "use",
+    "used",
+    "uses",
+    "using",
+    "very",
+    "was",
+    "way",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "why",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
     // Generic programming vocabulary — true of nearly every line of code
-    "actual", "actually", "code", "codebase", "define", "defined", "defines", "definition", "entry",
-    "file", "files", "fns", "func", "funcs", "function", "functions", "implement", "implementation",
-    "implemented", "implements", "line", "lines", "logic", "main", "method", "methods", "module",
-    "modules", "primary", "program", "project", "repo", "repository", "routine", "source", "stuff",
-    "top", "value", "values",
+    "actual",
+    "actually",
+    "code",
+    "codebase",
+    "define",
+    "defined",
+    "defines",
+    "definition",
+    "entry",
+    "file",
+    "files",
+    "fns",
+    "func",
+    "funcs",
+    "function",
+    "functions",
+    "implement",
+    "implementation",
+    "implemented",
+    "implements",
+    "line",
+    "lines",
+    "logic",
+    "main",
+    "method",
+    "methods",
+    "module",
+    "modules",
+    "primary",
+    "program",
+    "project",
+    "repo",
+    "repository",
+    "routine",
+    "source",
+    "stuff",
+    "top",
+    "value",
+    "values",
 ];
 
 /// Upper bound on seeded candidates.  Each one is a filesystem walk, and a
@@ -467,7 +594,8 @@ pub fn seed_candidates(question: &str, guesses: &[Candidate], tried: &[String]) 
             break;
         }
         let pattern = format!("(?i){token}");
-        let known = guesses.iter().map(|c| c.pattern.as_str()).chain(tried.iter().map(String::as_str));
+        let known =
+            guesses.iter().map(|c| c.pattern.as_str()).chain(tried.iter().map(String::as_str));
         if known.into_iter().any(|p| same_pattern(p, &pattern)) {
             continue;
         }
@@ -533,7 +661,12 @@ fn as_flag(v: &Value) -> Option<bool> {
 /// or the rerank kept nothing, so there are no excerpts to read identifiers out
 /// of.  The round check is where `max_attempts` becomes a *shared* budget —
 /// whiff-retries and reflect-retries draw on the same count.
-fn reflect_due(find_cfg: &crate::filter_config::FindConfig, round: usize, attempts: usize, payload: &Value) -> bool {
+fn reflect_due(
+    find_cfg: &crate::filter_config::FindConfig,
+    round: usize,
+    attempts: usize,
+    payload: &Value,
+) -> bool {
     find_cfg.reflect
         && round < attempts
         && payload.get("hits").and_then(Value::as_array).is_some_and(|h| !h.is_empty())
@@ -640,7 +773,11 @@ fn search_candidates(
     for c in candidates {
         let opts = candidate_options(base, c, root);
         let Ok(found) = source::search(root, &c.pattern, &opts) else {
-            results.push(CandidateResult { pattern: c.pattern.clone(), fate: Fate::Unusable, hits: 0 });
+            results.push(CandidateResult {
+                pattern: c.pattern.clone(),
+                fate: Fate::Unusable,
+                hits: 0,
+            });
             continue;
         };
         search_truncated |= found.truncated;
@@ -926,7 +1063,10 @@ fn drop_reason(r: &CandidateResult, cap: usize) -> Value {
         Fate::Kept => Value::Null,
         Fate::Whiffed => json!("matched nothing"),
         Fate::TooCommon => {
-            json!(format!("{} hits, past the degenerate cap of {cap} — matches too much to discriminate", r.hits))
+            json!(format!(
+                "{} hits, past the degenerate cap of {cap} — matches too much to discriminate",
+                r.hits
+            ))
         }
         Fate::Unusable => json!("the search refused this pattern"),
     }

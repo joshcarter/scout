@@ -193,7 +193,12 @@ fn last_output_line(output: &str) -> Option<String> {
 /// that answered in prose anyway still produces a usable result rather than a
 /// failure — the text is returned under `summary` with `ok` taken from the
 /// real exit status, which is the honest fallback verdict.
-pub fn classify_payload(command: &str, exit_ok: bool, language: Option<&str>, reply: &str) -> Value {
+pub fn classify_payload(
+    command: &str,
+    exit_ok: bool,
+    language: Option<&str>,
+    reply: &str,
+) -> Value {
     let mut payload = match parse_selector_json(reply) {
         Some(Value::Object(map)) => Value::Object(map),
         _ => serde_json::json!({
@@ -258,8 +263,8 @@ mod tests {
     #[test]
     fn a_nonexistent_cwd_fails_open_before_running_anything() {
         let ctx = offline_ctx(".");
-        let err = run(&ctx, &serde_json::json!({"command": "true", "cwd": "/nope/nowhere"}))
-            .unwrap_err();
+        let err =
+            run(&ctx, &serde_json::json!({"command": "true", "cwd": "/nope/nowhere"})).unwrap_err();
         let text = assert_fails_open(&err);
         assert!(text.contains("not a directory"), "text: {text}");
     }
@@ -271,11 +276,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("ran.txt");
         let ctx = offline_ctx(&dir.path().to_string_lossy());
-        let err = run(
-            &ctx,
-            &serde_json::json!({"command": format!("touch {}", marker.display())}),
-        )
-        .unwrap_err();
+        let err = run(&ctx, &serde_json::json!({"command": format!("touch {}", marker.display())}))
+            .unwrap_err();
         assert!(marker.exists(), "the command should have run");
         let text = assert_fails_open(&err);
         assert!(text.contains("not configured"), "text: {text}");
@@ -325,8 +327,14 @@ mod tests {
             timed_out: Some(verify::TimeoutKind::Idle),
             elapsed: Duration::from_secs(140),
         };
-        let p =
-            timeout_verdict(&ctx, "cargo build", Some("rust"), &capture, verify::TimeoutKind::Idle, 600);
+        let p = timeout_verdict(
+            &ctx,
+            "cargo build",
+            Some("rust"),
+            &capture,
+            verify::TimeoutKind::Idle,
+            600,
+        );
 
         assert_eq!(p["timed_out"], "idle");
         assert_eq!(p["language"], "rust");
@@ -388,7 +396,8 @@ mod tests {
     fn a_model_verdict_can_disagree_with_the_exit_status_and_both_survive() {
         // A test runner that exits 0 while printing failures is exactly why
         // the classifier exists — and why the raw status stays visible.
-        let p = classify_payload("make test", true, None, r#"{"ok": false, "summary": "2 failed"}"#);
+        let p =
+            classify_payload("make test", true, None, r#"{"ok": false, "summary": "2 failed"}"#);
         assert_eq!(p["ok"], false, "the model's verdict wins the 'ok' field");
         assert_eq!(p["exit_ok"], true, "the shell's verdict is still reported");
     }

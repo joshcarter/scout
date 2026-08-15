@@ -294,14 +294,20 @@ mod tests {
     #[test]
     fn tool_schemas_come_from_the_presets() {
         let tools = server().tools();
-        for (name, required) in
-            [("check_output", vec!["command"]), ("extract", vec!["file", "question"]), ("grep", vec!["pattern", "intent"])]
-        {
+        for (name, required) in [
+            ("check_output", vec!["command"]),
+            ("extract", vec!["file", "question"]),
+            ("grep", vec!["pattern", "intent"]),
+        ] {
             let t = tools.iter().find(|t| t.name == name).unwrap();
             let schema = Value::Object((*t.input_schema).clone());
             assert_eq!(schema["type"], "object", "{name} schema: {schema}");
-            let req: Vec<&str> =
-                schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+            let req: Vec<&str> = schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
             assert_eq!(req, required, "{name} required args");
             assert!(schema["properties"].is_object(), "{name} has no properties: {schema}");
         }

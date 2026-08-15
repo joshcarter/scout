@@ -29,10 +29,7 @@ use support::Sandbox;
 /// must not wander into by accident.
 fn fixture() -> Sandbox {
     let sandbox = Sandbox::new();
-    sandbox.write(
-        "src/alpha.rs",
-        "fn needle_one() {}\nfn unrelated() {}\nfn needle_two() {}\n",
-    );
+    sandbox.write("src/alpha.rs", "fn needle_one() {}\nfn unrelated() {}\nfn needle_two() {}\n");
     sandbox.write("src/beta.rs", "// nothing of interest here\n");
     sandbox
 }
@@ -163,8 +160,8 @@ fn json_format_emits_the_payload_on_stdout_and_status_on_stderr() {
         .expect("run scout grep");
 
     assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
-    let payload: serde_json::Value =
-        serde_json::from_str(&stdout(&out)).expect("--format json must put parseable JSON on stdout");
+    let payload: serde_json::Value = serde_json::from_str(&stdout(&out))
+        .expect("--format json must put parseable JSON on stdout");
     // Bypassed mode: no intent, so the model was never asked and every hit came
     // back. This is the shape docs/search-cli.md §3 promises for an absent intent.
     assert_eq!(payload["mode"], "full", "expected the bypassed mode: {payload}");

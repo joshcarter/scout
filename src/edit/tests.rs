@@ -181,7 +181,8 @@ fn the_quickfix_file_is_created_safely_and_still_readable_afterwards() {
 
     // Still on disk (not deleted by NamedTempFile's own Drop) — `quickfix`
     // hands this path to `-q` and the editor must be able to open it.
-    let content = std::fs::read_to_string(&path).expect("the launched editor must be able to read it");
+    let content =
+        std::fs::read_to_string(&path).expect("the launched editor must be able to read it");
     assert_eq!(content, render::render_vimgrep(&payload), "same formatter the module doc promises");
 
     // Not a predictable name: the whole point of moving off
@@ -309,7 +310,8 @@ fn a_missing_or_zero_line_becomes_line_one() {
 #[test]
 fn hits_without_a_file_are_dropped() {
     // There is nothing to open; passing "" would make a stray unnamed buffer.
-    let payload = json!({"hits": [{"line": 3}, {"file": "", "line": 4}, {"file": "c.rs", "line": 5}]});
+    let payload =
+        json!({"hits": [{"line": 3}, {"file": "", "line": 4}, {"file": "c.rs", "line": 5}]});
     assert_eq!(hits(&payload), [Hit { file: "c.rs".into(), line: 5, col: 1 }]);
 }
 

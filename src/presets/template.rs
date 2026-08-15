@@ -43,9 +43,16 @@ pub fn substitute_args(s: &str, caller_args: &serde_json::Value) -> String {
             let value: &str = match caller_args.get(field) {
                 Some(v) if v.is_string() => {
                     let s = v.as_str().unwrap();
-                    if s.is_empty() { fallback } else { s }
+                    if s.is_empty() {
+                        fallback
+                    } else {
+                        s
+                    }
                 }
-                Some(v) if !v.is_null() => { owned = v.to_string(); &owned }
+                Some(v) if !v.is_null() => {
+                    owned = v.to_string();
+                    &owned
+                }
                 _ => fallback,
             };
             result.push_str(value);
@@ -128,10 +135,8 @@ mod tests {
 
     #[test]
     fn substitute_args_multiple_refs() {
-        let result = substitute_args(
-            "${args.a} and ${args.b}",
-            &json!({"a": "hello", "b": "world"}),
-        );
+        let result =
+            substitute_args("${args.a} and ${args.b}", &json!({"a": "hello", "b": "world"}));
         assert_eq!(result, "hello and world");
     }
 
@@ -158,7 +163,8 @@ mod tests {
 
     #[test]
     fn substitute_args_fallback_field_present_uses_field() {
-        let result = substitute_args("base=${args.base_branch:-main}", &json!({"base_branch": "develop"}));
+        let result =
+            substitute_args("base=${args.base_branch:-main}", &json!({"base_branch": "develop"}));
         assert_eq!(result, "base=develop");
     }
 
@@ -176,7 +182,8 @@ mod tests {
 
     #[test]
     fn substitute_args_fallback_field_null_uses_default() {
-        let result = substitute_args("base=${args.base_branch:-main}", &json!({"base_branch": null}));
+        let result =
+            substitute_args("base=${args.base_branch:-main}", &json!({"base_branch": null}));
         assert_eq!(result, "base=main");
     }
 

@@ -86,9 +86,11 @@ impl Preset {
     /// this can hand back a borrow; the value is a constant either way.
     pub fn input_schema(&self) -> &Value {
         static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-        self.declared_input_schema
-            .as_ref()
-            .unwrap_or_else(|| EMPTY.get_or_init(|| serde_json::json!({"type": "object", "properties": {}, "required": []})))
+        self.declared_input_schema.as_ref().unwrap_or_else(|| {
+            EMPTY.get_or_init(
+                || serde_json::json!({"type": "object", "properties": {}, "required": []}),
+            )
+        })
     }
 }
 
@@ -294,11 +296,8 @@ pub fn resolve(preset: &Preset, args: &Value, project: &str) -> Result<(String, 
 
     for def in &preset.context {
         // Substitute ${args.field} in positional args
-        let positional: Vec<String> = def
-            .args
-            .iter()
-            .map(|a| template::substitute_args(a, args))
-            .collect();
+        let positional: Vec<String> =
+            def.args.iter().map(|a| template::substitute_args(a, args)).collect();
 
         // Substitute ${args.field} in extra (string values only)
         let extra: HashMap<String, Value> = def
@@ -314,11 +313,8 @@ pub fn resolve(preset: &Preset, args: &Value, project: &str) -> Result<(String, 
             })
             .collect();
 
-        let provider_args = ProviderArgs {
-            positional: &positional,
-            named: &extra,
-            project_root: project,
-        };
+        let provider_args =
+            ProviderArgs { positional: &positional, named: &extra, project_root: project };
 
         let output = run_provider(&def.provider, &provider_args).map_err(|e| {
             format!(

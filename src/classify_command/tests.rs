@@ -7,17 +7,11 @@
 use super::*;
 
 fn hit(cmd: &str) {
-    assert!(
-        classify(cmd).intercept,
-        "expected intercept for {cmd:?}, got none"
-    );
+    assert!(classify(cmd).intercept, "expected intercept for {cmd:?}, got none");
 }
 
 fn miss(cmd: &str) {
-    assert!(
-        !classify(cmd).intercept,
-        "expected no intercept for {cmd:?}, got one"
-    );
+    assert!(!classify(cmd).intercept, "expected no intercept for {cmd:?}, got one");
 }
 
 // ── docs/command-matching.md §3: the six observed rows ────────────────────────────────────────────

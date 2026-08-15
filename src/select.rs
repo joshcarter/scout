@@ -136,7 +136,9 @@ impl Ctx<'_> {
         match (self.client, &self.client_error) {
             (Some(c), _) => Ok(c),
             (None, Some(e)) => Err(format!("local LLM is not configured: {e}")),
-            (None, None) => Err("local LLM is not configured (see ~/.config/scout/config.toml)".to_string()),
+            (None, None) => {
+                Err("local LLM is not configured (see ~/.config/scout/config.toml)".to_string())
+            }
         }
     }
 
@@ -322,10 +324,9 @@ pub fn validate_ranges(v: &Value, file_lines: usize) -> RangeSelection {
     let mut raw: Vec<SelectedRange> = Vec::new();
     let items = v.get("ranges").and_then(Value::as_array).cloned().unwrap_or_default();
     for item in items {
-        let (Some(start), Some(end)) = (
-            item.get("start").and_then(Value::as_u64),
-            item.get("end").and_then(Value::as_u64),
-        ) else {
+        let (Some(start), Some(end)) =
+            (item.get("start").and_then(Value::as_u64), item.get("end").and_then(Value::as_u64))
+        else {
             sel.dropped_invalid += 1;
             continue;
         };

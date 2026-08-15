@@ -54,10 +54,7 @@ pub fn run_subcommand() -> anyhow::Result<()> {
     std::io::stdin().read_to_end(&mut raw)?;
     let command = String::from_utf8_lossy(&raw);
     let verdict = classify(&command);
-    println!(
-        "{}",
-        serde_json::json!({ "intercept": verdict.intercept, "escape": verdict.escape })
-    );
+    println!("{}", serde_json::json!({ "intercept": verdict.intercept, "escape": verdict.escape }));
     Ok(())
 }
 
@@ -640,11 +637,7 @@ impl Lexer {
                 if self.i < self.src.len() {
                     self.i += 1;
                 }
-                let cmp = if hd.strip_tabs {
-                    line.trim_start_matches('\t')
-                } else {
-                    line.as_str()
-                };
+                let cmp = if hd.strip_tabs { line.trim_start_matches('\t') } else { line.as_str() };
                 if cmp == hd.delim {
                     break;
                 }

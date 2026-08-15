@@ -23,7 +23,12 @@ fn opts() -> SearchOptions {
 
 /// The `(line, col, col_end)` triples of every hit, in walk order.
 fn spans(dir: &TempDir, pattern: &str, o: &SearchOptions) -> Vec<(usize, usize, usize)> {
-    search(dir.path(), pattern, o).unwrap().hits.iter().map(|h| (h.line, h.col, h.col_end)).collect()
+    search(dir.path(), pattern, o)
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| (h.line, h.col, h.col_end))
+        .collect()
 }
 
 /// Collect the hit files for `pattern` under `dir`, in walk order.
@@ -208,8 +213,12 @@ fn search_visits_files_in_sorted_path_order() {
     write(&dir, "b.rs", "needle\n");
     write(&dir, "a.rs", "needle\n");
     write(&dir, "c.rs", "needle\n");
-    let files: Vec<String> =
-        search(dir.path(), "needle", &opts()).unwrap().hits.iter().map(|h| h.file.clone()).collect();
+    let files: Vec<String> = search(dir.path(), "needle", &opts())
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.file.clone())
+        .collect();
     assert_eq!(files, vec!["a.rs", "b.rs", "c.rs"], "hit ids must be stable across runs");
 }
 
@@ -288,8 +297,12 @@ fn search_respects_gitignore() {
     write(&dir, "kept.rs", "needle\n");
     write(&dir, "ignored.rs", "needle\n");
     write(&dir, "target/generated.rs", "needle\n");
-    let files: Vec<String> =
-        search(dir.path(), "needle", &opts()).unwrap().hits.iter().map(|h| h.file.clone()).collect();
+    let files: Vec<String> = search(dir.path(), "needle", &opts())
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.file.clone())
+        .collect();
     assert_eq!(files, vec!["kept.rs"], "gitignored paths must not be searched");
 }
 
@@ -298,8 +311,12 @@ fn search_skips_hidden_directories() {
     let dir = tempfile::tempdir().unwrap();
     write(&dir, ".secret/notes.rs", "needle\n");
     write(&dir, "visible.rs", "needle\n");
-    let files: Vec<String> =
-        search(dir.path(), "needle", &opts()).unwrap().hits.iter().map(|h| h.file.clone()).collect();
+    let files: Vec<String> = search(dir.path(), "needle", &opts())
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.file.clone())
+        .collect();
     assert_eq!(files, vec!["visible.rs"]);
 }
 
@@ -311,8 +328,12 @@ fn search_skips_binary_files() {
     blob.extend_from_slice(b"needle\n");
     fs::write(dir.path().join("blob.bin"), blob).unwrap();
     write(&dir, "text.rs", "needle\n");
-    let files: Vec<String> =
-        search(dir.path(), "needle", &opts()).unwrap().hits.iter().map(|h| h.file.clone()).collect();
+    let files: Vec<String> = search(dir.path(), "needle", &opts())
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| h.file.clone())
+        .collect();
     assert_eq!(files, vec!["text.rs"], "binary files must never enter the hit list");
 }
 

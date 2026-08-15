@@ -67,16 +67,15 @@ pub struct Args {
 /// tests, while `$XDG_STATE_HOME` moves the whole state directory, which is
 /// what an isolated daemon needs.
 fn state_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(|h| PathBuf::from(h).join(".local").join("state"))
-        })?;
+    let base =
+        std::env::var("XDG_STATE_HOME").ok().filter(|v| !v.is_empty()).map(PathBuf::from).or_else(
+            || {
+                std::env::var("HOME")
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .map(|h| PathBuf::from(h).join(".local").join("state"))
+            },
+        )?;
     Some(base.join("scout"))
 }
 
@@ -458,9 +457,13 @@ fn stats_json(tail: &Tail) -> Value {
     }
     let mut by_preset: HashMap<&str, Agg> = HashMap::new();
     for r in tail.rows.iter().filter(|r| !r.bypassed()) {
-        let e = by_preset
-            .entry(r.preset.as_str())
-            .or_insert(Agg { calls: 0, ok: 0, tokens_in: 0, tokens_out: 0, ok_ms: 0 });
+        let e = by_preset.entry(r.preset.as_str()).or_insert(Agg {
+            calls: 0,
+            ok: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            ok_ms: 0,
+        });
         e.calls += 1;
         if r.ok {
             e.ok += 1;
@@ -653,9 +656,8 @@ fn bind_tcp_reuse(port: u16) -> std::io::Result<TcpListener> {
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
         sa.sin_family = libc::AF_INET as libc::sa_family_t;
         sa.sin_port = port.to_be();
-        sa.sin_addr = libc::in_addr {
-            s_addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()),
-        };
+        sa.sin_addr =
+            libc::in_addr { s_addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()) };
         let bound = libc::bind(
             fd,
             &sa as *const _ as *const libc::sockaddr,
@@ -821,11 +823,8 @@ fn history_with_live(
         None => &tail.rows,
     };
     let ops = group_ops(rows);
-    let limit: usize = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(300)
-        .clamp(1, 5000);
+    let limit: usize =
+        params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(300).clamp(1, 5000);
 
     let since_idx = params
         .get("since")
@@ -858,12 +857,7 @@ fn history_with_live(
     };
 
     let selected: Vec<&Vec<usize>> = ops.iter().filter(|op| want(op)).collect();
-    let page: Vec<Value> = selected
-        .iter()
-        .rev()
-        .take(limit)
-        .map(|op| op_json(rows, op))
-        .collect();
+    let page: Vec<Value> = selected.iter().rev().take(limit).map(|op| op_json(rows, op)).collect();
 
     json!({
         "ops": page,
@@ -1001,7 +995,11 @@ const HEADER_PHASE_DEADLINE: Duration = Duration::from_secs(10);
 /// hunting for the delimiter, which is exactly the gap this function exists
 /// to close. Traffic on this socket is a handful of short header lines per
 /// request on loopback, so the extra syscalls are not a real cost.
-fn read_header_line(stream: &mut TcpStream, max_bytes: usize, deadline: std::time::Instant) -> LineOutcome {
+fn read_header_line(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> LineOutcome {
     let mut line: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
     loop {
@@ -1262,11 +1260,12 @@ fn install_signal_handlers(pidfile: &Path) {
 
 /// Run the server in this process.  Returns only on a bind failure.
 fn run_foreground(port: u16) -> anyhow::Result<()> {
-    let listener = bind_with_retry(port)
-        .map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port}: {e}"))?;
+    let listener =
+        bind_with_retry(port).map_err(|e| anyhow::anyhow!("cannot bind 127.0.0.1:{port}: {e}"))?;
 
-    let log = stats::log_path()
-        .ok_or_else(|| anyhow::anyhow!("no call log path: $HOME and $XDG_STATE_HOME are both unset"))?;
+    let log = stats::log_path().ok_or_else(|| {
+        anyhow::anyhow!("no call log path: $HOME and $XDG_STATE_HOME are both unset")
+    })?;
     let mut tail = Tail::new(log);
     tail.reload();
 
@@ -1416,8 +1415,9 @@ fn spawn_daemon(port: u16) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;
-    let log_path = daemon_log_path()
-        .ok_or_else(|| anyhow::anyhow!("no state directory: $HOME and $XDG_STATE_HOME are unset"))?;
+    let log_path = daemon_log_path().ok_or_else(|| {
+        anyhow::anyhow!("no state directory: $HOME and $XDG_STATE_HOME are unset")
+    })?;
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1479,7 +1479,9 @@ fn start(port: u16, open: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if had_pidfile {
-        println!("scout dashboard: stale pidfile (port {port} not answering) — cleared, restarting");
+        println!(
+            "scout dashboard: stale pidfile (port {port} not answering) — cleared, restarting"
+        );
         clear_pidfile(port);
     } else if !port_is_free(port) {
         anyhow::bail!(
@@ -1623,8 +1625,7 @@ mod tests {
         // no `id` and no `via`, and the panes have nothing to show for it —
         // so the reader drops it rather than padding it out into a row whose
         // empty `input` is indistinguishable from a call that had none.
-        let line =
-            r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#;
+        let line = r#"{"ts":1770000000,"preset":"grep","tokens_in":1840,"tokens_out":210,"ms":3100,"ok":true}"#;
         assert!(Row::parse(line).is_none());
         assert!(is_legacy_record(line), "skipped on purpose, not malformed");
     }
@@ -1712,13 +1713,11 @@ mod tests {
         // `scout mcp` is one process — one `run` — for a whole Claude Code
         // session, so `run` alone would collapse a session's every tool call
         // into one history row.  `op` is what keeps them apart.
-        let rows: Vec<Row> = [
-            v2("s-1", "s", 100.0, r#","op":"s-op1""#),
-            v2("s-2", "s", 100.2, r#","op":"s-op2""#),
-        ]
-        .iter()
-        .map(|s| row(s))
-        .collect();
+        let rows: Vec<Row> =
+            [v2("s-1", "s", 100.0, r#","op":"s-op1""#), v2("s-2", "s", 100.2, r#","op":"s-op2""#)]
+                .iter()
+                .map(|s| row(s))
+                .collect();
         assert_eq!(group_ops(&rows), vec![vec![0], vec![1]]);
     }
 
@@ -1769,10 +1768,8 @@ mod tests {
 
     #[test]
     fn different_ops_never_merge() {
-        let rows: Vec<Row> = [v2("a-1", "a", 100.0, ""), v2("b-1", "b", 100.5, "")]
-            .iter()
-            .map(|s| row(s))
-            .collect();
+        let rows: Vec<Row> =
+            [v2("a-1", "a", 100.0, ""), v2("b-1", "b", 100.5, "")].iter().map(|s| row(s)).collect();
         assert_eq!(group_ops(&rows), vec![vec![0], vec![1]]);
     }
 
@@ -1883,7 +1880,12 @@ mod tests {
     fn latency_percentiles_ignore_the_zero_ms_failure_rows() {
         let mut lines = vec![];
         for i in 1..=10 {
-            lines.push(v2(&format!("a{i}-1"), &format!("a{i}"), 100.0, &format!(r#","ms":{}"#, i * 100)));
+            lines.push(v2(
+                &format!("a{i}-1"),
+                &format!("a{i}"),
+                100.0,
+                &format!(r#","ms":{}"#, i * 100),
+            ));
         }
         lines.push(
             r#"{"v":2,"id":"z-1","run":"z","ts":100,"preset":"grep","ok":false,"ms":0,"outcome":{"kind":"timeout"}}"#
@@ -2407,8 +2409,11 @@ mod tests {
         let resp = get_with_host("/api/status", "", "");
         assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
         // Two of them is ambiguous, which is how such a gate gets walked past.
-        let resp =
-            get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Host: attacker.example\r\n");
+        let resp = get_with_host(
+            "/api/status",
+            "Host: 127.0.0.1:{port}\r\n",
+            "Host: attacker.example\r\n",
+        );
         assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
         assert!(resp.contains("ambiguous"), "{resp}");
     }
@@ -2418,7 +2423,11 @@ mod tests {
     /// page — `url_for` hands out `localhost`, and `probe` uses `127.0.0.1`.
     #[test]
     fn the_dashboards_own_origins_are_accepted() {
-        for host in ["Host: 127.0.0.1:{port}\r\n", "Host: localhost:{port}\r\n", "Host: LocalHost:{port}\r\n"] {
+        for host in [
+            "Host: 127.0.0.1:{port}\r\n",
+            "Host: localhost:{port}\r\n",
+            "Host: LocalHost:{port}\r\n",
+        ] {
             let resp = get_with_host("/api/status", host, "");
             assert!(resp.starts_with("HTTP/1.0 200"), "{host}: {resp}");
         }
@@ -2441,8 +2450,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
         assert!(resp.contains("cross-origin"), "{resp}");
 
-        let resp =
-            get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Origin: null\r\n");
+        let resp = get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Origin: null\r\n");
         assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
 
         let resp = send_built(|port| {

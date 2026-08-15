@@ -90,8 +90,7 @@ struct ContextEntry {
 /// - The TOML is malformed
 /// - A `[context.<key>]` section references an unknown or blocked provider
 pub fn parse(source: &str) -> Result<Preset, String> {
-    let file: PresetFile =
-        toml::from_str(source).map_err(|e| format!("TOML parse error: {e}"))?;
+    let file: PresetFile = toml::from_str(source).map_err(|e| format!("TOML parse error: {e}"))?;
 
     // Validate providers
     let mut context_defs = Vec::with_capacity(file.context.len());
@@ -213,7 +212,10 @@ properties = {}
 required   = []
 "#;
         let preset = parse(toml).expect("parse failed");
-        assert!(preset.declared_input_schema.is_some(), "an explicit empty schema is still a declaration");
+        assert!(
+            preset.declared_input_schema.is_some(),
+            "an explicit empty schema is still a declaration"
+        );
         assert!(preset.input_schema()["properties"].as_object().unwrap().is_empty());
     }
 

@@ -53,10 +53,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--preset" => {
                 i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or("--preset requires a value")?
-                    .clone();
+                let val = args.get(i).ok_or("--preset requires a value")?.clone();
                 preset = Some(val);
             }
             "--arg" => {
@@ -69,10 +66,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--project" => {
                 i += 1;
-                let val = args
-                    .get(i)
-                    .ok_or("--project requires a value")?
-                    .clone();
+                let val = args.get(i).ok_or("--project requires a value")?.clone();
                 project = Some(val);
             }
             other => return Err(format!("unknown flag: {other}")),
@@ -91,11 +85,8 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 /// goes to stdout (LLM response) or stderr (diagnostics).
 pub fn run_subcommand(raw_args: &[String]) -> ! {
     // Skip the "run" token if it's still present at the front.
-    let tail: &[String] = if raw_args.first().map(|s| s.as_str()) == Some("run") {
-        &raw_args[1..]
-    } else {
-        raw_args
-    };
+    let tail: &[String] =
+        if raw_args.first().map(|s| s.as_str()) == Some("run") { &raw_args[1..] } else { raw_args };
 
     let args = match parse_run_args(tail) {
         Ok(a) => a,
@@ -145,10 +136,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
         Some(p) => p,
         None => {
             let available: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
-            eprintln!(
-                "scout run: preset {:?} not found (available: {:?})",
-                preset_name, available
-            );
+            eprintln!("scout run: preset {:?} not found (available: {:?})", preset_name, available);
             std::process::exit(1);
         }
     };
@@ -162,9 +150,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
 
     // Project root defaults to $PWD.
     let project = args.project.unwrap_or_else(|| {
-        std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string())
+        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
     });
 
     // A context provider that failed (no staged diff, a `git` timeout, an
@@ -239,9 +225,12 @@ mod tests {
     #[test]
     fn parse_preset_and_args() {
         let args: Vec<String> = vec![
-            "--preset".into(), "quality_review".into(),
-            "--arg".into(), "git_diff_range=HEAD~1..HEAD".into(),
-            "--arg".into(), "prompt_file=/tmp/quality.md".into(),
+            "--preset".into(),
+            "quality_review".into(),
+            "--arg".into(),
+            "git_diff_range=HEAD~1..HEAD".into(),
+            "--arg".into(),
+            "prompt_file=/tmp/quality.md".into(),
         ];
         let parsed = parse_run_args(&args).unwrap();
         assert_eq!(parsed.preset.as_deref(), Some("quality_review"));

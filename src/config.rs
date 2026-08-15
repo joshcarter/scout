@@ -138,15 +138,14 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         let _ = seed_default_config(path);
     }
 
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read config {:?}: {e}", path))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read config {:?}: {e}", path))?;
 
     let root: toml::Value =
         toml::from_str(&content).map_err(|e| format!("config parse error: {e}"))?;
 
-    let section = root
-        .get("llm")
-        .ok_or_else(|| format!("config: [llm] section not found in {:?}", path))?;
+    let section =
+        root.get("llm").ok_or_else(|| format!("config: [llm] section not found in {:?}", path))?;
 
     let endpoint = section
         .get("endpoint")
@@ -191,23 +190,15 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         .map(|v| v.clamp(1, 3600) as u64)
         .unwrap_or(15);
 
-    let api_key = section
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let api_key = section.get("api_key").and_then(|v| v.as_str()).map(String::from);
 
-    let max_tokens = section
-        .get("max_tokens")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.max(0) as u64);
+    let max_tokens =
+        section.get("max_tokens").and_then(|v| v.as_integer()).map(|v| v.max(0) as u64);
 
     // Defaults on, and an unusable value keeps the default rather than
     // erroring — this is a diagnostic knob, not a load-bearing one, and no
     // caller's result changes with it (docs/dashboard.md §6).
-    let stream = section
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let stream = section.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
 
     Ok(Config {
         endpoint,
@@ -250,10 +241,8 @@ mod tests {
     #[test]
     fn load_config_strips_trailing_slash() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_config(
-            &dir,
-            "[llm]\nendpoint = \"http://localhost:11434/v1/\"\nmodel = \"m\"\n",
-        );
+        let path =
+            write_config(&dir, "[llm]\nendpoint = \"http://localhost:11434/v1/\"\nmodel = \"m\"\n");
         let cfg = load_config(&path).unwrap();
         assert_eq!(cfg.endpoint, "http://localhost:11434/v1");
     }
@@ -277,22 +266,21 @@ mod tests {
         let base = "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n";
         assert!(load_config(&write_config(&dir, base)).unwrap().stream);
         assert!(
-            !load_config(&write_config(&dir, &format!("{base}stream = false\n")))
-                .unwrap()
-                .stream
+            !load_config(&write_config(&dir, &format!("{base}stream = false\n"))).unwrap().stream
         );
         // Parsed leniently, like every other tunable: a diagnostic knob must
         // never be the reason scout refuses to run.
         assert!(
-            load_config(&write_config(&dir, &format!("{base}stream = \"yes\"\n")))
-                .unwrap()
-                .stream
+            load_config(&write_config(&dir, &format!("{base}stream = \"yes\"\n"))).unwrap().stream
         );
     }
 
     #[test]
     fn the_bundled_default_config_documents_stream() {
-        assert!(DEFAULT_CONFIG.contains("# stream = true"), "config.example.toml is the only place a user learns the knob exists");
+        assert!(
+            DEFAULT_CONFIG.contains("# stream = true"),
+            "config.example.toml is the only place a user learns the knob exists"
+        );
     }
 
     #[test]
@@ -401,7 +389,12 @@ mod tests {
             "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\nfirst_token_timeout_seconds = -5\nidle_timeout_seconds = 0\n",
         );
         let cfg = load_config(&path).unwrap();
-        assert_eq!(cfg.first_token_timeout, Duration::from_secs(1), "{:?}", cfg.first_token_timeout);
+        assert_eq!(
+            cfg.first_token_timeout,
+            Duration::from_secs(1),
+            "{:?}",
+            cfg.first_token_timeout
+        );
         assert_eq!(cfg.idle_timeout, Duration::from_secs(1), "{:?}", cfg.idle_timeout);
     }
 
@@ -491,10 +484,7 @@ mod tests {
         let p = dir.path().join("config.toml");
         std::fs::write(&p, "hand edited, do not clobber").unwrap();
         assert!(!seed_default_config(&p).unwrap(), "should report it skipped");
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            "hand edited, do not clobber"
-        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hand edited, do not clobber");
     }
 
     #[cfg(unix)]
@@ -514,7 +504,11 @@ mod tests {
         let p = dir.path().join("scout").join("config.toml");
         assert!(seed_default_config(&p).unwrap());
         assert_eq!(mode_of(&p), 0o600, "config.toml can hold an api_key");
-        assert_eq!(mode_of(p.parent().unwrap()), 0o700, "the config dir must not be group/other readable");
+        assert_eq!(
+            mode_of(p.parent().unwrap()),
+            0o700,
+            "the config dir must not be group/other readable"
+        );
     }
 
     #[cfg(unix)]

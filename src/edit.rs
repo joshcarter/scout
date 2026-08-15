@@ -77,11 +77,9 @@ pub fn dispatch(
 
     if let Some(pattern) = pattern {
         if query.is_some() || intent.is_some() {
-            return Err(
-                "-p already carries the pattern — for a reranked search drop it and \
+            return Err("-p already carries the pattern — for a reranked search drop it and \
                  pass both positionals: scout edit <pattern> <intent>"
-                    .into(),
-            );
+                .into());
         }
         no_attempts("-p never guesses patterns")?;
         return Ok(Pipeline::Grep { pattern, intent: None, regex });

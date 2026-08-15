@@ -26,14 +26,9 @@ pub fn log_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SCOUT_CALLS_LOG") {
         return Some(PathBuf::from(p));
     }
-    let state_dir = std::env::var("XDG_STATE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local").join("state"))
-        })?;
+    let state_dir = std::env::var("XDG_STATE_HOME").ok().map(PathBuf::from).or_else(|| {
+        std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local").join("state"))
+    })?;
     Some(state_dir.join("scout").join("calls.jsonl"))
 }
 
@@ -397,11 +392,9 @@ impl CallRecord {
         m.insert("tool".into(), Value::from(self.tool.clone()));
         m.insert("preset".into(), Value::from(self.preset.clone()));
         m.insert("attempt".into(), Value::from(self.attempt));
-        for (key, value) in [
-            ("project", &self.project),
-            ("model", &self.model),
-            ("endpoint", &self.endpoint),
-        ] {
+        for (key, value) in
+            [("project", &self.project), ("model", &self.model), ("endpoint", &self.endpoint)]
+        {
             if let Some(v) = value {
                 m.insert(key.into(), Value::from(v.clone()));
             }
@@ -415,7 +408,8 @@ impl CallRecord {
             outcome.insert("summary".into(), Value::from(s.clone()));
         }
         m.insert("outcome".into(), Value::Object(outcome));
-        for (key, value) in [("raw_bytes", self.raw_bytes), ("returned_bytes", self.returned_bytes)] {
+        for (key, value) in [("raw_bytes", self.raw_bytes), ("returned_bytes", self.returned_bytes)]
+        {
             if let Some(n) = value {
                 m.insert(key.into(), Value::from(n));
             }
@@ -904,11 +898,7 @@ pub fn print_report() -> anyhow::Result<()> {
     );
     println!("{}", "-".repeat(75));
     for (name, s) in &report.rows {
-        let pass_pct = if s.calls > 0 {
-            s.ok as f64 / s.calls as f64 * 100.0
-        } else {
-            0.0
-        };
+        let pass_pct = if s.calls > 0 { s.ok as f64 / s.calls as f64 * 100.0 } else { 0.0 };
         let avg_ms = match s.ok_total_ms.checked_div(s.ok) {
             Some(v) => v.to_string(),
             None => "-".to_string(),
@@ -921,16 +911,10 @@ pub fn print_report() -> anyhow::Result<()> {
 
     let total_calls: u64 = report.rows.iter().map(|(_, s)| s.calls).sum();
     let total_ok: u64 = report.rows.iter().map(|(_, s)| s.ok).sum();
-    let overall_pass = if total_calls > 0 {
-        total_ok as f64 / total_calls as f64 * 100.0
-    } else {
-        0.0
-    };
+    let overall_pass =
+        if total_calls > 0 { total_ok as f64 / total_calls as f64 * 100.0 } else { 0.0 };
     println!("{}", "-".repeat(75));
-    println!(
-        "{:<25} {:>6} {:>6.1}%  (overall)",
-        "TOTAL", total_calls, overall_pass
-    );
+    println!("{:<25} {:>6} {:>6.1}%  (overall)", "TOTAL", total_calls, overall_pass);
 
     print_summary(&report);
 
@@ -967,10 +951,7 @@ fn print_summary(report: &Report) {
         ));
     }
     if report.bypassed > 0 {
-        section(format!(
-            "bypassed:       {} call(s) served without the model",
-            report.bypassed
-        ));
+        section(format!("bypassed:       {} call(s) served without the model", report.bypassed));
     }
     if !report.failures.is_empty() {
         let parts: Vec<String> =
@@ -1048,7 +1029,10 @@ mod tests {
                 .attempt(2)
                 .project("/home/josh/Projects/scout")
                 .endpoint("qwen3:27b", "http://localhost:11434/v1")
-                .input(input_summary("find_patterns", &json!({"question": "where is the port bound"})))
+                .input(input_summary(
+                    "find_patterns",
+                    &json!({"question": "where is the port bound"}),
+                ))
                 .outcome(Outcome::Ok)
                 .summary("8 patterns, 3 non-degenerate")
                 .raw_bytes(184_320)
@@ -1303,7 +1287,10 @@ mod tests {
         }
         let before = std::fs::metadata(&path).unwrap().len();
 
-        append_line(&path, &json!({"preset": "extract", "ok": true, "ts": 1_770_000_100.5}).to_string());
+        append_line(
+            &path,
+            &json!({"preset": "extract", "ok": true, "ts": 1_770_000_100.5}).to_string(),
+        );
 
         assert!(rotated_path(&path).exists(), "the previous generation must be kept");
         assert_eq!(std::fs::metadata(rotated_path(&path)).unwrap().len(), before);
@@ -1335,7 +1322,11 @@ mod tests {
         let path = dir.path().join("scout").join("calls.jsonl");
         append_line(&path, &json!({"preset": "grep", "ok": true}).to_string());
         assert_eq!(mode_of(&path), 0o600, "calls.jsonl can carry full command strings");
-        assert_eq!(mode_of(path.parent().unwrap()), 0o700, "the state dir must not be group/other readable");
+        assert_eq!(
+            mode_of(path.parent().unwrap()),
+            0o700,
+            "the state dir must not be group/other readable"
+        );
     }
 
     #[cfg(unix)]
@@ -1373,7 +1364,8 @@ mod tests {
         // process umask.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("calls.jsonl");
-        let fat = json!({"ts": 1_770_000_000u64, "preset": "grep", "ok": true, "pad": "x".repeat(4096)});
+        let fat =
+            json!({"ts": 1_770_000_000u64, "preset": "grep", "ok": true, "pad": "x".repeat(4096)});
         while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_LOG_BYTES {
             append_line(&path, &fat.to_string());
         }
@@ -1382,7 +1374,11 @@ mod tests {
         append_line(&path, &json!({"preset": "extract", "ok": true}).to_string());
         assert!(rotated_path(&path).exists());
         assert_eq!(mode_of(&path), 0o600, "the reopened post-rotation file must also be 0600");
-        assert_eq!(mode_of(&rotated_path(&path)), 0o600, "and the renamed-away generation keeps its mode");
+        assert_eq!(
+            mode_of(&rotated_path(&path)),
+            0o600,
+            "and the renamed-away generation keeps its mode"
+        );
     }
 
     // ── parse_log / report aggregation ───────────────────────────────────

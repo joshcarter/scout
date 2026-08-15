@@ -73,7 +73,10 @@ fn candidates_survive_fences_prose_and_think_blocks() {
 #[test]
 fn bare_strings_are_accepted_alongside_objects() {
     let c = parse_candidates(r#"{"patterns": ["a_thing", {"pattern": "b_thing"}]}"#, 8);
-    assert_eq!(c.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(), vec!["a_thing", "b_thing"]);
+    assert_eq!(
+        c.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(),
+        vec!["a_thing", "b_thing"]
+    );
 }
 
 #[test]
@@ -128,7 +131,10 @@ fn the_tokenizer_keeps_the_distinctive_words_and_drops_the_rest() {
         question_tokens("where are the config file options parsed?"),
         vec!["config", "options", "parsed"],
     );
-    assert_eq!(question_tokens("how does the main entry point of this code work"), vec!["point", "work"]);
+    assert_eq!(
+        question_tokens("how does the main entry point of this code work"),
+        vec!["point", "work"]
+    );
     assert_eq!(question_tokens("what is an i8 vs a u8 in 2024"), vec!["vs"; 0]);
 }
 
@@ -137,7 +143,10 @@ fn the_tokenizer_splits_on_punctuation_but_never_inside_an_identifier() {
     // An identifier the caller typed is the best seed there is — splitting it
     // on `_` would throw that away.
     assert_eq!(question_tokens("who calls draw_waterslide()?"), vec!["draw_waterslide"]);
-    assert_eq!(question_tokens("src/gui: the WaterslideView struct"), vec!["src", "gui", "waterslideview", "struct"]);
+    assert_eq!(
+        question_tokens("src/gui: the WaterslideView struct"),
+        vec!["src", "gui", "waterslideview", "struct"]
+    );
     // Repeats collapse: one walk per distinct word.
     assert_eq!(question_tokens("waterslide, waterslide, WATERSLIDE"), vec!["waterslide"]);
 }
@@ -147,13 +156,19 @@ fn seeds_are_case_insensitive_regexes_so_identifier_casing_cannot_hide_them() {
     // `waterslide` in the question must reach `WaterslideView` and
     // `WATERSLIDE_BINS` too — the caller typed a word, not an identifier.
     let seeds = seed_candidates("the waterslide view", &[], &[]);
-    assert_eq!(seeds.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(), vec!["(?i)waterslide", "(?i)view"]);
+    assert_eq!(
+        seeds.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(),
+        vec!["(?i)waterslide", "(?i)view"]
+    );
     assert!(seeds.iter().all(|c| c.regex), "a (?i) seed is only case-insensitive as a regex");
     // The tokenizer emits identifier characters only, so a seed can never
     // carry a metacharacter into that regex.
     for c in seed_candidates("what about a *b + c[0] (parens)?", &[], &[]) {
         assert!(
-            c.pattern.trim_start_matches("(?i)").chars().all(|ch| ch.is_alphanumeric() || ch == '_'),
+            c.pattern
+                .trim_start_matches("(?i)")
+                .chars()
+                .all(|ch| ch.is_alphanumeric() || ch == '_'),
             "metacharacter leaked into a seed: {}",
             c.pattern
         );
@@ -188,7 +203,8 @@ fn a_seed_is_a_candidate_like_any_other_and_the_guard_judges_it() {
     // Seeds cost nothing but search time precisely because the degenerate
     // guard disposes of the useless ones before the model sees anything.
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.rs"), "pub fn draw_waterslide(v: WaterslideView) {}\n").unwrap();
+    std::fs::write(dir.path().join("a.rs"), "pub fn draw_waterslide(v: WaterslideView) {}\n")
+        .unwrap();
     let common: String = (0..40).map(|i| format!("// view {i}\n")).collect();
     std::fs::write(dir.path().join("b.rs"), common).unwrap();
 
@@ -201,7 +217,11 @@ fn a_seed_is_a_candidate_like_any_other_and_the_guard_judges_it() {
         &FindConfig { degenerate_hit_cap: 10, ..Default::default() },
     );
     let fate = |p: &str| results.iter().find(|r| r.pattern == p).unwrap().fate;
-    assert_eq!(fate("(?i)rendering"), Fate::Whiffed, "a word that is not in this tree costs one walk");
+    assert_eq!(
+        fate("(?i)rendering"),
+        Fate::Whiffed,
+        "a word that is not in this tree costs one walk"
+    );
     assert_eq!(fate("(?i)waterslide"), Fate::Kept, "...and the distinctive one finds the answer");
     assert_eq!(fate("(?i)view"), Fate::TooCommon, "...while an everywhere-word is dropped whole");
     // The case-insensitive seed matched both spellings on the one line.
@@ -242,8 +262,14 @@ fn an_unreadable_or_absent_verdict_reads_as_answered() {
     // and missing one costs the status quo, while a spurious "no" costs a
     // whole extra round.
     assert!(parse_reflection(r#"{"patterns": ["x"]}"#, 4).unwrap().answered, "absent verdict");
-    assert!(parse_reflection(r#"{"answered": "maybe"}"#, 4).unwrap().answered, "unreadable verdict");
-    assert!(parse_reflection(r#"{"answered": 0}"#, 4).unwrap().answered, "a number is not a verdict");
+    assert!(
+        parse_reflection(r#"{"answered": "maybe"}"#, 4).unwrap().answered,
+        "unreadable verdict"
+    );
+    assert!(
+        parse_reflection(r#"{"answered": 0}"#, 4).unwrap().answered,
+        "a number is not a verdict"
+    );
     // Nothing parsed at all: the caller treats `None` exactly like "answered".
     for reply in ["", "I think so?", "[1,2]"] {
         assert_eq!(parse_reflection(reply, 4), None, "reply: {reply:?}");
@@ -272,9 +298,14 @@ fn reflection(answered: bool, patterns: &[&str]) -> Option<Reflection> {
 #[test]
 fn answered_stops_the_loop_and_unanswered_with_patterns_re_rounds() {
     assert_eq!(next_patterns(reflection(true, &[]), &[]), None, "answered: return what we have");
-    assert_eq!(next_patterns(reflection(true, &["ignored"]), &[]), None, "answered wins over patterns");
+    assert_eq!(
+        next_patterns(reflection(true, &["ignored"]), &[]),
+        None,
+        "answered wins over patterns"
+    );
 
-    let next = next_patterns(reflection(false, &["draw_waterslide", "fn draw_waterslide"]), &[]).unwrap();
+    let next =
+        next_patterns(reflection(false, &["draw_waterslide", "fn draw_waterslide"]), &[]).unwrap();
     assert_eq!(
         next.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(),
         vec!["draw_waterslide", "fn draw_waterslide"]
@@ -286,7 +317,11 @@ fn a_parse_failure_or_an_empty_refinement_returns_the_current_results() {
     // Never fail toward discarding results: every uncertain reply stops the
     // loop with what the rerank already kept.
     assert_eq!(next_patterns(None, &[]), None, "unparseable reply");
-    assert_eq!(next_patterns(reflection(false, &[]), &[]), None, "'no' with nothing to try instead");
+    assert_eq!(
+        next_patterns(reflection(false, &[]), &[]),
+        None,
+        "'no' with nothing to try instead"
+    );
 }
 
 #[test]
@@ -326,7 +361,8 @@ fn the_reflect_stage_is_skipped_when_it_cannot_help() {
 fn an_unreachable_model_leaves_the_results_alone() {
     // An LLM error in this stage must read as "answered": the rerank's result
     // is already in hand and reflect can only ever add to it.
-    let payload = json!({"hits": [{"file": "a.rs", "line": 1, "text": "fn x() {}", "context": "fn x() {}"}]});
+    let payload =
+        json!({"hits": [{"file": "a.rs", "line": 1, "text": "fn x() {}", "context": "fn x() {}"}]});
     assert_eq!(reflect(&offline_ctx("."), "anything", &payload, &[], 8), None);
 }
 
@@ -346,7 +382,10 @@ fn the_reflect_hit_list_numbers_the_hits_and_tags_comment_lines() {
     assert!(list.starts_with("[1] panel.rs:12 (comment)\n"), "list: {list}");
     assert!(list.contains("[2] mod.rs:708 (code)\n"), "list: {list}");
     assert!(list.contains("[3] cut.rs:3\n"), "a null-text hit is untagged: {list}");
-    assert!(list.contains("// calls draw_waterslide"), "the excerpt is what identifiers are read from");
+    assert!(
+        list.contains("// calls draw_waterslide"),
+        "the excerpt is what identifiers are read from"
+    );
     assert!(reflect_hit_list(&[]).is_empty());
 }
 
@@ -578,7 +617,10 @@ fn the_trying_line_reports_the_guard_separately() {
     // An unusable pattern is a whiff from the caller's chair: it produced
     // nothing.  A too-common one produced too much, which is a different
     // problem and a different fix.
-    assert_eq!(line, "trying: parse, load_config, (bad · 1 whiffed · 1 matched too much to discriminate");
+    assert_eq!(
+        line,
+        "trying: parse, load_config, (bad · 1 whiffed · 1 matched too much to discriminate"
+    );
 
     // An all-kept round says only what it tried.
     assert_eq!(trying_line(&[result("load_config", Fate::Kept, 3)]), "trying: load_config");
@@ -714,11 +756,9 @@ fn an_unconfigured_model_fails_open_before_any_search() {
 
 #[test]
 fn a_bad_filter_arg_fails_open() {
-    let err = run(
-        &offline_ctx("."),
-        &serde_json::json!({"question": "anything", "types": ["rustt"]}),
-    )
-    .unwrap_err();
+    let err =
+        run(&offline_ctx("."), &serde_json::json!({"question": "anything", "types": ["rustt"]}))
+            .unwrap_err();
     let text = assert_fails_open(&err);
     assert!(text.contains("invalid file type"), "text: {text}");
 }

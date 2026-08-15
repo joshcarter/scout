@@ -109,9 +109,12 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         // a search it was never asked for.
         ctx.ledger.raw_bytes(hit_list_bytes(&hits));
         ctx.ledger.record(
-            ctx.record("grep", &serde_json::json!({
-                "pattern": pattern, "hits_considered": hits.len(),
-            }))
+            ctx.record(
+                "grep",
+                &serde_json::json!({
+                    "pattern": pattern, "hits_considered": hits.len(),
+                }),
+            )
             .outcome(crate::stats::Outcome::Bypassed)
             .summary("no intent given — unfiltered search")
             .ms(ctx.ledger.elapsed_ms()),
@@ -153,9 +156,12 @@ pub fn rerank(
     // ── 3. Bypass: nothing for the model to filter ───────────────────
     if hits_total <= cfg.bypass_max_hits {
         ctx.ledger.record(
-            ctx.record("grep", &serde_json::json!({
-                "pattern": pattern, "intent": intent, "hits_considered": hits_total,
-            }))
+            ctx.record(
+                "grep",
+                &serde_json::json!({
+                    "pattern": pattern, "intent": intent, "hits_considered": hits_total,
+                }),
+            )
             .outcome(crate::stats::Outcome::Bypassed)
             .summary("few enough hits to return whole")
             .ms(ctx.ledger.elapsed_ms()),
@@ -214,7 +220,8 @@ pub fn rerank(
     }
 
     if !parsed_any {
-        let detail = last_error.unwrap_or_else(|| "local LLM returned no usable output".to_string());
+        let detail =
+            last_error.unwrap_or_else(|| "local LLM returned no usable output".to_string());
         return Err(fail(&detail));
     }
 
@@ -235,10 +242,8 @@ pub fn rerank(
         )));
     }
 
-    let returned: Vec<Value> = keeps
-        .iter()
-        .filter_map(|k| considered.get(k.id - 1).map(|h| materialize(h, k)))
-        .collect();
+    let returned: Vec<Value> =
+        keeps.iter().filter_map(|k| considered.get(k.id - 1).map(|h| materialize(h, k))).collect();
 
     Ok(rerank_payload(
         pattern,
@@ -274,10 +279,8 @@ pub fn search_options(
     root: &std::path::Path,
     args: &Value,
 ) -> Result<SearchOptions, String> {
-    let types = crate::source::build_types(
-        &string_list(args, "types"),
-        &string_list(args, "types_not"),
-    )?;
+    let types =
+        crate::source::build_types(&string_list(args, "types"), &string_list(args, "types_not"))?;
     let overrides = crate::source::build_overrides(root, &string_list(args, "globs"))?;
     Ok(SearchOptions {
         regex,
@@ -352,7 +355,12 @@ fn full_payload(
 }
 
 /// Bypass result: every hit, verbatim, no LLM involved.
-pub fn bypass_payload(pattern: &str, intent: &str, hits: &[RawHit], search_truncated: bool) -> Value {
+pub fn bypass_payload(
+    pattern: &str,
+    intent: &str,
+    hits: &[RawHit],
+    search_truncated: bool,
+) -> Value {
     full_payload(
         pattern,
         Some(intent),
@@ -524,7 +532,14 @@ pub fn parse_hits(results: &SearchResults, context_lines: usize) -> Vec<RawHit> 
                 Some(_) => (Some(h.col), Some(h.col_end.max(h.col))),
                 None => (None, None),
             };
-            RawHit { file: h.file.clone(), line: h.line, text, col, col_end, context: h.text.clone() }
+            RawHit {
+                file: h.file.clone(),
+                line: h.line,
+                text,
+                col,
+                col_end,
+                context: h.text.clone(),
+            }
         })
         .collect()
 }

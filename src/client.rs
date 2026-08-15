@@ -38,7 +38,9 @@ pub struct Config {
 
 #[derive(Debug)]
 pub enum LlmError {
-    EndpointUnavailable { endpoint: String },
+    EndpointUnavailable {
+        endpoint: String,
+    },
     RequestFailed(String),
     /// A deadline elapsed. The payload names *which* one, because scout bounds
     /// a streamed call with three separate clocks that mean three different
@@ -150,10 +152,7 @@ pub struct LlmClient {
 /// Returns true if an `io::Error` should be classified as a request timeout.
 /// Used to distinguish ureq's I/O transport errors from endpoint failures.
 pub(crate) fn is_timeout_io_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    )
+    matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
 }
 
 /// The three clocks a streamed call runs against.
@@ -415,9 +414,8 @@ impl LlmClient {
             body["max_tokens"] = json!(mt);
         }
 
-        let mut req = ureq::post(&url)
-            .timeout(self.config.timeout)
-            .set("Content-Type", "application/json");
+        let mut req =
+            ureq::post(&url).timeout(self.config.timeout).set("Content-Type", "application/json");
         if let Some(key) = &self.config.api_key {
             req = req.set("Authorization", &format!("Bearer {key}"));
         }
@@ -435,9 +433,9 @@ impl LlmClient {
                 use ureq::ErrorKind;
                 match t.kind() {
                     // DNS failure or refused connection — endpoint is down.
-                    ErrorKind::ConnectionFailed | ErrorKind::Dns => LlmError::EndpointUnavailable {
-                        endpoint: self.config.endpoint.clone(),
-                    },
+                    ErrorKind::ConnectionFailed | ErrorKind::Dns => {
+                        LlmError::EndpointUnavailable { endpoint: self.config.endpoint.clone() }
+                    }
                     // I/O error — inspect inner io::Error to distinguish timeout from disconnect.
                     ErrorKind::Io => {
                         let timed_out = (t as &dyn Error)
@@ -459,9 +457,7 @@ impl LlmClient {
                         if call_start.elapsed() >= self.config.timeout {
                             LlmError::Timeout(Deadline::Overall(self.config.timeout))
                         } else {
-                            LlmError::EndpointUnavailable {
-                                endpoint: self.config.endpoint.clone(),
-                            }
+                            LlmError::EndpointUnavailable { endpoint: self.config.endpoint.clone() }
                         }
                     }
                 }
@@ -667,15 +663,10 @@ mod tests {
     #[test]
     fn wrong_endpoint_complete_returns_unavailable() {
         let client = dead_client();
-        let err = client
-            .complete(vec![json!({"role": "user", "content": "hi"})], None)
-            .unwrap_err();
+        let err =
+            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
         assert!(matches!(err, LlmError::EndpointUnavailable { .. }));
     }
-
-
-
-
 
     // ── Streaming read loop (P5) ─────────────────────────────────────────
     // The reader is split out from the HTTP call precisely so these run
@@ -683,10 +674,7 @@ mod tests {
     // taken from the §5.5 measurement against LM Studio.
 
     fn delta(content: &str) -> String {
-        format!(
-            "data: {}\n\n",
-            json!({"choices": [{"index": 0, "delta": {"content": content}}]})
-        )
+        format!("data: {}\n\n", json!({"choices": [{"index": 0, "delta": {"content": content}}]}))
     }
 
     /// Budgets so wide nothing in a `Cursor`-driven test can reach them; the
@@ -703,24 +691,14 @@ mod tests {
         let mut seen = Vec::new();
         let (text, usage) = {
             let mut sink = |d: &str| seen.push(d.to_string());
-            read_stream(
-                std::io::Cursor::new(sse.as_bytes()),
-                slack(),
-                Instant::now(),
-                &mut sink,
-            )?
+            read_stream(std::io::Cursor::new(sse.as_bytes()), slack(), Instant::now(), &mut sink)?
         };
         Ok((text, usage, seen))
     }
 
     #[test]
     fn deltas_accumulate_in_order_and_reach_the_sink() {
-        let sse = format!(
-            "{}{}{}data: [DONE]\n\n",
-            delta("Hel"),
-            delta("lo, "),
-            delta("world")
-        );
+        let sse = format!("{}{}{}data: [DONE]\n\n", delta("Hel"), delta("lo, "), delta("world"));
         let (text, usage, seen) = read(&sse).unwrap();
         assert_eq!(text, "Hello, world");
         assert_eq!(seen, ["Hel", "lo, ", "world"]);
@@ -860,10 +838,7 @@ mod tests {
                     }
                     Some(Beat::Silence(d)) => {
                         std::thread::sleep(d);
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "quiet",
-                        ));
+                        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "quiet"));
                     }
                     Some(Beat::Eof) | None => return Ok(&[]),
                 }
@@ -1229,9 +1204,8 @@ mod tests {
         );
         let client = client_against(endpoint, Duration::from_secs(20), Duration::from_millis(400));
         let start = Instant::now();
-        let err = client
-            .complete(vec![json!({"role": "user", "content": "hi"})], None)
-            .unwrap_err();
+        let err =
+            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
         let elapsed = start.elapsed();
         assert!(
             matches!(err, LlmError::Timeout(Deadline::Idle(_))),
@@ -1248,9 +1222,8 @@ mod tests {
         let endpoint = stalling_server(": ping\n\n");
         let client = client_against(endpoint, Duration::from_millis(400), Duration::from_secs(20));
         let start = Instant::now();
-        let err = client
-            .complete(vec![json!({"role": "user", "content": "hi"})], None)
-            .unwrap_err();
+        let err =
+            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
         let elapsed = start.elapsed();
         assert!(
             matches!(err, LlmError::Timeout(Deadline::FirstToken(_))),
@@ -1319,7 +1292,10 @@ mod tests {
             (LlmError::EndpointUnavailable { endpoint: "x".into() }, Outcome::EndpointUnreachable),
             (LlmError::Timeout(Deadline::Overall(Duration::from_secs(120))), Outcome::Timeout),
             (LlmError::RequestFailed("HTTP 500: boom".into()), Outcome::HttpError),
-            (LlmError::RequestFailed("network I/O error: reset".into()), Outcome::EndpointUnreachable),
+            (
+                LlmError::RequestFailed("network I/O error: reset".into()),
+                Outcome::EndpointUnreachable,
+            ),
             (LlmError::RequestFailed("parse LLM response: eof".into()), Outcome::ParseFailure),
             (LlmError::Internal("LLM returned empty response".into()), Outcome::EmptyResponse),
             (LlmError::Internal("serialize request: nope".into()), Outcome::ParseFailure),
@@ -1328,9 +1304,7 @@ mod tests {
             assert_eq!(err.outcome(), want, "{err:?}");
         }
         // ...and none of them is ever recorded as a success.
-        assert!(!LlmError::Timeout(Deadline::Idle(Duration::from_secs(15)))
-            .outcome()
-            .is_ok());
+        assert!(!LlmError::Timeout(Deadline::Idle(Duration::from_secs(15))).outcome().is_ok());
     }
 
     #[test]
@@ -1353,34 +1327,23 @@ mod tests {
     // io::Error to distinguish Timeout from other errors. We test the
     // classification predicate directly since ureq Transport is unforgeble.
 
-
     #[test]
     fn io_timed_out_matches_timeout_predicate() {
         let io_err = std::io::Error::from(std::io::ErrorKind::TimedOut);
-        assert!(
-            is_timeout_io_error(&io_err),
-            "TimedOut should match the timeout predicate"
-        );
+        assert!(is_timeout_io_error(&io_err), "TimedOut should match the timeout predicate");
     }
 
     #[test]
     fn io_would_block_matches_timeout_predicate() {
         let io_err = std::io::Error::from(std::io::ErrorKind::WouldBlock);
-        assert!(
-            is_timeout_io_error(&io_err),
-            "WouldBlock should match the timeout predicate"
-        );
+        assert!(is_timeout_io_error(&io_err), "WouldBlock should match the timeout predicate");
     }
 
     #[test]
     fn io_broken_pipe_does_not_match_timeout_predicate() {
         let io_err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
-        assert!(
-            !is_timeout_io_error(&io_err),
-            "BrokenPipe must not match the timeout predicate"
-        );
+        assert!(!is_timeout_io_error(&io_err), "BrokenPipe must not match the timeout predicate");
     }
-
 
     #[test]
     fn check_endpoint_treats_http_error_as_reachable() {
@@ -1398,8 +1361,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_roundtrip() {
-        let endpoint = std::env::var("LM_HOST")
-            .unwrap_or_else(|_| "http://localhost:11434/v1".into());
+        let endpoint =
+            std::env::var("LM_HOST").unwrap_or_else(|_| "http://localhost:11434/v1".into());
         let model = std::env::var("LM_MODEL").unwrap_or_else(|_| "qwen3:8b".into());
         let client = LlmClient::new(Config {
             endpoint: endpoint.clone(),
@@ -1452,9 +1415,8 @@ mod tests {
             "content": "Count from one to ten in words, separated by commas. /no_think",
         })];
 
-        let (plain, plain_usage) = LlmClient::new(cfg(false))
-            .complete(prompt.clone(), None)
-            .expect("non-streaming call");
+        let (plain, plain_usage) =
+            LlmClient::new(cfg(false)).complete(prompt.clone(), None).expect("non-streaming call");
 
         let mut deltas: Vec<String> = Vec::new();
         let (streamed, streamed_usage) = {
