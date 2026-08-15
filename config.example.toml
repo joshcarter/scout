@@ -15,8 +15,33 @@ model = "qwen3:27b"
 # value but some require the header to be present at all.
 # api_key = "local"
 
-# Clamped to 1..3600.
+# The outer bound on a whole call — connect, request, and the entire
+# reply. Clamped to 1..3600.
 # timeout_seconds = 120
+
+# Two progress budgets, applied to a streamed reply only (see `stream`
+# below). They exist because a total-elapsed deadline cannot tell a
+# slow-but-working model from a hung one: a model emitting tokens steadily
+# is healthy however long it has been running, and a connection that has
+# produced nothing for twenty seconds is wedged however recently it
+# started. Raising timeout_seconds to cover the first case buys minutes of
+# waiting on the second.
+#
+# first_token_timeout_seconds bounds "the model never started". Generous,
+# because a cold local host loads several gigabytes of weights off disk
+# before the first byte and that is not a fault. It is measured from the
+# moment the reply's headers arrive, and only until the first token; after
+# that it is never consulted again.
+#
+# idle_timeout_seconds bounds "the model stopped mid-answer" — the longest
+# silence tolerated *between* tokens, armed only once the first one has
+# landed. Tight, because by then the model has proved it can produce.
+# Raise it if your host batches tokens in large, infrequent flushes.
+#
+# Both are clamped to 1..3600, and timeout_seconds still applies on top of
+# them as the outer net.
+# first_token_timeout_seconds = 60
+# idle_timeout_seconds = 15
 
 # Cap on generated tokens. Unset means no cap is sent; a per-call
 # argument overrides this.

@@ -131,6 +131,28 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         .map(|v| v.clamp(1, 3600) as u64)
         .unwrap_or(120);
 
+    // The two progress budgets. Same clamp, same cast discipline, same
+    // reason: `v as u64` on a negative i64 wraps to near-maxint, which turns a
+    // typo into a deadline that never fires.
+    //
+    // They are separate from `timeout_seconds` because they measure different
+    // things. A local model's cold load — several GB of weights off disk before
+    // a single byte comes back — is not a stall, so the first-token budget is
+    // generous; a stream that has been producing and then goes quiet is a
+    // stall regardless of how recently the call started, so the idle budget is
+    // tight. Streaming only: `stream = false` has no progress signal to watch.
+    let first_token_timeout_seconds = section
+        .get("first_token_timeout_seconds")
+        .and_then(|v| v.as_integer())
+        .map(|v| v.clamp(1, 3600) as u64)
+        .unwrap_or(60);
+
+    let idle_timeout_seconds = section
+        .get("idle_timeout_seconds")
+        .and_then(|v| v.as_integer())
+        .map(|v| v.clamp(1, 3600) as u64)
+        .unwrap_or(15);
+
     let api_key = section
         .get("api_key")
         .and_then(|v| v.as_str())
@@ -153,6 +175,8 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         endpoint,
         model,
         timeout: Duration::from_secs(timeout_seconds),
+        first_token_timeout: Duration::from_secs(first_token_timeout_seconds),
+        idle_timeout: Duration::from_secs(idle_timeout_seconds),
         api_key,
         max_tokens,
         stream,
@@ -305,6 +329,61 @@ mod tests {
         );
         let cfg = load_config(&path).unwrap();
         assert_eq!(cfg.timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn load_config_progress_budgets_default_and_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n";
+        let cfg = load_config(&write_config(&dir, base)).unwrap();
+        assert_eq!(cfg.first_token_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(15));
+        // Generous first token, tight idle gap: they measure different things
+        // and the defaults have to reflect that or the split is pointless.
+        assert!(cfg.idle_timeout < cfg.first_token_timeout);
+        assert!(cfg.first_token_timeout < cfg.timeout);
+
+        let cfg = load_config(&write_config(
+            &dir,
+            &format!("{base}first_token_timeout_seconds = 90\nidle_timeout_seconds = 5\n"),
+        ))
+        .unwrap();
+        assert_eq!(cfg.first_token_timeout, Duration::from_secs(90));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn load_config_negative_progress_budgets_clamped_not_wrapped() {
+        // Same regression as timeout_seconds: `v as u64` on a negative i64
+        // wraps to near-maxint, which turns a typo into a budget that never
+        // fires — the exact failure mode this feature exists to remove.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\nfirst_token_timeout_seconds = -5\nidle_timeout_seconds = 0\n",
+        );
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.first_token_timeout, Duration::from_secs(1), "{:?}", cfg.first_token_timeout);
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(1), "{:?}", cfg.idle_timeout);
+    }
+
+    #[test]
+    fn load_config_progress_budgets_capped_at_one_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            &dir,
+            "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\nfirst_token_timeout_seconds = 99999\nidle_timeout_seconds = 99999\n",
+        );
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.first_token_timeout, Duration::from_secs(3600));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_the_progress_budgets() {
+        // config.example.toml is the only place a user learns a knob exists.
+        assert!(DEFAULT_CONFIG.contains("# first_token_timeout_seconds = 60"));
+        assert!(DEFAULT_CONFIG.contains("# idle_timeout_seconds = 15"));
     }
 
     // The process environment is global and cargo runs tests on parallel

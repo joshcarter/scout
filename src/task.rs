@@ -48,6 +48,8 @@ mod tests {
             endpoint: "http://127.0.0.1:1/v1".into(),
             model: "test-model".into(),
             timeout: Duration::from_secs(2),
+            first_token_timeout: Duration::from_secs(2),
+            idle_timeout: Duration::from_secs(2),
             api_key: None,
             max_tokens: None,
             stream: true,
