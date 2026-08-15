@@ -171,6 +171,24 @@
     padding: 6px 8px; font-size: 11.5px; max-height: 320px; overflow: auto;
   }
   pre.body.placeholder { color: var(--dim); font-style: italic; }
+  /* find's per-round internals (P4). Same slab as pre.body so the round reads
+     as one more block of the detail pane rather than a second design. */
+  .fr {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 3px;
+    padding: 6px 8px; font-size: 11.5px; max-height: 320px; overflow: auto;
+  }
+  .fr .line { display: flex; gap: 8px; align-items: baseline; }
+  .fr .grow { flex: 1 1 auto; overflow-wrap: anywhere; color: var(--fg2); }
+  .fr .n { flex: 0 0 auto; color: var(--dim); }
+  .fr .why { color: var(--dim); font-style: italic; }
+  .fr .head { color: var(--dim); margin-bottom: 3px; }
+  .fr .kept { color: var(--green); }
+  .fr .whiffed { color: var(--dim); }
+  .fr .too_common { color: var(--yellow); }
+  .fr .unusable { color: var(--red); }
+  .fr .tagseed { color: var(--cyan); }
+  .fr .tagre { color: var(--purple); }
+  .fr .none { color: var(--dim); font-style: italic; }
   .kv { display: grid; grid-template-columns: 96px minmax(0,1fr); gap: 0 8px; font-size: 11.5px; }
   .kv dt { color: var(--dim); }
   .kv dd { color: var(--fg2); overflow-wrap: anywhere; }
@@ -280,8 +298,11 @@
   let cursor = '';                // opaque server cursor (a row id)
   let pinnedId = null;            // null ⇒ Live
   let missedWhilePinned = 0;
+  const findRoundsByOp = new Map(); // op id → Map(round → {patterns,hits,rerank,reflect})
+  const detailFetched = new Set();  // op ids already asked for bodies/rounds
   let renderedDetailId = null;    // what the detail pane currently shows
   let renderedRound = 0;
+  let findRound = null;           // selected find round, null ⇒ the newest seen
   let historySig = '';            // re-render guard for the history list
   let backfilled = false;         // the first page has landed
   const expanded = new Set();     // op ids whose rounds are shown
@@ -540,8 +561,9 @@
     if (op.id === renderedDetailId) return;
     renderedDetailId = op.id;
     renderedRound = 0;
+    findRound = null;
     paintDetail(op);
-    ensureBodies(op);
+    ensureDetail(op);
   }
   // Copyable block texts, by index. Deliberately not inlined into a
   // `data-copy` attribute: these carry JSON and shell commands, and quoting
@@ -560,9 +582,8 @@
       esc(op.kind) + (op.summary ? ' \u2014 ' + esc(op.summary) : '') + '</div>' +
       '</div>';
 
-    // The round tab strip: a `find` is three preset calls, and seeing round 1's
-    // patterns next to round 2's is the best debugging view scout has. P4 adds
-    // the per-round internals; P2 shows the calls themselves.
+    // The call tab strip: the preset round-trips this operation made. One tab
+    // per row, which for a `find` is find_patterns / grep / find_reflect.
     if (op.rows.length > 1) {
       html += '<div class="tabs">';
       op.rows.forEach((row, i) => {
@@ -571,6 +592,11 @@
       });
       html += '</div>';
     }
+
+    // `find`'s per-round internals (P4): seeing round 1's patterns next to
+    // round 2's after a reflect-driven retry is the best debugging view scout
+    // has, and none of it reaches the log.
+    html += renderFindRounds(op);
 
     // `{}` renders as an empty block that reads like a bug rather than a fact,
     // so say it in words. The reader drops pre-v2 records outright, so an empty
@@ -618,6 +644,137 @@
       kv.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl></div>';
     $('detail').innerHTML = html;
   }
+  // ── find rounds ──────────────────────────────────────────────────────
+  // Everything here keys on `op`, never on arrival order: two concurrent
+  // `find`s interleave their events over the channel exactly as their rows
+  // interleave in the log. And there is no replay buffer (§2.5) — a tab
+  // opened mid-run holds round 3 and nothing before it, which renders as a
+  // one-tab strip and a note, not as an error or a blank pane.
+  const FIND_PARTS = ['patterns', 'hits', 'rerank', 'reflect'];
+
+  function ingestFindEvent(ev) {
+    const opId = ev.op || ev.id;
+    if (!opId || !ev.kind) return null;
+    const part = ev.kind.slice('find.'.length);
+    if (FIND_PARTS.indexOf(part) < 0) return null;
+    let rounds = findRoundsByOp.get(opId);
+    if (!rounds) { rounds = new Map(); findRoundsByOp.set(opId, rounds); }
+    const n = ev.round || 0;
+    const round = rounds.get(n) || {};
+    round[part] = ev;                       // a repeat updates, never appends
+    rounds.set(n, round);
+    return opId;
+  }
+  /** `find_rounds` as `/api/call/<id>` serves it: the same events, batched. */
+  function ingestFindRounds(opId, list) {
+    for (const r of (list || [])) {
+      for (const part of FIND_PARTS) {
+        if (!r[part]) continue;
+        ingestFindEvent(Object.assign({ op: opId, round: r.round, kind: 'find.' + part }, r[part]));
+      }
+    }
+  }
+  function renderFindRounds(op) {
+    const rounds = findRoundsByOp.get(op.op);
+    const nums = rounds ? [...rounds.keys()].sort((a, b) => a - b) : [];
+    if (!nums.length) {
+      if (op.tool !== 'find') return '';
+      return block('find rounds',
+        'not captured — the dashboard was not listening while this search ran.\n' +
+        'Round internals travel the live channel (SPEC-dashboard §2.5) and are not written to the log.',
+        true);
+    }
+    const sel = nums.indexOf(findRound) >= 0 ? findRound : nums[nums.length - 1];
+    let html = '<div class="tabs">';
+    for (const n of nums) {
+      html += '<button class="tab' + (n === sel ? ' on' : '') + '" data-fround="' + esc(n) + '">round ' +
+        esc(n) + '</button>';
+    }
+    html += '</div>';
+    if (nums[0] > 1) {
+      html += '<div class="block"><div class="fr none">round' + (nums[0] > 2 ? 's 1–' : ' ') +
+        esc(nums[0] - 1) + ' ran before this tab was listening — there is no replay buffer.</div></div>';
+    }
+    const r = rounds.get(sel) || {};
+    html += findPatternsBlock(r.patterns, r.hits);
+    html += findRerankBlock(r.rerank);
+    html += findReflectBlock(r.reflect);
+    return html;
+  }
+  /** A detail block whose body is markup rather than text; copy yields JSON. */
+  function frBlock(title, inner, source) {
+    const idx = copyBlocks.push(JSON.stringify(source, null, 2)) - 1;
+    return '<div class="block"><div class="block-head"><span>' + esc(title) + '</span>' +
+      '<button class="copy" data-copy="' + idx + '">copy</button></div>' +
+      '<div class="fr">' + inner + '</div></div>';
+  }
+  function findPatternsBlock(patterns, hits) {
+    if (!patterns && !hits) return '';
+    const byPattern = new Map();
+    for (const c of ((hits && hits.candidates) || [])) byPattern.set(c.pattern, c);
+    let list = (patterns && patterns.patterns) || [];
+    if (!list.length) list = [...byPattern.keys()].map(p => ({ pattern: p }));
+    let body = '<div class="head">' +
+      (patterns
+        ? (patterns.source === 'reflect'
+            ? 'patterns the reflect stage asked for'
+            : 'model guesses, then the question’s own words as seeds')
+        : 'searched this round') +
+      (patterns && patterns.truncated ? ' · list shortened to fit the channel' : '') +
+      '</div>';
+    for (const p of list) {
+      const c = byPattern.get(p.pattern) || null;
+      const fate = c ? String(c.fate || '') : '';
+      body += '<div class="line">' +
+        '<span class="grow ' + esc(fate) + '">' + esc(p.pattern) + '</span>' +
+        (p.seed ? '<span class="tagseed">seed</span>' : '') +
+        (p.regex ? '<span class="tagre">re</span>' : '') +
+        '<span class="n">' + (c ? esc(c.hits) + ' hit' + (c.hits === 1 ? '' : 's') : '—') + '</span>' +
+        (fate ? '<span class="' + esc(fate) + '">' + esc(fate.replace(/_/g, ' ')) + '</span>' : '') +
+        '</div>' +
+        (c && c.why ? '<div class="line"><span class="why">↳ ' + esc(c.why) + '</span></div>' : '');
+    }
+    if (hits) {
+      body += '<div class="head" style="margin-top:6px">' + esc(hits.union) +
+        ' hit(s) in the union' +
+        (hits.carried ? ' — ' + esc(hits.new) + ' new, ' + esc(hits.carried) + ' carried forward' : '') +
+        ' · degenerate cap ' + esc(hits.degenerate_hit_cap) +
+        (hits.search_truncated ? ' · search truncated' : '') + '</div>';
+    }
+    return frBlock('patterns · hits', body, { patterns: patterns, hits: hits });
+  }
+  function findRerankBlock(rr) {
+    if (!rr) return '';
+    let body = '<div class="head">' + esc(rr.returned || 0) + ' kept of ' +
+      esc(rr.hits_considered || 0) + ' considered, ' + esc(rr.hits_total || 0) + ' found' +
+      (rr.none_relevant ? ' · none judged relevant' : '') + '</div>';
+    const keeps = rr.keeps || [];
+    for (const k of keeps) {
+      body += '<div class="line"><span class="n">' + esc(k.score) + '</span>' +
+        '<span class="grow">' + esc(k.file) + ':' + esc(k.line) + '</span></div>' +
+        (k.why ? '<div class="line"><span class="why">↳ ' + esc(k.why) + '</span></div>' : '');
+    }
+    if (!keeps.length) body += '<div class="none">the reranker kept nothing</div>';
+    return frBlock('rerank', body, rr);
+  }
+  function findReflectBlock(rf) {
+    if (!rf) return '';
+    let body = '<div class="head">' + (rf.parsed === false ? 'unreadable reply, read as ' : '') +
+      (rf.answered
+        ? 'answered — these hits address the question'
+        : 'off-target — the hits do not answer the question') + '</div>';
+    const refining = rf.refining || [];
+    for (const p of (rf.patterns || [])) {
+      const going = refining.indexOf(p) >= 0;
+      body += '<div class="line"><span class="grow' + (going ? '' : ' whiffed') + '">' + esc(p) + '</span>' +
+        '<span class="n">' + (going ? 'searching next' : 'already tried') + '</span></div>';
+    }
+    if (!rf.answered && !refining.length) {
+      body += '<div class="none">nothing new to search — the round stands</div>';
+    }
+    return frBlock('reflect', body, rf);
+  }
+
   function block(title, text, placeholder) {
     const idx = copyBlocks.push(text) - 1;
     return '<div class="block"><div class="block-head"><span>' + esc(title) + '</span>' +
@@ -625,6 +782,13 @@
       '<pre class="body' + (placeholder ? ' placeholder' : '') + '">' + esc(text) + '</pre></div>';
   }
   $('detail').addEventListener('click', e => {
+    const fr = e.target.closest('[data-fround]');
+    if (fr) {
+      findRound = parseInt(fr.getAttribute('data-fround'), 10);
+      const op = currentOp();
+      if (op) paintDetail(op);
+      return;
+    }
     const tab = e.target.closest('[data-round]');
     if (tab) {
       renderedRound = parseInt(tab.getAttribute('data-round'), 10) || 0;
@@ -747,6 +911,14 @@
   }
   function applyLiveEvent(ev) {
     if (!ev || !ev.id || !ev.kind) return;
+    if (ev.kind.indexOf('find.') === 0) {
+      const opId = ingestFindEvent(ev);
+      // Repaint in place rather than clearing `renderedDetailId`: a round the
+      // reader selected by hand must survive its own operation moving on.
+      const cur = currentOp();
+      if (opId && cur && cur.op === opId) paintDetail(cur);
+      return;
+    }
     ingestBodies(ev);
     if (ev.kind === 'call.start') {
       upsertLiveRow(ev);
@@ -806,13 +978,21 @@
     renderHistory(true);
     renderDetail();
   }
-  function ensureBodies(op) {
+  // Backfill what only the daemon's memory holds — bodies, and a `find`'s
+  // rounds — for an operation the live stream did not deliver in full. That is
+  // every operation after a reload, and every deep link.
+  function ensureDetail(op) {
     if (!op || !op.rows || !op.rows.length) return;
     const missing = op.rows.filter(r => !bodiesByRowId.has(r.id));
-    if (!missing.length) return;
+    // Rounds are asked for once per operation: unlike a body, a `find` that
+    // never had them recorded has nothing to wait for.
+    const wantRounds = op.tool === 'find' && !findRoundsByOp.has(op.op) && !detailFetched.has(op.op);
+    if (!missing.length && !wantRounds) return;
+    if (wantRounds) detailFetched.add(op.op);
     const id = op.rows[0].id;
     fetch('/api/call/' + encodeURIComponent(id)).then(r => r.json()).then(d => {
       for (const r of (d.rows || [])) ingestBodies(r);
+      ingestFindRounds(d.op || op.op, d.find_rounds);
       // Remember a miss so we do not refetch every paint of an old row.
       for (const r of missing) {
         if (!bodiesByRowId.has(r.id)) bodiesByRowId.set(r.id, {});

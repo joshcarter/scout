@@ -11,7 +11,7 @@
 
 use crate::stats::{self, CallRecord};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +25,9 @@ use std::time::{Duration, SystemTime};
 pub const MAX_DGRAM: usize = 64 * 1024;
 /// In-memory body cache. A daemon restart empties it.
 pub const MAX_BODIES: usize = 500;
+/// In-memory `find` round cache, keyed by `op`. Smaller than `MAX_BODIES`:
+/// only `find` writes here, and it is the rarest of the tools.
+pub const MAX_FINDS: usize = 200;
 /// Concurrent `/api/stream` connections. Each is a thread that lives as
 /// long as the browser tab.
 pub const MAX_STREAMS: usize = 8;
@@ -177,6 +180,51 @@ pub fn emit_end(rec: &CallRecord, response: Option<&str>) {
     emit_bytes(&fit_event(ev));
 }
 
+/// Is anyone on the other end?
+///
+/// Resolves and caches the socket exactly as an emit would, so a caller whose
+/// payload costs something to build can skip building it. Answering "no" is
+/// one mutex acquisition after the first call — the same cached `Missing` that
+/// keeps a long-lived MCP server from re-`connect(2)`ing per event.
+pub fn is_listening() -> bool {
+    let mut slot = sender_slot();
+    if slot.is_none() {
+        *slot = Some(resolve());
+    }
+    matches!(slot.as_ref(), Some(Sock::Ready(_)))
+}
+
+/// `find.*` — one round's internals (SPEC-dashboard §2.5, P4).
+///
+/// `kind` is the bare suffix (`patterns`, `hits`, `rerank`, `reflect`) and
+/// `fields` is merged over the envelope, so the shape of a round lives in
+/// `find.rs` next to the values and the transport lives here.
+///
+/// Unlike `call.*` these describe an operation rather than a single
+/// round-trip, so there is no row id to carry: `id` is the operation's own id.
+/// That is minted from the same counter as a row id (`stats::next_id`) and so
+/// can never collide with one. The daemon keys on `op` regardless — two
+/// concurrent `find`s interleave over this channel exactly as their log rows
+/// interleave in the log.
+pub fn emit_find(op: &str, round: u64, kind: &str, fields: Value) {
+    let mut ev = json!({
+        "v": 1,
+        "id": op,
+        "run": stats::run_id(),
+        "op": op,
+        "seq": next_seq(),
+        "kind": format!("find.{kind}"),
+        "ts": now_ts(),
+        "round": round,
+    });
+    if let (Some(obj), Some(extra)) = (ev.as_object_mut(), fields.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    emit_bytes(&fit_event(ev));
+}
+
 fn next_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed) + 1
@@ -222,6 +270,28 @@ fn fit_event(mut v: Value) -> Vec<u8> {
             return bytes;
         }
     }
+    // Lists next. `find.*` carries pattern, candidate and keep arrays, and a
+    // wide search can make any of them long enough to matter on its own. Halve
+    // the longest repeatedly and say so: a partial list is worth more than a
+    // dropped event, and a reader that cannot tell partial from complete would
+    // be worse than either.
+    for _ in 0..16 {
+        let Some((key, len)) = longest_array(&v) else { break };
+        if len < 2 {
+            break;
+        }
+        if let Some(Value::Array(a)) = v.get_mut(&key) {
+            a.truncate(len / 2);
+        }
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("truncated".into(), Value::Bool(true));
+        }
+        bytes = v.to_string().into_bytes();
+        if bytes.len() <= MAX_DGRAM {
+            return bytes;
+        }
+    }
+
     // Last resort: drop the bodies entirely. Metadata still has to land.
     for key in ["system", "user", "response"] {
         if let Some(obj) = v.as_object_mut() {
@@ -233,6 +303,15 @@ fn fit_event(mut v: Value) -> Vec<u8> {
         bytes.truncate(MAX_DGRAM);
     }
     bytes
+}
+
+/// The longest top-level array field, if any: `fit_event`'s next thing to trim.
+fn longest_array(v: &Value) -> Option<(String, usize)> {
+    v.as_object()?
+        .iter()
+        .filter_map(|(k, val)| val.as_array().map(|a| (k.clone(), a.len())))
+        .filter(|(_, n)| *n > 0)
+        .max_by_key(|(_, n)| *n)
 }
 
 fn elide(s: &str, budget: usize) -> String {
@@ -352,6 +431,14 @@ struct Inner {
     inflight: HashMap<String, LiveRow>,
     body_order: VecDeque<String>,
     bodies: HashMap<String, Bodies>,
+    /// `op` → round → part name (`patterns` … `reflect`) → the event.
+    ///
+    /// Keyed by `op` and by round number, never by arrival order: rounds of
+    /// two concurrent `find`s interleave, and a dashboard that joined mid-run
+    /// holds round 3 without ever having seen 1 or 2. A `BTreeMap` so the
+    /// rounds come back ordered whatever order they landed in.
+    finds: HashMap<String, BTreeMap<u64, Map<String, Value>>>,
+    find_order: VecDeque<String>,
     subs: Vec<SyncSender<String>>,
 }
 
@@ -368,6 +455,8 @@ impl LiveStore {
                 inflight: HashMap::new(),
                 body_order: VecDeque::new(),
                 bodies: HashMap::new(),
+                finds: HashMap::new(),
+                find_order: VecDeque::new(),
                 subs: Vec::new(),
             }),
             streams: AtomicUsize::new(0),
@@ -451,6 +540,19 @@ impl LiveStore {
                         put_bodies(&mut inner, id, b);
                     }
                 }
+                k if k.starts_with("find.") => {
+                    let part = &k["find.".len()..];
+                    if !matches!(part, "patterns" | "hits" | "rerank" | "reflect") {
+                        return false;
+                    }
+                    // `op` is the grouping key. A find event minted before the
+                    // ledger existed would have none; fall back to its own id
+                    // so it lands somewhere rather than nowhere.
+                    let op = opt_s(&v, "op").unwrap_or_else(|| id.clone());
+                    let round = v.get("round").and_then(Value::as_u64).unwrap_or(0);
+                    let part = part.to_string();
+                    put_find(&mut inner, op, round, part, v.clone());
+                }
                 _ => return false,
             }
             let dead: Vec<usize> = inner
@@ -482,10 +584,38 @@ impl LiveStore {
         self.lock().bodies.get(id).cloned()
     }
 
-    /// `(inflight, bodies, streams)` for `/api/status`.
-    pub fn snapshot(&self) -> (usize, usize, usize) {
+    /// The `find` rounds captured for one operation, oldest round first.
+    ///
+    /// `None` when nothing was captured — which is the ordinary answer for
+    /// every tool that is not `find`, for a `find` that ran before the daemon
+    /// started, and for one whose rounds have since been evicted. There is no
+    /// replay buffer (§2.5), so a partial answer here is a fact about what was
+    /// witnessed, not an error.
+    pub fn find_rounds(&self, op: &str) -> Option<Value> {
         let inner = self.lock();
-        (inner.inflight.len(), inner.bodies.len(), self.stream_count())
+        let rounds = inner.finds.get(op)?;
+        if rounds.is_empty() {
+            return None;
+        }
+        Some(Value::Array(
+            rounds
+                .iter()
+                .map(|(round, parts)| {
+                    let mut obj = Map::new();
+                    obj.insert("round".into(), Value::from(*round));
+                    for (k, v) in parts {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                    Value::Object(obj)
+                })
+                .collect(),
+        ))
+    }
+
+    /// `(inflight, bodies, finds, streams)` for `/api/status`.
+    pub fn snapshot(&self) -> (usize, usize, usize, usize) {
+        let inner = self.lock();
+        (inner.inflight.len(), inner.bodies.len(), inner.finds.len(), self.stream_count())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -504,6 +634,24 @@ fn put_bodies(inner: &mut Inner, id: String, bodies: Bodies) {
     while inner.body_order.len() > MAX_BODIES {
         if let Some(old) = inner.body_order.pop_front() {
             inner.bodies.remove(&old);
+        }
+    }
+}
+
+/// Merge one `find.*` event into its operation's round, LRU-capped by `op`.
+///
+/// Re-applying the same part of the same round overwrites rather than appends:
+/// an operation that somehow emits `find.patterns` twice for round 2 is one
+/// round with a later reading, never two rounds.
+fn put_find(inner: &mut Inner, op: String, round: u64, part: String, ev: Value) {
+    if let Some(pos) = inner.find_order.iter().position(|k| k == &op) {
+        inner.find_order.remove(pos);
+    }
+    inner.finds.entry(op.clone()).or_default().entry(round).or_default().insert(part, ev);
+    inner.find_order.push_back(op);
+    while inner.find_order.len() > MAX_FINDS {
+        if let Some(old) = inner.find_order.pop_front() {
+            inner.finds.remove(&old);
         }
     }
 }
@@ -813,8 +961,182 @@ mod tests {
         }
         assert!(store.bodies_of("id-0").is_none());
         assert!(store.bodies_of(&format!("id-{}", MAX_BODIES + 2)).is_some());
-        let (_, n, _) = store.snapshot();
+        let (_, n, _, _) = store.snapshot();
         assert_eq!(n, MAX_BODIES);
+    }
+
+    // ── find.* (P4) ──────────────────────────────────────────────────────
+
+    fn find_ev(op: &str, round: u64, kind: &str, extra: Value) -> String {
+        let mut v = json!({
+            "v": 1, "id": op, "run": "r", "op": op, "seq": 1,
+            "kind": format!("find.{kind}"), "ts": 1.0, "round": round,
+        });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn a_find_event_costs_nothing_when_nobody_is_listening() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such.sock");
+        with_sock_env(&path, || {
+            assert!(!is_listening(), "no socket, no listener");
+            // The guard callers use is one cached lookup; emitting anyway must
+            // still be silent and must not create the socket.
+            emit_find("op-1", 1, "patterns", json!({"patterns": []}));
+            emit_find("op-1", 1, "hits", json!({"candidates": []}));
+            match sender_slot().as_ref() {
+                Some(Sock::Missing) => {}
+                other => panic!("expected cached Missing, got {other:?}"),
+            }
+            assert!(!path.exists(), "a miss must not create the socket");
+        });
+    }
+
+    #[test]
+    fn a_connected_find_event_carries_id_op_and_round() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        with_sock_env(&path, || {
+            assert!(is_listening());
+            emit_find("op-7", 2, "reflect", json!({"answered": false, "patterns": ["draw"]}));
+            let mut buf = vec![0u8; MAX_DGRAM];
+            let n = listener.recv(&mut buf).expect("datagram");
+            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(v["kind"], "find.reflect");
+            assert_eq!(v["op"], "op-7");
+            assert_eq!(v["id"], "op-7", "no row id exists; the op stands in");
+            assert_eq!(v["round"], 2);
+            assert_eq!(v["run"], stats::run_id());
+            assert_eq!(v["answered"], false);
+            assert_eq!(v["patterns"][0], "draw");
+        });
+    }
+
+    #[test]
+    fn an_oversized_find_event_is_truncated_rather_than_dropped() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        with_sock_env(&path, || {
+            // A pathological keep list: far past MAX_DGRAM in one array.
+            let keeps: Vec<Value> = (0..4000)
+                .map(|i| json!({"file": format!("src/{i}/{}.rs", "long".repeat(20)), "line": i, "why": "y".repeat(120)}))
+                .collect();
+            emit_find("op-big", 1, "rerank", json!({"keeps": keeps}));
+            let mut buf = vec![0u8; MAX_DGRAM + 4096];
+            let n = listener.recv(&mut buf).expect("datagram");
+            assert!(n <= MAX_DGRAM, "datagram was {n} bytes");
+            let v: Value = serde_json::from_slice(&buf[..n]).expect("still valid JSON");
+            assert_eq!(v["kind"], "find.rerank");
+            assert_eq!(v["truncated"], true, "a shortened list says so");
+            let kept = v["keeps"].as_array().unwrap().len();
+            assert!(kept > 0 && kept < 4000, "kept a prefix, not all and not none");
+        });
+    }
+
+    #[test]
+    fn find_rounds_reconcile_onto_one_op_without_duplicating() {
+        let store = LiveStore::new();
+        for (round, kind) in [
+            (1, "patterns"),
+            (1, "hits"),
+            (1, "rerank"),
+            (1, "reflect"),
+            (2, "patterns"),
+            (2, "hits"),
+        ] {
+            assert!(store.apply_json(&find_ev("op-a", round, kind, json!({"n": round}))));
+        }
+        // The same part of the same round arriving twice is one round, updated.
+        assert!(store.apply_json(&find_ev("op-a", 1, "patterns", json!({"n": 99}))));
+
+        let rounds = store.find_rounds("op-a").unwrap();
+        let rounds = rounds.as_array().unwrap();
+        assert_eq!(rounds.len(), 2, "two rounds, not seven events");
+        assert_eq!(rounds[0]["round"], 1);
+        assert_eq!(rounds[1]["round"], 2);
+        for part in ["patterns", "hits", "rerank", "reflect"] {
+            assert!(rounds[0][part].is_object(), "round 1 missing {part}");
+        }
+        assert_eq!(rounds[0]["patterns"]["n"], 99, "a repeat overwrites");
+        assert!(rounds[1]["rerank"].is_null(), "round 2 never reranked");
+        // Find events are not calls: no phantom history row, no bodies.
+        assert!(store.inflight_rows().is_empty());
+        assert!(store.bodies_of("op-a").is_none());
+    }
+
+    #[test]
+    fn interleaved_finds_do_not_cross_contaminate() {
+        let store = LiveStore::new();
+        // Two concurrent `find`s, their events arriving alternately — which is
+        // the ordinary case under `spawn_blocking` dispatch, not an edge one.
+        store.apply_json(&find_ev("op-a", 1, "patterns", json!({"patterns": ["a1"]})));
+        store.apply_json(&find_ev("op-b", 1, "patterns", json!({"patterns": ["b1"]})));
+        store.apply_json(&find_ev("op-b", 2, "patterns", json!({"patterns": ["b2"]})));
+        store.apply_json(&find_ev("op-a", 1, "hits", json!({"union": 3})));
+        store.apply_json(&find_ev("op-b", 2, "hits", json!({"union": 9})));
+
+        let a = store.find_rounds("op-a").unwrap();
+        let b = store.find_rounds("op-b").unwrap();
+        assert_eq!(a.as_array().unwrap().len(), 1);
+        assert_eq!(b.as_array().unwrap().len(), 2);
+        assert_eq!(a[0]["patterns"]["patterns"][0], "a1");
+        assert_eq!(a[0]["hits"]["union"], 3);
+        assert_eq!(b[1]["patterns"]["patterns"][0], "b2");
+        assert_eq!(b[1]["hits"]["union"], 9);
+        assert!(store.find_rounds("op-c").is_none());
+    }
+
+    #[test]
+    fn joining_mid_find_yields_a_partial_round_list_not_an_orphan() {
+        let store = LiveStore::new();
+        // No replay buffer (§2.5): rounds 1 and 2 happened before the daemon
+        // bound its socket, so all it ever sees is round 3.
+        store.apply_json(&find_ev("op-late", 3, "hits", json!({"union": 12})));
+        let rounds = store.find_rounds("op-late").unwrap();
+        let rounds = rounds.as_array().unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0]["round"], 3);
+        assert!(rounds[0]["patterns"].is_null(), "an unseen part is simply absent");
+    }
+
+    #[test]
+    fn an_unknown_find_part_is_rejected() {
+        let store = LiveStore::new();
+        assert!(!store.apply_json(&find_ev("op-a", 1, "tokens", json!({}))));
+        assert!(store.find_rounds("op-a").is_none());
+    }
+
+    #[test]
+    fn find_rounds_are_lru_capped_by_op() {
+        let store = LiveStore::new();
+        for i in 0..(MAX_FINDS + 2) {
+            store.apply_json(&find_ev(&format!("op-{i}"), 1, "patterns", json!({})));
+        }
+        assert!(store.find_rounds("op-0").is_none());
+        assert!(store.find_rounds(&format!("op-{}", MAX_FINDS + 1)).is_some());
+        let (_, _, finds, _) = store.snapshot();
+        assert_eq!(finds, MAX_FINDS);
+    }
+
+    #[test]
+    fn a_find_event_reaches_subscribers() {
+        let store = LiveStore::new();
+        let rx = store.subscribe();
+        store.apply_json(&find_ev("op-a", 1, "rerank", json!({"keeps": []})));
+        let got = rx.try_recv().expect("the SSE fan-out carries find.* too");
+        let v: Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["kind"], "find.rerank");
     }
 
     impl std::fmt::Debug for Sock {

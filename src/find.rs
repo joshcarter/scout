@@ -179,8 +179,12 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         ctx.ledger.raw_bytes(tree.len() as u64);
         // Either the reflect stage already said what to search next, or this is
         // a synthesis round and the pattern preset gets asked.
+        let mut from_reflect = false;
         let mut candidates = match refined.take() {
-            Some(c) => c,
+            Some(c) => {
+                from_reflect = true;
+                c
+            }
             None => {
                 let reply = call_preset(
                     ctx,
@@ -208,7 +212,9 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         };
         // The question's own words are candidates too, and they cost no LLM
         // call at all — see `seed_candidates`.
+        let guessed = candidates.len();
         candidates.extend(seed_candidates(&question, &candidates, &tried));
+        live(ctx, round, "patterns", || patterns_event(&candidates, guessed, from_reflect));
 
         let (results, kept, search_truncated) = search_candidates(root, &base, &candidates, &cfg, &find_cfg);
         ctx.note(&trying_line(&results));
@@ -233,6 +239,9 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         let previously = prior.len();
         lists.push(std::mem::take(&mut prior));
         let union = union_hits(lists);
+        live(ctx, round, "hits", || {
+            hits_event(&results, find_cfg.degenerate_hit_cap, &union, previously, truncated)
+        });
         if union.is_empty() {
             continue; // every candidate whiffed — guess again if rounds remain
         }
@@ -259,6 +268,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
             truncated,
         )?;
         annotate(&mut payload, &tried, round);
+        live(ctx, round, "rerank", || rerank_event(&payload, &label));
 
         // ── Reflect: did those hits actually answer the question? ────
         //
@@ -555,7 +565,15 @@ fn reflect(
         }),
     )
     .ok()?;
-    next_patterns(parse_reflection(&reply, budget), tried)
+    let reflection = parse_reflection(&reply, budget);
+    let next = next_patterns(reflection.clone(), tried);
+    // The round is the one `run` set on the ledger's counter before this
+    // iteration — reading it back is cheaper than threading it down here, and
+    // it is the same number every log row of the round already carries.
+    live(ctx, ctx.attempt.get() as usize, "reflect", || {
+        reflect_event(reflection.as_ref(), next.as_deref())
+    });
+    next
 }
 
 /// Turn a reflection into the next round's candidates, or `None` to stop.
@@ -815,6 +833,151 @@ pub fn sketch(paths: &[String], max_bytes: usize) -> String {
         out.push_str(MARKER);
     }
     out
+}
+
+// ── Live channel (SPEC-dashboard §2.5, P4) ───────────────────────────
+//
+// Observability only.  Every value below is one the round already computed —
+// nothing here searches, calls, or decides anything, and a `find` behaves
+// identically whether or not a dashboard is listening.
+//
+// The four events are the ones the *log* serves worst: it records a round as
+// three unrelated-looking preset rows, and the interesting part — which guesses
+// whiffed, which matched everything, what the reranker kept and why, what the
+// reflect stage made of it — never reaches disk at all.
+
+/// Emit one `find.*` event, if anyone is listening.
+///
+/// `fields` is a closure so an unwatched run never builds the payload: the
+/// cost of instrumenting a round with no dashboard attached is one cached
+/// socket check per event. A silent ledger (test fixtures) emits nothing, the
+/// same rule `call.start` follows.
+fn live(ctx: &Ctx, round: usize, kind: &str, fields: impl FnOnce() -> Value) {
+    if ctx.ledger.is_silent() || !crate::live::is_listening() {
+        return;
+    }
+    crate::live::emit_find(ctx.ledger.op(), round as u64, kind, fields());
+}
+
+/// `find.patterns` — what this round is about to search for.
+///
+/// `seed` separates the model's guesses from the question's own words
+/// (`seed_candidates`), which is the distinction worth watching: a run whose
+/// answer only ever comes from seeds is a run whose synthesis prompt is not
+/// earning its call.
+fn patterns_event(candidates: &[Candidate], guessed: usize, from_reflect: bool) -> Value {
+    json!({
+        "source": if from_reflect { "reflect" } else { "synthesis" },
+        "patterns": candidates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({
+                "pattern": c.pattern,
+                "regex": c.regex,
+                "seed": i >= guessed,
+                "types": c.types,
+                "globs": c.globs,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `find.hits` — what each pattern actually matched, and what the guard did.
+fn hits_event(
+    results: &[CandidateResult],
+    cap: usize,
+    union: &[RawHit],
+    previously: usize,
+    truncated: bool,
+) -> Value {
+    json!({
+        "degenerate_hit_cap": cap,
+        "union": union.len(),
+        // A refined round only ever adds (see the module header), so "new" is
+        // the number that says whether it was worth making.
+        "new": union.len().saturating_sub(previously),
+        "carried": previously,
+        "search_truncated": truncated,
+        "candidates": results
+            .iter()
+            .map(|r| json!({
+                "pattern": r.pattern,
+                "hits": r.hits,
+                "fate": fate_name(r.fate),
+                "dropped": r.fate != Fate::Kept,
+                "why": drop_reason(r, cap),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn fate_name(fate: Fate) -> &'static str {
+    match fate {
+        Fate::Kept => "kept",
+        Fate::Whiffed => "whiffed",
+        Fate::TooCommon => "too_common",
+        Fate::Unusable => "unusable",
+    }
+}
+
+/// Why the guard threw this candidate away, in the words the stderr line uses.
+fn drop_reason(r: &CandidateResult, cap: usize) -> Value {
+    match r.fate {
+        Fate::Kept => Value::Null,
+        Fate::Whiffed => json!("matched nothing"),
+        Fate::TooCommon => {
+            json!(format!("{} hits, past the degenerate cap of {cap} — matches too much to discriminate", r.hits))
+        }
+        Fate::Unusable => json!("the search refused this pattern"),
+    }
+}
+
+/// `find.rerank` — the keeps, with their scores and `why`.
+///
+/// Read out of the payload the rerank just returned rather than recomputed:
+/// this is the same list the caller is about to receive.
+fn rerank_event(payload: &Value, pattern: &str) -> Value {
+    let keeps: Vec<Value> = payload
+        .get("hits")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            hits.iter()
+                .map(|h| {
+                    json!({
+                        "file": h.get("file"),
+                        "line": h.get("line"),
+                        "score": h.get("score"),
+                        "why": h.get("why"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "pattern": pattern,
+        "hits_total": payload.get("hits_total"),
+        "hits_considered": payload.get("hits_considered"),
+        "returned": payload.get("returned"),
+        "dropped": payload.get("dropped"),
+        "none_relevant": payload.get("none_relevant"),
+        "keeps": keeps,
+    })
+}
+
+/// `find.reflect` — the verdict, and the patterns it named.
+///
+/// `patterns` is everything the stage asked for; `refining` is what survived
+/// the already-tried filter and will actually be searched. They differ exactly
+/// when the stage went in a circle, which is worth seeing.
+fn reflect_event(reflection: Option<&Reflection>, next: Option<&[Candidate]>) -> Value {
+    let names = |cs: &[Candidate]| cs.iter().map(|c| c.pattern.clone()).collect::<Vec<_>>();
+    json!({
+        "parsed": reflection.is_some(),
+        // Unparseable reads as "answered", which is what the loop does with it.
+        "answered": reflection.map(|r| r.answered).unwrap_or(true),
+        "patterns": reflection.map(|r| names(&r.patterns)).unwrap_or_default(),
+        "refining": next.map(names).unwrap_or_default(),
+    })
 }
 
 // ── Small helpers ────────────────────────────────────────────────────

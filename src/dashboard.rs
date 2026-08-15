@@ -649,7 +649,7 @@ impl State {
         let overview = overview(&tail);
         drop(tail);
         let reach = self.reach.lock().unwrap_or_else(|e| e.into_inner());
-        let (inflight, bodies, streams) = self.live.snapshot();
+        let (inflight, bodies, finds, streams) = self.live.snapshot();
         json!({
             // The marker a liveness probe looks for (§5): a pidfile surviving
             // `kill -9` is common, so the port answering *as scout* is what
@@ -674,6 +674,7 @@ impl State {
                 "bound": self.live.bound(),
                 "inflight": inflight,
                 "bodies": bodies,
+                "finds": finds,
                 "streams": streams,
             },
         })
@@ -855,6 +856,20 @@ fn attach_bodies(op: &mut Value, live: &crate::live::LiveStore) {
     }
 }
 
+/// `find`'s per-round internals (§2.5, P4), for the detail pane's tab strip.
+///
+/// Only on `/api/call/<id>`, never on `/api/history`: a page of 300 operations
+/// carrying every round's pattern and keep list would dwarf the summary rows it
+/// exists to deliver, and the pane fetches the one operation it is painting.
+/// The live stream carries the same events as they happen, so this path serves
+/// a reload, a deep link, and `curl`.
+fn attach_find_rounds(op: &mut Value, live: &crate::live::LiveStore) {
+    let Some(id) = op.get("op").and_then(Value::as_str).map(str::to_string) else { return };
+    if let Some(rounds) = live.find_rounds(&id) {
+        op["find_rounds"] = rounds;
+    }
+}
+
 #[cfg(test)]
 fn history_json(tail: &Tail, params: &HashMap<String, String>) -> Value {
     history_with_live(tail, None, params)
@@ -950,6 +965,7 @@ fn call_with_live(tail: &Tail, live: Option<&crate::live::LiveStore>, id: &str) 
     let mut v = op_json(rows, &op);
     if let Some(live) = live {
         attach_bodies(&mut v, live);
+        attach_find_rounds(&mut v, live);
     }
     Some(v)
 }
@@ -1898,6 +1914,40 @@ mod tests {
         assert_eq!(v["rows"][0]["user"], "USR");
         assert_eq!(v["rows"][0]["response"], "OK");
         assert!(live.inflight_rows().is_empty(), "reaped once the log has the id");
+    }
+
+    #[test]
+    fn find_rounds_ride_on_the_call_route_but_not_on_history() {
+        let t = tail_of(&[v2("r-1", "r", 100.0, r#","op":"r-op""#)]);
+        let live = crate::live::LiveStore::new();
+        for (round, kind) in [(1, "patterns"), (1, "hits"), (2, "patterns")] {
+            live.apply_json(
+                &serde_json::json!({
+                    "v": 1, "id": "r-op", "run": "r", "op": "r-op", "ts": 100.0,
+                    "kind": format!("find.{kind}"), "round": round, "union": 4,
+                })
+                .to_string(),
+            );
+        }
+        let v = call_with_live(&t, Some(&live), "r-1").unwrap();
+        let rounds = v["find_rounds"].as_array().unwrap();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[0]["round"], 1);
+        assert_eq!(rounds[0]["hits"]["union"], 4);
+        assert!(rounds[1]["hits"].is_null());
+
+        // History stays a summary: 300 operations' worth of round internals
+        // would dwarf the rows they belong to.
+        let h = history_with_live(&t, Some(&live), &q(&[]));
+        assert!(h["ops"][0]["find_rounds"].is_null());
+    }
+
+    #[test]
+    fn an_operation_with_no_captured_rounds_says_nothing_about_them() {
+        let t = tail_of(&[v2("r-1", "r", 100.0, r#","op":"r-op""#)]);
+        let live = crate::live::LiveStore::new();
+        let v = call_with_live(&t, Some(&live), "r-1").unwrap();
+        assert!(v.get("find_rounds").is_none(), "absent, not an empty array");
     }
 
     // ── The tailing reader ───────────────────────────────────────────────

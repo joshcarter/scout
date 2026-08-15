@@ -1,9 +1,10 @@
 # Spec: `scout dashboard` — a local web view of local-LLM traffic
 
-**Status:** **P1–P3 shipped — the dashboard shows the call, not just
-metadata about it.** No open design questions remain; §7 records the
-decisions and §6 the remaining phases. Streaming behavior in §5.5 is
-measured against the configured endpoint, not assumed.
+**Status:** **P1–P4 shipped — the dashboard shows the call, not just
+metadata about it, and a `find` shows its own reasoning.** No open design
+questions remain; §7 records the decisions and §6 the remaining phases.
+Streaming behavior in §5.5 is measured against the configured endpoint,
+not assumed.
 
 | Phase | State | What it delivers |
 |---|---|---|
@@ -11,7 +12,7 @@ measured against the configured endpoint, not assumed.
 | **P2** — daemon + server | ✅ `1d99442` | `scout dashboard` on 13001; all §4 panes but bodies and live views |
 | — op grouping fix | ✅ `cee6d14` | recorded `op` replaces P2's idle-gap heuristic |
 | **P3** — live channel | ✅ | unix datagram socket, SSE, prompt/response bodies, in-flight calls |
-| **P4** — `find` refinement events | ⬜ | per-round internals: patterns, hits, rerank, reflect |
+| **P4** — `find` refinement events | ✅ | per-round internals: patterns, hits, rerank, reflect |
 | **P5** — token streaming | ⬜ | `call.token` deltas; cleared by measurement (§5.5) |
 | **P6** — bodies sidecar | ⬜ optional | retroactive bodies on disk; build only if missed |
 | **P7** — auto-start | ⬜ optional | SessionStart hook calls the idempotent start |
@@ -23,10 +24,13 @@ p50/p95 latency, the Live/Pinned detail pane with three ways back, and
 filters by tool/via/project/failed. The reader survives log rotation.
 The live channel carries resolved prompts and responses: in-flight rows
 appear in history, `/api/stream` is SSE, and the detail pane shows
-bodies while the daemon is up.
+bodies while the daemon is up. A `find` streams its own rounds — the
+patterns it guessed and which were the question's own words, what each
+one matched and which the degenerate guard threw away, the rerank's keeps
+with their scores and `why`, and the reflect verdict — behind a round tab
+strip in the detail pane.
 
-**What is missing until P4:** `find` round internals (guessed patterns,
-degenerate drops, rerank `why`, reflect verdict). Token streaming is P5.
+**What is missing:** token streaming (P5). P6 and P7 are optional.
 
 **One operational note:** per `CLAUDE.md`, the plugin's binary is a copy
 in `$CLAUDE_PLUGIN_DATA/bin` refreshed on session restart. Until a
@@ -847,20 +851,62 @@ mid-stream without leaking the handler thread.
 optimistic — the reconciliation and the SSE responder path are both
 places where the detail is the work.
 
-### ⬜ P4 — `find` refinement events
+### ✅ P4 — `find` refinement events
 
 `find.patterns` / `.hits` / `.rerank` / `.reflect`, plus the round tab
 strip in the detail pane. The data the log serves worst — its rounds are
-currently three unrelated-looking preset rows even after `op` grouping
-ties them together — and the best argument for the channel existing.
-Watching the search converge is also the only practical way to tune
-`max_patterns`, `degenerate_hit_cap`, and `reflect` against real
-questions.
+three unrelated-looking preset rows even after `op` grouping ties them
+together — and the best argument for the channel existing. Watching the
+search converge is also the only practical way to tune `max_patterns`,
+`degenerate_hit_cap`, and `reflect` against real questions.
 
-Mostly instrumentation at points `find.rs` already computes the values:
-the guessed pattern list, per-pattern hit counts and which were dropped
-as degenerate, the rerank keeps with scores and `why`, the reflect
-verdict and any refined patterns. ~150 lines.
+Delivered ~850 lines (≈340 Rust impl, ≈320 Rust test, ~185 HTML) against
+an estimated ~150. Verified end to end against LM Studio: a real
+`find "where does the dashboard bind its port"` streamed six `find.*`
+events across two rounds, and the same rounds came back on
+`/api/call/<id>` after a reload.
+
+The payoff was immediate and is the reason the phase exists: that run's
+seeded `(?i)port` matched **301** hits against a `degenerate_hit_cap` of
+**300** and was discarded whole. Nothing in the log says so, and nothing
+in the result hints at it — one glance at the pane does.
+
+Where it landed differently from the brief, all four found by building:
+
+- **A `find.*` event has no row `id` to carry.** §2.5's envelope is
+  `{v, id, run, seq, kind, …}` and P3 made `id` the row id, which is what
+  makes reconciliation possible. But a round is not a round-trip — it
+  spans zero, one, or several — so there is no row id to put there. The
+  operation's own id goes in the `id` slot instead: `Ledger`'s `op` and
+  every row `id` come from the same `stats::next_id` counter, so the two
+  can never collide, and the store keys on `op` regardless. Nothing
+  downstream noticed, because the dashboard already groups on `op`.
+- **Two of the four values are not computed in `find.rs`.** The rerank's
+  keeps, scores and `why` are `grep::rerank`'s, and the reflect verdict
+  is discarded inside `find::reflect` the moment `next_patterns` decides
+  not to act on it. Both are still one-line reads — the keeps come back
+  inside the payload `rerank` returns, and the verdict needed only a
+  `clone` before `next_patterns` consumes it — but "at points `find.rs`
+  already computes the values" was not where to look for either.
+- **`fit_event` could only shrink strings.** P3's truncation elides
+  `system`/`user`/`response`; every `find.*` payload is *arrays*. A wide
+  search would have hit the 64 KiB cap with nothing the shrinker
+  recognised and lost the event. It now halves the longest array
+  repeatedly and sets `truncated: true`, so a shortened list is
+  distinguishable from a complete one.
+- **A round can legitimately produce no `find.rerank`.** When a refined
+  round's hits are all already in the union (`union.len() ==
+  previously`), `find` returns the prior payload rather than spending a
+  call to reproduce it — so round 2 has patterns and hits and nothing
+  else. Observed on the very first real run. It renders through the same
+  partial-view path as a dashboard that joined mid-`find`, which is the
+  right answer: "absent" and "not yet" look identical and both are
+  ordinary.
+
+One deliberate omission: `find_rounds` rides on `/api/call/<id>` only,
+never on `/api/history`. A 300-operation page carrying every round's
+pattern and keep list would dwarf the summary rows it exists to deliver,
+and the pane fetches the one operation it is painting anyway.
 
 ### ⬜ P5 — token streaming
 
@@ -955,5 +1001,20 @@ pushing back on the brief.
    review, not observed. Worth remembering as the counterexample: not
    every plausible-sounding hazard is real, and a spec asserting one
    costs implementation time.
+5. **The event envelope assumed every event describes a round-trip**
+   (P4). `find.*` describes an operation, and has no row `id` to carry.
+   Produced the `id = op` rule, and the observation that the store was
+   already keying on `op` anyway.
+6. **The truncation ladder only understood strings** (P4). Bodies are
+   strings; `find`'s payloads are arrays, and the ladder had nothing to
+   trim. Produced array halving and the `truncated` marker. The general
+   lesson: a fail-open contract has to be re-checked against each new
+   *shape* of payload, not just each new payload.
+7. **"Mostly instrumentation at points that already compute the values"
+   was half right** (P4) — the same shape of claim §7.1 records for P1's
+   byte accounting, and wrong the same way. Two of the four values live
+   one function away from where the brief pointed. Cheap to fix here;
+   worth distrusting the phrasing next time it appears.
 
-**No open design questions remain. P3 is next.**
+**No open design questions remain. P5 (token streaming) is next, and
+§5.5 has already cleared it by measurement.**

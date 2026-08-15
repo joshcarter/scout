@@ -722,3 +722,120 @@ fn a_bad_filter_arg_fails_open() {
     let text = assert_fails_open(&err);
     assert!(text.contains("invalid file type"), "text: {text}");
 }
+
+// ── Live-channel payloads (SPEC-dashboard §2.5, P4) ──────────────────
+//
+// The events are pure functions of values the round already computed, so they
+// test without a socket or a model.  What matters is that each one says the
+// thing the log cannot: which patterns were seeds, why a candidate was thrown
+// away, what the reranker kept and why, and what the reflect stage made of it.
+
+#[test]
+fn the_patterns_event_separates_seeds_from_guesses() {
+    let guesses = vec![
+        Candidate { pattern: "render".into(), ..Default::default() },
+        Candidate { pattern: "draw".into(), types: vec!["rust".into()], ..Default::default() },
+    ];
+    let mut all = guesses.clone();
+    all.push(Candidate { pattern: "(?i)waterslide".into(), regex: true, ..Default::default() });
+
+    let ev = patterns_event(&all, guesses.len(), false);
+    assert_eq!(ev["source"], "synthesis");
+    let p = ev["patterns"].as_array().unwrap();
+    assert_eq!(p.len(), 3);
+    assert_eq!(p[0]["seed"], false);
+    assert_eq!(p[1]["types"][0], "rust");
+    assert_eq!(p[2]["seed"], true, "the question's own word is a seed");
+    assert_eq!(p[2]["regex"], true);
+
+    assert_eq!(patterns_event(&all, all.len(), true)["source"], "reflect");
+}
+
+#[test]
+fn the_hits_event_says_why_the_guard_dropped_each_candidate() {
+    let results = vec![
+        result("load_config", Fate::Kept, 4),
+        result("config", Fate::TooCommon, 900),
+        result("cfgg", Fate::Whiffed, 0),
+        result("[unclosed", Fate::Unusable, 0),
+    ];
+    let union = vec![raw("a.rs", 1), raw("a.rs", 2), raw("b.rs", 9)];
+    let ev = hits_event(&results, 200, &union, 1, true);
+
+    assert_eq!(ev["union"], 3);
+    assert_eq!(ev["carried"], 1);
+    assert_eq!(ev["new"], 2, "a refined round is judged on what it added");
+    assert_eq!(ev["degenerate_hit_cap"], 200);
+    assert_eq!(ev["search_truncated"], true);
+
+    let c = ev["candidates"].as_array().unwrap();
+    assert_eq!(c[0]["fate"], "kept");
+    assert_eq!(c[0]["dropped"], false);
+    assert!(c[0]["why"].is_null(), "a kept candidate needs no excuse");
+    assert_eq!(c[1]["fate"], "too_common");
+    assert!(c[1]["why"].as_str().unwrap().contains("900"), "{}", c[1]["why"]);
+    assert!(c[1]["why"].as_str().unwrap().contains("200"), "names the cap it broke");
+    assert_eq!(c[2]["why"], "matched nothing");
+    assert_eq!(c[3]["fate"], "unusable");
+}
+
+#[test]
+fn the_rerank_event_reads_the_payload_the_caller_gets() {
+    let payload = serde_json::json!({
+        "hits_total": 40, "hits_considered": 30, "returned": 2, "dropped": 38,
+        "none_relevant": false,
+        "hits": [
+            {"file": "src/a.rs", "line": 12, "score": 3, "why": "the definition", "context": "…"},
+            {"file": "src/b.rs", "line": 3, "score": 1, "why": "a caller", "context": "…"},
+        ],
+    });
+    let ev = rerank_event(&payload, "a|b");
+    assert_eq!(ev["pattern"], "a|b");
+    assert_eq!(ev["hits_total"], 40);
+    assert_eq!(ev["dropped"], 38);
+    let k = ev["keeps"].as_array().unwrap();
+    assert_eq!(k.len(), 2);
+    assert_eq!(k[0]["file"], "src/a.rs");
+    assert_eq!(k[0]["score"], 3);
+    assert_eq!(k[0]["why"], "the definition");
+    // The excerpt itself stays out: the row's body already carries it, and a
+    // keep list of full context blocks is what blows the datagram cap.
+    assert!(k[0].get("context").is_none());
+}
+
+#[test]
+fn the_reflect_event_distinguishes_asked_for_from_actually_searching() {
+    let reflection = Reflection {
+        answered: false,
+        patterns: vec![
+            Candidate { pattern: "draw_waterslide".into(), ..Default::default() },
+            Candidate { pattern: "render".into(), ..Default::default() },
+        ],
+    };
+    let next = vec![Candidate { pattern: "draw_waterslide".into(), ..Default::default() }];
+    let ev = reflect_event(Some(&reflection), Some(&next));
+    assert_eq!(ev["parsed"], true);
+    assert_eq!(ev["answered"], false);
+    assert_eq!(ev["patterns"].as_array().unwrap().len(), 2);
+    assert_eq!(ev["refining"].as_array().unwrap().len(), 1, "`render` was already tried");
+    assert_eq!(ev["refining"][0], "draw_waterslide");
+
+    // An unreadable reply is recorded as what the loop does with it.
+    let none = reflect_event(None, None);
+    assert_eq!(none["parsed"], false);
+    assert_eq!(none["answered"], true);
+    assert_eq!(none["refining"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn a_silent_ledger_emits_no_find_events() {
+    // The fixture ledger is silent, which must gate the live channel exactly as
+    // it gates the log — otherwise a test run sprays a developer's dashboard.
+    let ctx = offline_ctx(".");
+    let mut called = false;
+    live(&ctx, 1, "patterns", || {
+        called = true;
+        serde_json::json!({})
+    });
+    assert!(!called, "a silent ledger must not even build the payload");
+}
