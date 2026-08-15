@@ -189,7 +189,8 @@ fn the_quickfix_file_is_created_safely_and_still_readable_afterwards() {
     // `scout-quickfix-<pid>.txt` was that another local user can't guess it
     // ahead of time and pre-plant a symlink there.
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
-    assert!(name.starts_with("scout-quickfix-") && name.ends_with(".txt"), "{name}");
+    assert!(name.starts_with("scout-quickfix-"), "{name}");
+    assert_eq!(path.extension().and_then(std::ffi::OsStr::to_str), Some("txt"), "{name}");
     assert_ne!(
         name,
         format!("scout-quickfix-{}.txt", std::process::id()),

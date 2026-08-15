@@ -21,7 +21,7 @@ use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 /// Hard cap on a serialized event. Unix datagrams fail `EMSGSIZE` above
@@ -168,17 +168,15 @@ fn emit_bytes(bytes: &[u8]) {
     }
     match slot.as_mut() {
         Some(Sock::Missing) | None => {}
-        Some(Sock::Ready(sock)) => match sock.send(bytes) {
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
-                // Daemon restarted and unlinked the socket. Forget so the
-                // next emit re-resolves; this is the one permitted reconnect.
+        Some(Sock::Ready(sock)) => {
+            // ConnectionRefused means the daemon restarted and unlinked the
+            // socket: forget the sender so the next emit re-resolves, which is
+            // the one permitted reconnect.  Every other error — EAGAIN,
+            // EMSGSIZE, anything else — drops the datagram and stays connected.
+            if sock.send(bytes).is_err_and(|e| e.kind() == ErrorKind::ConnectionRefused) {
                 *slot = None;
             }
-            Err(_) => {
-                // EAGAIN, EMSGSIZE, anything else: drop, stay connected.
-            }
-        },
+        }
     }
 }
 
@@ -384,7 +382,7 @@ fn emit_token(id: &str, op: &str, index: u64, text: &str) {
 /// can never collide with one. The daemon keys on `op` regardless — two
 /// concurrent `find`s interleave over this channel exactly as their log rows
 /// interleave in the log.
-pub fn emit_find(op: &str, round: u64, kind: &str, fields: Value) {
+pub fn emit_find(op: &str, round: u64, kind: &str, fields: &Value) {
     let mut ev = json!({
         "v": 1,
         "id": op,
@@ -1001,7 +999,7 @@ fn apply_end(row: &mut Row, v: &Value) {
 }
 
 /// Drain datagrams into `store` until the process exits.
-pub fn recv_loop(sock: std::os::unix::net::UnixDatagram, store: Arc<LiveStore>) {
+pub fn recv_loop(sock: &std::os::unix::net::UnixDatagram, store: &LiveStore) {
     let mut buf = vec![0u8; MAX_DGRAM];
     loop {
         match sock.recv(&mut buf) {
@@ -1022,6 +1020,7 @@ pub fn recv_loop(sock: std::os::unix::net::UnixDatagram, store: Arc<LiveStore>) 
 mod tests {
     use super::*;
     use std::os::unix::net::UnixDatagram;
+    use std::sync::Arc;
 
     // Env vars and the process-global sender are shared; serialise tests
     // that touch either.
@@ -1758,7 +1757,7 @@ mod tests {
 
     // ── find.* (P4) ──────────────────────────────────────────────────────
 
-    fn find_ev(op: &str, round: u64, kind: &str, extra: Value) -> String {
+    fn find_ev(op: &str, round: u64, kind: &str, extra: &Value) -> String {
         let mut v = json!({
             "v": 1, "id": op, "run": "r", "op": op, "seq": 1,
             "kind": format!("find.{kind}"), "ts": 1.0, "round": round,
@@ -1778,8 +1777,8 @@ mod tests {
             assert!(!is_listening(), "no socket, no listener");
             // The guard callers use is one cached lookup; emitting anyway must
             // still be silent and must not create the socket.
-            emit_find("op-1", 1, "patterns", json!({"patterns": []}));
-            emit_find("op-1", 1, "hits", json!({"candidates": []}));
+            emit_find("op-1", 1, "patterns", &json!({"patterns": []}));
+            emit_find("op-1", 1, "hits", &json!({"candidates": []}));
             match sender_slot().as_ref() {
                 Some(Sock::Missing) => {}
                 other => panic!("expected cached Missing, got {other:?}"),
@@ -1797,7 +1796,7 @@ mod tests {
         let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
         with_sock_env(&path, || {
             assert!(is_listening());
-            emit_find("op-7", 2, "reflect", json!({"answered": false, "patterns": ["draw"]}));
+            emit_find("op-7", 2, "reflect", &json!({"answered": false, "patterns": ["draw"]}));
             let mut buf = vec![0u8; MAX_DGRAM];
             let n = listener.recv(&mut buf).expect("datagram");
             let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
@@ -1823,7 +1822,7 @@ mod tests {
             let keeps: Vec<Value> = (0..4000)
                 .map(|i| json!({"file": format!("src/{i}/{}.rs", "long".repeat(20)), "line": i, "why": "y".repeat(120)}))
                 .collect();
-            emit_find("op-big", 1, "rerank", json!({"keeps": keeps}));
+            emit_find("op-big", 1, "rerank", &json!({"keeps": keeps}));
             let mut buf = vec![0u8; MAX_DGRAM + 4096];
             let n = listener.recv(&mut buf).expect("datagram");
             assert!(n <= MAX_DGRAM, "datagram was {n} bytes");
@@ -1846,10 +1845,10 @@ mod tests {
             (2, "patterns"),
             (2, "hits"),
         ] {
-            assert!(store.apply_json(&find_ev("op-a", round, kind, json!({"n": round}))));
+            assert!(store.apply_json(&find_ev("op-a", round, kind, &json!({"n": round}))));
         }
         // The same part of the same round arriving twice is one round, updated.
-        assert!(store.apply_json(&find_ev("op-a", 1, "patterns", json!({"n": 99}))));
+        assert!(store.apply_json(&find_ev("op-a", 1, "patterns", &json!({"n": 99}))));
 
         let rounds = store.find_rounds("op-a").unwrap();
         let rounds = rounds.as_array().unwrap();
@@ -1871,11 +1870,11 @@ mod tests {
         let store = LiveStore::new();
         // Two concurrent `find`s, their events arriving alternately — which is
         // the ordinary case under `spawn_blocking` dispatch, not an edge one.
-        store.apply_json(&find_ev("op-a", 1, "patterns", json!({"patterns": ["a1"]})));
-        store.apply_json(&find_ev("op-b", 1, "patterns", json!({"patterns": ["b1"]})));
-        store.apply_json(&find_ev("op-b", 2, "patterns", json!({"patterns": ["b2"]})));
-        store.apply_json(&find_ev("op-a", 1, "hits", json!({"union": 3})));
-        store.apply_json(&find_ev("op-b", 2, "hits", json!({"union": 9})));
+        store.apply_json(&find_ev("op-a", 1, "patterns", &json!({"patterns": ["a1"]})));
+        store.apply_json(&find_ev("op-b", 1, "patterns", &json!({"patterns": ["b1"]})));
+        store.apply_json(&find_ev("op-b", 2, "patterns", &json!({"patterns": ["b2"]})));
+        store.apply_json(&find_ev("op-a", 1, "hits", &json!({"union": 3})));
+        store.apply_json(&find_ev("op-b", 2, "hits", &json!({"union": 9})));
 
         let a = store.find_rounds("op-a").unwrap();
         let b = store.find_rounds("op-b").unwrap();
@@ -1893,7 +1892,7 @@ mod tests {
         let store = LiveStore::new();
         // No replay buffer (§2.5): rounds 1 and 2 happened before the daemon
         // bound its socket, so all it ever sees is round 3.
-        store.apply_json(&find_ev("op-late", 3, "hits", json!({"union": 12})));
+        store.apply_json(&find_ev("op-late", 3, "hits", &json!({"union": 12})));
         let rounds = store.find_rounds("op-late").unwrap();
         let rounds = rounds.as_array().unwrap();
         assert_eq!(rounds.len(), 1);
@@ -1904,7 +1903,7 @@ mod tests {
     #[test]
     fn an_unknown_find_part_is_rejected() {
         let store = LiveStore::new();
-        assert!(!store.apply_json(&find_ev("op-a", 1, "tokens", json!({}))));
+        assert!(!store.apply_json(&find_ev("op-a", 1, "tokens", &json!({}))));
         assert!(store.find_rounds("op-a").is_none());
     }
 
@@ -1912,7 +1911,7 @@ mod tests {
     fn find_rounds_are_lru_capped_by_op() {
         let store = LiveStore::new();
         for i in 0..(MAX_FINDS + 2) {
-            store.apply_json(&find_ev(&format!("op-{i}"), 1, "patterns", json!({})));
+            store.apply_json(&find_ev(&format!("op-{i}"), 1, "patterns", &json!({})));
         }
         assert!(store.find_rounds("op-0").is_none());
         assert!(store.find_rounds(&format!("op-{}", MAX_FINDS + 1)).is_some());
@@ -1924,7 +1923,7 @@ mod tests {
     fn a_find_event_reaches_subscribers() {
         let store = LiveStore::new();
         let rx = store.subscribe();
-        store.apply_json(&find_ev("op-a", 1, "rerank", json!({"keeps": []})));
+        store.apply_json(&find_ev("op-a", 1, "rerank", &json!({"keeps": []})));
         let got = rx.try_recv().expect("the SSE fan-out carries find.* too");
         let v: Value = serde_json::from_str(&got).unwrap();
         assert_eq!(v["kind"], "find.rerank");

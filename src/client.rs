@@ -105,11 +105,10 @@ impl LlmError {
             LlmError::RequestFailed(msg) if msg.starts_with("network I/O") => {
                 Outcome::EndpointUnreachable
             }
-            // Everything else in these two arms is a reply scout could not use:
-            // unparseable JSON, no content field, an empty response.
-            LlmError::RequestFailed(_) => Outcome::ParseFailure,
             LlmError::Internal(msg) if msg.contains("empty response") => Outcome::EmptyResponse,
-            LlmError::Internal(_) => Outcome::ParseFailure,
+            // Everything else is a reply scout could not use: unparseable
+            // JSON, no content field.
+            LlmError::RequestFailed(_) | LlmError::Internal(_) => Outcome::ParseFailure,
         }
     }
 }
@@ -356,8 +355,7 @@ impl LlmClient {
         // An HTTP error response (4xx/5xx) means the endpoint is up — only a
         // Transport error means we couldn't connect at all.
         let reachable = match req.call() {
-            Ok(_) => true,
-            Err(ureq::Error::Status(_, _)) => true,
+            Ok(_) | Err(ureq::Error::Status(_, _)) => true,
             Err(ureq::Error::Transport(_)) => false,
         };
         (reachable, start.elapsed().as_millis() as u64)
@@ -373,7 +371,7 @@ impl LlmClient {
     /// value is identical either way (§5.5).
     pub fn complete(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         max_tokens: Option<u64>,
     ) -> Result<(String, Value), LlmError> {
         self.complete_streaming(messages, max_tokens, &mut |_| {})
@@ -395,7 +393,7 @@ impl LlmClient {
     /// sink — this file has never heard of the concept.
     pub fn complete_streaming(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         max_tokens: Option<u64>,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<(String, Value), LlmError> {
@@ -662,8 +660,7 @@ mod tests {
     #[test]
     fn wrong_endpoint_complete_returns_unavailable() {
         let client = dead_client();
-        let err =
-            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
+        let err = client.complete(&[json!({"role": "user", "content": "hi"})], None).unwrap_err();
         assert!(matches!(err, LlmError::EndpointUnavailable { .. }));
     }
 
@@ -1184,7 +1181,7 @@ mod tests {
         let (text, _usage) = {
             let mut sink = |d: &str| seen.push(d.to_string());
             client
-                .complete_streaming(vec![json!({"role": "user", "content": "hi"})], None, &mut sink)
+                .complete_streaming(&[json!({"role": "user", "content": "hi"})], None, &mut sink)
                 .expect("a steady stream must not be killed")
         };
         let elapsed = start.elapsed();
@@ -1203,8 +1200,7 @@ mod tests {
         );
         let client = client_against(endpoint, Duration::from_secs(20), Duration::from_millis(400));
         let start = Instant::now();
-        let err =
-            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
+        let err = client.complete(&[json!({"role": "user", "content": "hi"})], None).unwrap_err();
         let elapsed = start.elapsed();
         assert!(
             matches!(err, LlmError::Timeout(Deadline::Idle(_))),
@@ -1221,8 +1217,7 @@ mod tests {
         let endpoint = stalling_server(": ping\n\n");
         let client = client_against(endpoint, Duration::from_millis(400), Duration::from_secs(20));
         let start = Instant::now();
-        let err =
-            client.complete(vec![json!({"role": "user", "content": "hi"})], None).unwrap_err();
+        let err = client.complete(&[json!({"role": "user", "content": "hi"})], None).unwrap_err();
         let elapsed = start.elapsed();
         assert!(
             matches!(err, LlmError::Timeout(Deadline::FirstToken(_))),
@@ -1358,7 +1353,7 @@ mod tests {
     /// Round-trip test against a real local endpoint.
     /// Run with: LM_HOST=http://localhost:11434 cargo test -- --ignored
     #[test]
-    #[ignore]
+    #[ignore = "needs a live LLM endpoint: set LM_HOST (and optionally LM_MODEL), then run with --ignored"]
     fn live_roundtrip() {
         let endpoint =
             std::env::var("LM_HOST").unwrap_or_else(|_| "http://localhost:11434/v1".into());
@@ -1379,7 +1374,7 @@ mod tests {
         assert!(ms < 5000, "endpoint check took too long: {ms}ms");
 
         let (content, usage) = client
-            .complete(vec![json!({"role": "user", "content": "Reply with exactly: hello"})], None)
+            .complete(&[json!({"role": "user", "content": "Reply with exactly: hello"})], None)
             .unwrap();
         assert!(!content.is_empty(), "empty response from LLM");
         assert!(usage.is_object(), "usage should be an object, got: {usage}");
@@ -1394,7 +1389,7 @@ mod tests {
     ///   LM_HOST=http://localhost:1234/v1 LM_MODEL=<loaded model> \
     ///     cargo test -- --ignored stream_matches_non_stream
     #[test]
-    #[ignore]
+    #[ignore = "needs a live LLM endpoint that streams: set LM_HOST and LM_MODEL, then run with --ignored"]
     fn live_stream_matches_non_stream() {
         let endpoint =
             std::env::var("LM_HOST").unwrap_or_else(|_| "http://localhost:1234/v1".into());
@@ -1409,19 +1404,19 @@ mod tests {
             max_tokens: Some(64),
             stream,
         };
-        let prompt = vec![json!({
+        let prompt = [json!({
             "role": "user",
             "content": "Count from one to ten in words, separated by commas. /no_think",
         })];
 
         let (plain, plain_usage) =
-            LlmClient::new(cfg(false)).complete(prompt.clone(), None).expect("non-streaming call");
+            LlmClient::new(cfg(false)).complete(&prompt, None).expect("non-streaming call");
 
         let mut deltas: Vec<String> = Vec::new();
         let (streamed, streamed_usage) = {
             let mut sink = |d: &str| deltas.push(d.to_string());
             LlmClient::new(cfg(true))
-                .complete_streaming(prompt, None, &mut sink)
+                .complete_streaming(&prompt, None, &mut sink)
                 .expect("streaming call")
         };
 

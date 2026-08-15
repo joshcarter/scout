@@ -21,6 +21,10 @@
 //! File content comes from `source::read_file` — plain filesystem reads, no
 //! index and no daemon.
 
+// See `render.rs` for why this writes into the buffer instead of pushing a
+// freshly-formatted `String`, and why the infallible `Result` is discarded.
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 use crate::select::{
@@ -236,7 +240,7 @@ pub fn chunk_numbered(lines: &[String], chunk_bytes: usize) -> Vec<String> {
 pub fn render_numbered(lines: &[String], first_line: usize) -> String {
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
-        out.push_str(&format!("{:6}\u{2192}{}\n", first_line + i, line));
+        let _ = writeln!(out, "{:6}\u{2192}{line}", first_line + i);
     }
     out
 }

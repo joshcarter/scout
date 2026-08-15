@@ -98,7 +98,7 @@ pub fn seed_default_config(path: &Path) -> Result<bool, String> {
     }
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)
-            .map_err(|e| format!("cannot create config dir {parent:?}: {e}"))?;
+            .map_err(|e| format!("cannot create config dir {}: {e}", parent.display()))?;
     }
     // create_new: two scout processes starting at once (an MCP server and a
     // CLI call, say) must not race into a half-written file. Losing the race
@@ -114,11 +114,11 @@ pub fn seed_default_config(path: &Path) -> Result<bool, String> {
         Ok(mut f) => {
             use std::io::Write;
             f.write_all(DEFAULT_CONFIG.as_bytes())
-                .map_err(|e| format!("cannot write config {path:?}: {e}"))?;
+                .map_err(|e| format!("cannot write config {}: {e}", path.display()))?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(format!("cannot create config {path:?}: {e}")),
+        Err(e) => Err(format!("cannot create config {}: {e}", path.display())),
     }
 }
 
@@ -138,14 +138,15 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         let _ = seed_default_config(path);
     }
 
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read config {path:?}: {e}"))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
 
     let root: toml::Value =
         toml::from_str(&content).map_err(|e| format!("config parse error: {e}"))?;
 
-    let section =
-        root.get("llm").ok_or_else(|| format!("config: [llm] section not found in {path:?}"))?;
+    let section = root
+        .get("llm")
+        .ok_or_else(|| format!("config: [llm] section not found in {}", path.display()))?;
 
     let endpoint = section
         .get("endpoint")

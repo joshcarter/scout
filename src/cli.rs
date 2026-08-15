@@ -328,30 +328,30 @@ pub struct EditArgs {
 /// Handle `scout extract` — the payload keys are the `extract` pipeline's, not
 /// the binary's, so building them lives here rather than in `main`.
 pub fn run_extract(
-    file: String,
-    question: String,
+    file: &str,
+    question: &str,
     max_lines: Option<u64>,
     project: Option<String>,
 ) -> ! {
     run_filter(
         "extract",
         project,
-        json!({ "file": file, "question": question, "max_lines": max_lines }),
+        &json!({ "file": file, "question": question, "max_lines": max_lines }),
         None,
     )
 }
 
 /// Handle `scout check` — as `run_extract`, for the `check_output` pipeline.
 pub fn run_check(
-    command: String,
-    cwd: Option<String>,
+    command: &str,
+    cwd: Option<&str>,
     timeout_seconds: Option<u64>,
     project: Option<String>,
 ) -> ! {
     run_filter(
         "check_output",
         project,
-        json!({ "command": command, "cwd": cwd, "timeout_seconds": timeout_seconds }),
+        &json!({ "command": command, "cwd": cwd, "timeout_seconds": timeout_seconds }),
         None,
     )
 }
@@ -384,7 +384,7 @@ pub fn run_grep(a: GrepArgs) -> ! {
     // `--no-filter` with an intent an error rather than a silent no-op — so
     // by the time we get here, `--no-filter` and "no intent" are the same
     // state and the pipeline sees exactly one code path.
-    run_filter("grep", project, args, Some(out))
+    run_filter("grep", project, &args, Some(&out))
 }
 
 /// Resolve `scout find`'s flags and hand off to `run_filter`.
@@ -396,7 +396,7 @@ pub fn run_find(a: FindArgs) -> ! {
     let (mut args, out, project) = resolve_flags(a.flags, a.format);
     args["question"] = json!(a.question);
     args["attempts"] = json!(a.attempts);
-    run_filter("find", project, args, Some(out))
+    run_filter("find", project, &args, Some(&out))
 }
 
 /// Run whichever pipeline `scout edit`'s positionals selected, then hand the
@@ -573,15 +573,15 @@ fn run_pipeline(
 fn run_filter(
     tool: &str,
     project: Option<String>,
-    args: serde_json::Value,
-    grep_out: Option<GrepOutput>,
+    args: &serde_json::Value,
+    grep_out: Option<&GrepOutput>,
 ) -> ! {
     let project = resolve_project(project);
-    let result = run_pipeline(tool, tool, project, &args, grep_out.is_some());
+    let result = run_pipeline(tool, tool, project, args, grep_out.is_some());
 
     match result {
         Ok(payload) => {
-            if let Some(out) = &grep_out {
+            if let Some(out) = grep_out {
                 finish_grep(&payload, out)
             } else {
                 println!("{}", pretty_json(&payload));
@@ -617,7 +617,7 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
         eprintln!("{line}");
     }
     let returned = payload.get("hits").and_then(|h| h.as_array()).map_or(0, Vec::len);
-    std::process::exit(i32::from(returned <= 0));
+    std::process::exit(i32::from(returned == 0));
 }
 
 /// The stderr status lines for one grep result (docs/search-cli.md §2).

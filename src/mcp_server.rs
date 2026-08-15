@@ -58,7 +58,7 @@ impl Scout {
         Scout { presets: Arc::new(crate::presets::load_presets()) }
     }
 
-    fn ping(&self, message: Option<String>) -> String {
+    fn ping(message: Option<&str>) -> String {
         let version = env!("CARGO_PKG_VERSION");
         match message {
             Some(m) => format!("scout {version} — pong: {m}"),
@@ -98,7 +98,7 @@ impl Scout {
 
     /// Run one filter, loading config lazily so a missing `config.toml` is a
     /// per-call tool error naming a fallback, never a dead server.
-    fn dispatch(&self, tool: &str, args: Value) -> ToolResult {
+    fn dispatch(&self, tool: &str, args: &Value) -> ToolResult {
         let cfg = crate::config::load_config(&crate::config::config_path());
         let (client, client_error) = match cfg {
             Ok(c) => (Some(LlmClient::new(c)), None),
@@ -118,9 +118,9 @@ impl Scout {
             ..Default::default()
         };
         let result = match tool {
-            "check_output" => crate::check_output::run(&ctx, &args),
-            "extract" => crate::extract::run(&ctx, &args),
-            "grep" => crate::grep::run(&ctx, &args),
+            "check_output" => crate::check_output::run(&ctx, args),
+            "extract" => crate::extract::run(&ctx, args),
+            "grep" => crate::grep::run(&ctx, args),
             other => Err(crate::select::ToolError::new(
                 format!("unknown tool {other:?}"),
                 "the built-in tools",
@@ -187,14 +187,15 @@ impl ServerHandler for Scout {
                 serde_json::from_value::<PingParams>(args)
                     .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?,
             );
-            return Ok(CallToolResult::success(vec![ContentBlock::text(self.ping(message))]).into());
+            let pong = Self::ping(message.as_deref());
+            return Ok(CallToolResult::success(vec![ContentBlock::text(pong)]).into());
         }
 
         let this = self.clone();
         let tool = name.clone();
         // The filters block on subprocesses and HTTP; keep them off the reactor.
         let result =
-            bounded_dispatch(move || this.dispatch(&name, args), DISPATCH_TIMEOUT, &tool).await?;
+            bounded_dispatch(move || this.dispatch(&name, &args), DISPATCH_TIMEOUT, &tool).await?;
 
         Ok(match result {
             Ok(payload) => CallToolResult::success(vec![ContentBlock::text(compact(&payload))]),
@@ -315,14 +316,14 @@ mod tests {
 
     #[test]
     fn ping_reports_the_version() {
-        let out = server().ping(Some("hi".into()));
+        let out = Scout::ping(Some("hi"));
         assert!(out.contains(env!("CARGO_PKG_VERSION")));
         assert!(out.contains("hi"));
     }
 
     #[test]
     fn unknown_tool_is_a_fail_open_error_not_a_panic() {
-        let err = server().dispatch("nope", serde_json::json!({})).unwrap_err();
+        let err = server().dispatch("nope", &serde_json::json!({})).unwrap_err();
         assert!(err.text().contains("unknown tool"), "{}", err.text());
     }
 

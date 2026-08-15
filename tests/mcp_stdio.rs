@@ -113,7 +113,7 @@ impl McpServer {
     /// assuming the next line is ours — a client that assumes strict ordering
     /// is exactly the kind of thing that works until the server adds a
     /// notification.
-    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+    fn request(&mut self, id: u64, method: &str, params: &Value) -> Value {
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}));
         let deadline = Instant::now() + READ_TIMEOUT;
         loop {
@@ -175,7 +175,7 @@ fn handshake(server: &mut McpServer) -> Value {
     let result = server.request(
         1,
         "initialize",
-        json!({
+        &json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "scout-integration-test", "version": "0"}
@@ -221,7 +221,7 @@ fn tools_list_advertises_the_expected_tool_set() {
     let mut server = McpServer::spawn(&sandbox);
     handshake(&mut server);
 
-    let result = server.request(2, "tools/list", json!({}));
+    let result = server.request(2, "tools/list", &json!({}));
     let names: Vec<&str> = result["tools"]
         .as_array()
         .expect("tools array")
@@ -241,7 +241,7 @@ fn every_advertised_tool_carries_a_usable_input_schema() {
     let mut server = McpServer::spawn(&sandbox);
     handshake(&mut server);
 
-    let result = server.request(2, "tools/list", json!({}));
+    let result = server.request(2, "tools/list", &json!({}));
     let tools = result["tools"].as_array().expect("tools array");
 
     for tool in tools {
@@ -270,7 +270,7 @@ fn each_tools_required_args_match_what_its_handler_reads() {
     let mut server = McpServer::spawn(&sandbox);
     handshake(&mut server);
 
-    let result = server.request(2, "tools/list", json!({}));
+    let result = server.request(2, "tools/list", &json!({}));
     let tools = result["tools"].as_array().expect("tools array");
     let find = |name: &str| {
         tools
@@ -339,7 +339,7 @@ description = "A user's own wording for the grep tool, changing nothing about it
     let mut server = McpServer::spawn(&sandbox);
     handshake(&mut server);
 
-    let result = server.request(2, "tools/list", json!({}));
+    let result = server.request(2, "tools/list", &json!({}));
     let tools = result["tools"].as_array().expect("tools array");
     let grep = tools.iter().find(|t| t["name"] == "grep").expect("grep not advertised");
 

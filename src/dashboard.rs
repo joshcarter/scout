@@ -34,6 +34,10 @@ const MAX_DAEMON_LOG_BYTES: u64 = 1024 * 1024;
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 
 /// `scout dashboard` — start, stop, inspect, or be the daemon.
+///
+/// Every field here is one `--flag`, and clap owns the shape: the bools are a
+/// command line, not a state machine that wants collapsing into an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args, Debug, Default)]
 pub struct Args {
     /// Run the server in this process instead of detaching. For debugging,
@@ -267,7 +271,7 @@ fn group_ops(rows: &[Row]) -> Vec<Vec<usize>> {
     let mut slot: HashMap<&str, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
         if let Some(&at) = slot.get(row.op.as_str()) {
-            ops[at].push(i)
+            ops[at].push(i);
         } else {
             slot.insert(row.op.as_str(), ops.len());
             ops.push(vec![i]);
@@ -1290,7 +1294,7 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
     });
 
     if let Some(sock) = live_sock {
-        std::thread::spawn(move || crate::live::recv_loop(sock, live));
+        std::thread::spawn(move || crate::live::recv_loop(&sock, &live));
     }
 
     if let Some(pidfile) = pid_path_for(port) {
@@ -1495,7 +1499,7 @@ fn start(port: u16, open: bool) -> anyhow::Result<()> {
 /// The pid comes from the pidfile when there is one and from the daemon's own
 /// `/api/status` when there is not, so a dashboard whose pidfile was deleted is
 /// still stoppable.
-fn stop(port: u16) -> anyhow::Result<bool> {
+fn stop(port: u16) -> bool {
     let live = probe(port);
     let pid = pid_for_port(port)
         .or_else(|| live.as_ref().and_then(|v| v.get("pid").and_then(Value::as_u64)));
@@ -1503,12 +1507,12 @@ fn stop(port: u16) -> anyhow::Result<bool> {
     let Some(pid) = pid else {
         clear_pidfile(port);
         println!("scout dashboard: not running");
-        return Ok(false);
+        return false;
     };
     if live.is_none() {
         clear_pidfile(port);
         println!("scout dashboard: not running (stale pidfile for pid {pid} cleared)");
-        return Ok(false);
+        return false;
     }
 
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
@@ -1516,13 +1520,13 @@ fn stop(port: u16) -> anyhow::Result<bool> {
         if probe(port).is_none() {
             clear_pidfile(port);
             println!("scout dashboard stopped (pid {pid})");
-            return Ok(true);
+            return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     clear_pidfile(port);
     println!("scout dashboard: pid {pid} did not exit within 2s; pidfile removed");
-    Ok(true)
+    true
 }
 
 fn human_secs(secs: u64) -> String {
@@ -1535,7 +1539,7 @@ fn human_secs(secs: u64) -> String {
 }
 
 /// `--status`: running/not, pid, port, uptime, log path. Exit 0/1.
-fn status(port: u16) -> anyhow::Result<bool> {
+fn status(port: u16) -> bool {
     let log = daemon_log_path().map(|p| p.display().to_string()).unwrap_or_default();
     if let Some(v) = probe(port) {
         let get = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -1547,7 +1551,7 @@ fn status(port: u16) -> anyhow::Result<bool> {
         println!("  version  {}", v.get("version").and_then(Value::as_str).unwrap_or("?"));
         println!("  calls    {} rows", v["overview"]["rows"].as_u64().unwrap_or(0));
         println!("  log      {log}");
-        Ok(true)
+        true
     } else {
         if pid_for_port(port).is_some() {
             clear_pidfile(port);
@@ -1557,12 +1561,12 @@ fn status(port: u16) -> anyhow::Result<bool> {
         }
         println!("  port     {port}");
         println!("  log      {log}");
-        Ok(false)
+        false
     }
 }
 
 /// Entry point for `scout dashboard`.
-pub fn run(args: Args) -> anyhow::Result<()> {
+pub fn run(args: &Args) -> anyhow::Result<()> {
     let port = resolve_port(args.port);
 
     if args.foreground {
@@ -1574,14 +1578,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return run_foreground(port);
     }
     if args.status {
-        return if status(port)? { Ok(()) } else { std::process::exit(1) };
+        return if status(port) { Ok(()) } else { std::process::exit(1) };
     }
     if args.stop {
-        stop(port)?;
+        stop(port);
         return Ok(());
     }
     if args.restart {
-        stop(port)?;
+        stop(port);
         return start(port, args.open);
     }
     start(port, args.open)
@@ -1589,6 +1593,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // Shadows the module's `io::Write`; `String` only implements the `fmt` one,
+    // so `write!` into a buffer resolves to it.
+    use std::fmt::Write as _;
+
     use super::*;
 
     fn row(json: &str) -> Row {
@@ -2351,7 +2359,7 @@ mod tests {
     fn too_many_headers_is_rejected() {
         let mut request = String::from("GET /api/status HTTP/1.1\r\n");
         for i in 0..(MAX_HEADER_COUNT + 10) {
-            request.push_str(&format!("X-Custom-{i}: v\r\n"));
+            let _ = write!(request, "X-Custom-{i}: v\r\n");
         }
         request.push_str("\r\n");
         let resp = send_raw(request.as_bytes());

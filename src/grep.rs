@@ -21,6 +21,10 @@
 //! the resulting `source::SearchResults` and everything downstream — batching,
 //! id validation, materialization, the payload shapes — works off that.
 
+// See `render.rs` for why this writes into the buffer instead of pushing a
+// freshly-formatted `String`, and why the infallible `Result` is discarded.
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 use crate::filter_config::GrepConfig;
@@ -249,7 +253,7 @@ pub fn rerank(
         intent,
         hits_total,
         considered.len(),
-        returned,
+        &returned,
         dropped_invalid,
         none_relevant,
         search_truncated,
@@ -336,7 +340,7 @@ fn full_payload(
     hits: &[RawHit],
     hits_total: usize,
     search_truncated: bool,
-    hint: String,
+    hint: &str,
 ) -> Value {
     serde_json::json!({
         "mode": "full",
@@ -366,7 +370,7 @@ pub fn bypass_payload(
         hits,
         hits.len(),
         search_truncated,
-        "few enough hits to return whole — no filtering was applied".to_string(),
+        "few enough hits to return whole — no filtering was applied",
     )
 }
 
@@ -389,7 +393,7 @@ pub fn unfiltered_payload(
     } else {
         "no intent given — unfiltered search, no filtering applied".to_string()
     };
-    full_payload(pattern, None, shown, hits_total, search_truncated, hint)
+    full_payload(pattern, None, shown, hits_total, search_truncated, &hint)
 }
 
 /// Filtered result.  `dropped` and the hint always expose the lossiness.
@@ -399,7 +403,7 @@ pub fn rerank_payload(
     intent: &str,
     hits_total: usize,
     hits_considered: usize,
-    returned: Vec<Value>,
+    returned: &[Value],
     dropped_invalid: usize,
     none_relevant: bool,
     search_truncated: bool,
@@ -449,7 +453,7 @@ pub fn render_hit_list(hits: &[RawHit], first_id: usize) -> String {
             Some(kind) => format!(" ({kind})"),
             None => String::new(),
         };
-        out.push_str(&format!("[{}] {}:{}{tag}\n{}\n\n", first_id + i, h.file, h.line, h.context));
+        let _ = write!(out, "[{}] {}:{}{tag}\n{}\n\n", first_id + i, h.file, h.line, h.context);
     }
     out
 }

@@ -4,6 +4,8 @@
 //! Hits come from a `source::SearchResults` fixture, and the fail-open tests
 //! call `run` directly rather than going through the MCP request loop.
 
+use std::fmt::Write as _;
+
 use super::*;
 use crate::select::Ctx;
 use crate::source::SearchHit;
@@ -324,7 +326,10 @@ fn no_intent_returns_every_hit_without_touching_the_model() {
     // Well past `bypass_max_hits`, with no client configured: the absence of
     // an intent must short-circuit before the model is ever needed.
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (0..40).map(|i| format!("let needle_{i} = 1;\n")).collect();
+    let body = (0..40).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "let needle_{i} = 1;");
+        s
+    });
     std::fs::write(dir.path().join("a.rs"), body).unwrap();
     let ctx = offline_ctx(&dir.path().to_string_lossy());
     let payload = run(&ctx, &serde_json::json!({"pattern": "needle", "max_hits": 100}))
@@ -340,7 +345,10 @@ fn no_intent_returns_every_hit_without_touching_the_model() {
 #[test]
 fn an_empty_intent_is_the_same_as_no_intent() {
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (0..40).map(|i| format!("let needle_{i} = 1;\n")).collect();
+    let body = (0..40).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "let needle_{i} = 1;");
+        s
+    });
     std::fs::write(dir.path().join("a.rs"), body).unwrap();
     let ctx = offline_ctx(&dir.path().to_string_lossy());
     for intent in [serde_json::Value::String(String::new()), serde_json::Value::Null] {
@@ -486,7 +494,7 @@ fn type_and_glob_args_narrow_a_real_search() {
 #[test]
 fn rerank_payload_exposes_its_own_lossiness() {
     let returned = vec![serde_json::json!({"file": "a.rs", "line": 412, "text": "WritePack(&w)"})];
-    let p = rerank_payload("WritePack", "ignored errors", 57, 57, returned, 2, false, false);
+    let p = rerank_payload("WritePack", "ignored errors", 57, 57, &returned, 2, false, false);
     assert_eq!(p["mode"], "rerank");
     assert_eq!(p["hits_total"], 57);
     assert_eq!(p["returned"], 1);
@@ -500,7 +508,7 @@ fn rerank_payload_exposes_its_own_lossiness() {
 
 #[test]
 fn none_relevant_is_an_explicit_verdict_not_an_empty_match_set() {
-    let p = rerank_payload("WritePack", "ignored errors", 57, 57, vec![], 0, true, false);
+    let p = rerank_payload("WritePack", "ignored errors", 57, 57, &[], 0, true, false);
     assert_eq!(p["returned"], 0);
     assert_eq!(p["none_relevant"], true);
     let hint = p["hint"].as_str().unwrap();
@@ -510,7 +518,7 @@ fn none_relevant_is_an_explicit_verdict_not_an_empty_match_set() {
 
 #[test]
 fn over_cap_runs_report_the_truncation() {
-    let p = rerank_payload("x", "y", 900, 500, vec![], 0, true, true);
+    let p = rerank_payload("x", "y", 900, 500, &[], 0, true, true);
     assert_eq!(p["hits_total"], 900);
     assert_eq!(p["hits_considered"], 500);
     assert_eq!(p["truncated_before_rerank"], true);
@@ -552,7 +560,10 @@ fn a_noisy_hit_list_without_a_configured_llm_fails_open() {
     // Past the bypass threshold the model is required — and its absence must
     // read as a configuration problem, not a mystery.
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (0..40).map(|i| format!("let needle_{i} = 1;\n")).collect();
+    let body = (0..40).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "let needle_{i} = 1;");
+        s
+    });
     std::fs::write(dir.path().join("a.rs"), body).unwrap();
     let ctx = offline_ctx(&dir.path().to_string_lossy());
     let err =

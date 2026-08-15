@@ -91,25 +91,22 @@ pub fn dispatch(
             .into());
     };
 
-    match intent {
-        // Two positionals: pattern + intent, the reranked grep.
-        Some(intent) => {
-            no_attempts("this is an explicit pattern")?;
-            Ok(Pipeline::Grep { pattern: query, intent: Some(intent), regex })
-        }
-        // One positional: a question for the find pipeline.  `--regex` is
-        // rejected here for the same reason `scout find` has no such flag —
-        // the model decides per candidate whether its pattern is a regex, so a
-        // global override would countermand a decision the caller never made.
-        None => {
-            if regex {
-                return Err("--regex applies to an explicit pattern; this is a question \
-                            for the find pipeline (use -p, or add an intent)"
-                    .into());
-            }
-            Ok(Pipeline::Find { question: query, attempts })
-        }
+    // Two positionals: pattern + intent, the reranked grep.
+    if let Some(intent) = intent {
+        no_attempts("this is an explicit pattern")?;
+        return Ok(Pipeline::Grep { pattern: query, intent: Some(intent), regex });
     }
+
+    // One positional: a question for the find pipeline.  `--regex` is rejected
+    // here for the same reason `scout find` has no such flag — the model
+    // decides per candidate whether its pattern is a regex, so a global
+    // override would countermand a decision the caller never made.
+    if regex {
+        return Err("--regex applies to an explicit pattern; this is a question \
+                    for the find pipeline (use -p, or add an intent)"
+            .into());
+    }
+    Ok(Pipeline::Find { question: query, attempts })
 }
 
 // ── The editor and its invocation ────────────────────────────────────
@@ -402,13 +399,15 @@ fn prompt(n: usize) -> Choice {
             Ok(_) => {}
         }
         match parse_choice(&line, n) {
-            Choice::Invalid => continue,
+            // Anything unparseable just re-prompts.
+            Choice::Invalid => {}
             choice => return choice,
         }
     }
 }
 
 /// Which hits the caller picked.
+#[derive(Clone, Copy)]
 enum Selection {
     /// A 0-based index into the hit list.
     One(usize),
@@ -436,7 +435,7 @@ fn launch(editor: &[String], hits: &[Hit], sel: Selection, payload: &Value, proj
     if kind == EditorKind::Unknown {
         eprintln!("{}: at line {}", target.file, target.line);
     }
-    exec_editor(editor, open_args(kind, &files, target.line, target.col), project, None)
+    exec_editor(editor, &open_args(kind, &files, target.line, target.col), project, None)
 }
 
 /// Write the hit list as `--format vimgrep` to a private temp file and return
@@ -472,7 +471,7 @@ fn quickfix(editor: &[String], payload: &Value, project: &str) -> ! {
         }
     };
     let args = quickfix_args(&path.to_string_lossy());
-    exec_editor(editor, args, project, Some(path))
+    exec_editor(editor, &args, project, Some(path))
 }
 
 /// Hand the terminal to the editor.
@@ -482,9 +481,9 @@ fn quickfix(editor: &[String], payload: &Value, project: &str) -> ! {
 /// behind to confuse `^Z` or a window resize.  A quickfix temp file forces the
 /// other shape — `exec` never returns, so the unlink would never run — and there
 /// the child is spawned, waited on, and its exit status forwarded.
-fn exec_editor(editor: &[String], args: Vec<String>, project: &str, cleanup: Option<PathBuf>) -> ! {
+fn exec_editor(editor: &[String], args: &[String], project: &str, cleanup: Option<PathBuf>) -> ! {
     let mut cmd = Command::new(&editor[0]);
-    cmd.args(&editor[1..]).args(&args).current_dir(project);
+    cmd.args(&editor[1..]).args(args).current_dir(project);
 
     #[cfg(unix)]
     if cleanup.is_none() {

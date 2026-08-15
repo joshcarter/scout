@@ -324,10 +324,8 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
             out.truncated = true;
             break;
         }
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue, // unreadable dir/symlink loop — skip, never abort
-        };
+        // An unreadable dir or a symlink loop — skip it, never abort the walk.
+        let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }

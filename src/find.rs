@@ -53,6 +53,9 @@
 //! * Unlike `grep`, this verb requires a configured LLM — there is no pattern
 //!   to fall back on — so a missing config fails open naming `scout grep`.
 
+// See `render.rs` for why the string builders below `write!` into the buffer
+// and discard the infallible `Result`.
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -110,6 +113,15 @@ pub struct CandidateResult {
 
 /// Answer a natural-language question by guessing patterns, searching for them,
 /// and reranking the union against the question.
+//
+// One honest sequence rather than 120 lines wanting a split.  The round loop
+// carries nine pieces of state across iterations — what was tried, what
+// whiffed, what was too common, the label parts, the last parse error, the
+// prior survivors and their payload, the refined patterns, and the truncation
+// flag — and every one of them is read or written on the next pass.  Lifting
+// the body into a helper means lifting all nine into a struct that exists only
+// to be threaded back in, which is ceremony, not structure.
+#[allow(clippy::too_many_lines)]
 pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let (_, mut cfg) = crate::filter_config::load();
     let find_cfg = crate::filter_config::load_find();
@@ -739,13 +751,14 @@ pub fn reflect_hit_list(hits: &[Value]) -> String {
             Some(kind) => format!(" ({kind})"),
             None => String::new(),
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "[{}] {}:{}{tag}\n{}\n\n",
             i + 1,
             h.get("file").and_then(Value::as_str).unwrap_or("?"),
             h.get("line").and_then(Value::as_u64).unwrap_or(0),
             h.get("context").and_then(Value::as_str).unwrap_or(""),
-        ));
+        );
     }
     out
 }
@@ -842,11 +855,11 @@ pub fn trying_line(results: &[CandidateResult]) -> String {
     // Unusable is a whiff from the caller's chair: the guess produced nothing.
     let whiffed = count(Fate::Whiffed) + count(Fate::Unusable);
     if whiffed > 0 {
-        line.push_str(&format!(" · {whiffed} whiffed"));
+        let _ = write!(line, " · {whiffed} whiffed");
     }
     let common = count(Fate::TooCommon);
     if common > 0 {
-        line.push_str(&format!(" · {common} matched too much to discriminate"));
+        let _ = write!(line, " · {common} matched too much to discriminate");
     }
     line
 }
@@ -988,7 +1001,7 @@ fn live(ctx: &Ctx, round: usize, kind: &str, fields: impl FnOnce() -> Value) {
     if ctx.ledger.is_silent() || !crate::live::is_listening() {
         return;
     }
-    crate::live::emit_find(ctx.ledger.op(), round as u64, kind, fields());
+    crate::live::emit_find(ctx.ledger.op(), round as u64, kind, &fields());
 }
 
 /// `find.patterns` — what this round is about to search for.

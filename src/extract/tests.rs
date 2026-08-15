@@ -5,6 +5,8 @@
 //! The fail-open tests call `run` directly rather than going through the MCP
 //! request loop.
 
+use std::fmt::Write as _;
+
 use super::*;
 use crate::select::Ctx;
 
@@ -146,7 +148,10 @@ fn a_large_file_without_a_configured_llm_fails_open() {
     // Past the bypass threshold the model is required — and its absence must
     // read as a configuration problem, not a mystery.
     let dir = tempfile::tempdir().unwrap();
-    let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    let body = (1..=500).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "line {i}");
+        s
+    });
     std::fs::write(dir.path().join("big.rs"), body).unwrap();
     let ctx = offline_ctx(&dir.path().to_string_lossy());
     let err = run(&ctx, &serde_json::json!({"file": "big.rs", "question": "where?"})).unwrap_err();

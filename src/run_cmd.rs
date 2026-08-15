@@ -134,9 +134,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
     // Load presets from the same source the MCP server uses: embedded
     // built-ins overlaid with any user overrides.
     let loaded = presets::load_presets();
-    let preset = if let Some(p) = loaded.iter().find(|p| p.name == preset_name) {
-        p
-    } else {
+    let Some(preset) = loaded.iter().find(|p| p.name == preset_name) else {
         let available: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
         eprintln!("scout run: preset {preset_name:?} not found (available: {available:?})");
         std::process::exit(1);

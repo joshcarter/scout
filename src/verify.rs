@@ -11,6 +11,10 @@
 //! printed — capped as the bytes arrive, never buffered whole — and decide
 //! whether it is still making progress or has wedged.
 
+// See `render.rs` for why this writes into the buffer instead of pushing a
+// freshly-formatted `String`, and why the infallible `Result` is discarded.
+use std::fmt::Write as _;
+
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
@@ -176,6 +180,11 @@ pub fn run_command_capture(
 /// So: one reader thread per pipe, each appending into a bounded buffer and
 /// stamping a shared "last byte seen" clock, while this thread polls
 /// `try_wait()` and the two deadlines.
+// One honest sequence, and deliberately so: the doc comment above is a record
+// of what splitting it cost last time.  The child, its two reader threads and
+// the two deadlines are a single piece of state; handing any part of it to a
+// helper means handing over the rest as well.
+#[allow(clippy::too_many_lines)]
 pub fn capture_with_deadlines(
     cmd: &str,
     dir: &Path,
@@ -343,7 +352,8 @@ fn spawn_reader<R: Read + Send + 'static>(
                     last_output_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     lock(&buf).push(&chunk[..n]);
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // EINTR is not a read failure: go round and read again.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
@@ -454,7 +464,7 @@ impl BoundedBuffer {
             return String::from_utf8_lossy(&whole).into_owned();
         }
         let mut out = String::from_utf8_lossy(&self.head).into_owned();
-        out.push_str(&format!("\n...[{} bytes elided]...\n", self.dropped));
+        let _ = writeln!(out, "\n...[{} bytes elided]...", self.dropped);
         out.push_str(&String::from_utf8_lossy(&tail));
         out
     }

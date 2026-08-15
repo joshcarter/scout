@@ -19,13 +19,13 @@ fn main() -> anyhow::Result<()> {
         Command::Find(args) => cli::run_find(*args),
         Command::Edit(args) => cli::run_edit(*args),
         Command::Extract { file, question, max_lines, project } => {
-            cli::run_extract(file, question, max_lines, project)
+            cli::run_extract(&file, &question, max_lines, project)
         }
         Command::Check { command, cwd, timeout_seconds, project } => {
-            cli::run_check(command, cwd, timeout_seconds, project)
+            cli::run_check(&command, cwd.as_deref(), timeout_seconds, project)
         }
         Command::ClassifyCommand => classify_command::run_subcommand(),
         Command::Stats => stats::print_report(),
-        Command::Dashboard(args) => dashboard::run(args),
+        Command::Dashboard(args) => dashboard::run(&args),
     }
 }

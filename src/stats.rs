@@ -544,7 +544,7 @@ impl Ledger {
     /// `CallRecord::new`, so a row can only be grouped with its siblings by
     /// going through the ledger that actually delimits them.
     pub fn record(&self, mut rec: CallRecord) {
-        rec.op = self.op.clone();
+        rec.op.clone_from(&self.op);
         if rec.raw_bytes.is_none() {
             rec.raw_bytes = self.raw.take();
         }
@@ -858,9 +858,7 @@ fn human_bytes(n: u64) -> String {
 /// then the three things the record now carries that the table cannot show:
 /// context saved, calls served without the model, and failures by kind.
 pub fn print_report() -> anyhow::Result<()> {
-    let path = if let Some(p) = log_path() {
-        p
-    } else {
+    let Some(path) = log_path() else {
         println!("scout stats: $HOME not set and $SCOUT_CALLS_LOG not set; no log to read");
         return Ok(());
     };
@@ -991,7 +989,7 @@ mod tests {
             .collect()
     }
 
-    fn write(f: &NamedTempFile, rec: CallRecord) {
+    fn write(f: &NamedTempFile, rec: &CallRecord) {
         append_line(f.path(), &rec.to_json().to_string());
     }
 
@@ -1019,7 +1017,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         write(
             &tmp,
-            CallRecord::new("find", "find_patterns")
+            &CallRecord::new("find", "find_patterns")
                 .via(VIA_CLI)
                 .attempt(2)
                 .project("/home/josh/Projects/scout")
@@ -1062,8 +1060,8 @@ mod tests {
     #[test]
     fn a_record_written_on_its_own_is_its_own_operation() {
         let tmp = NamedTempFile::new().unwrap();
-        write(&tmp, CallRecord::new("task", "task"));
-        write(&tmp, CallRecord::new("task", "task"));
+        write(&tmp, &CallRecord::new("task", "task"));
+        write(&tmp, &CallRecord::new("task", "task"));
         let rows = lines_of(&tmp);
         assert_eq!(rows[0]["run"], rows[1]["run"], "one process is one run");
         assert_ne!(rows[0]["op"], rows[1]["op"], "...and two operations");
@@ -1072,8 +1070,8 @@ mod tests {
     #[test]
     fn ids_are_monotonic_within_a_run() {
         let tmp = NamedTempFile::new().unwrap();
-        write(&tmp, CallRecord::new("grep", "grep"));
-        write(&tmp, CallRecord::new("grep", "grep"));
+        write(&tmp, &CallRecord::new("grep", "grep"));
+        write(&tmp, &CallRecord::new("grep", "grep"));
         let rows = lines_of(&tmp);
         assert_eq!(rows[0]["run"], rows[1]["run"], "one process is one run");
         assert_ne!(rows[0]["id"], rows[1]["id"]);
@@ -1132,7 +1130,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         write(
             &tmp,
-            CallRecord::new("check_output", "check_output")
+            &CallRecord::new("check_output", "check_output")
                 .outcome(Outcome::EndpointUnreachable)
                 .summary("local LLM endpoint http://localhost:11434/v1 is not responding"),
         );
@@ -1153,7 +1151,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         write(
             &tmp,
-            CallRecord::new("check_output", "check_output")
+            &CallRecord::new("check_output", "check_output")
                 .outcome(Outcome::SubprocessTimeout)
                 .summary("the command printed nothing for 120s and was killed after 121s"),
         );
@@ -1171,7 +1169,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         write(
             &tmp,
-            CallRecord::new("extract", "extract")
+            &CallRecord::new("extract", "extract")
                 .outcome(Outcome::Bypassed)
                 .summary("file is small enough to return whole")
                 .raw_bytes(4096)
@@ -1196,7 +1194,7 @@ mod tests {
     #[test]
     fn absent_fields_are_omitted_rather_than_written_null() {
         let tmp = NamedTempFile::new().unwrap();
-        write(&tmp, CallRecord::new("task", "task"));
+        write(&tmp, &CallRecord::new("task", "task"));
         let v = &lines_of(&tmp)[0];
         for key in ["project", "model", "endpoint", "input", "raw_bytes", "returned_bytes"] {
             assert!(v.get(key).is_none(), "{key} should be absent, got {v}");
@@ -1419,7 +1417,14 @@ mod tests {
         assert_eq!(r.rows[0].1.calls, 2);
         assert_eq!(r.rows[0].1.ok, 1);
         assert_eq!(r.rows[0].1.tokens_in, 1840);
-        assert_eq!(r.span_secs, 60.0, "an integer ts must not read as 0");
+        // Exact `==` on a float is right here, not a slip: both timestamps are
+        // whole seconds well under 2^53, so they land in an `f64` exactly and
+        // their difference is exact too.  An epsilon would only hide a real
+        // regression — reading an integer `ts` as 0 is what this pins.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(r.span_secs, 60.0, "an integer ts must not read as 0");
+        }
         // A v1 failure has no kind, and is counted rather than dropped.
         assert_eq!(r.failures, vec![("unknown".to_string(), 1)]);
     }

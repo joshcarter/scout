@@ -19,9 +19,9 @@ use std::collections::HashMap;
 
 /// Pass 1: replace `${args.<field>}` in `s` using `caller_args`.
 ///
-/// - `${args.symbol}` → caller_args["symbol"] as string (strings verbatim;
-///   numbers/booleans converted via Display; missing or null → "")
-/// - `${args.base_branch:-main}` → caller_args["base_branch"] if present
+/// - `${args.symbol}` → `caller_args["symbol"]` as string (strings verbatim;
+///   numbers/booleans converted via `Display`; missing or null → "")
+/// - `${args.base_branch:-main}` → `caller_args["base_branch"]` if present
 ///   and non-empty, otherwise the literal `main`.  The `:-default` suffix
 ///   follows shell conventions: absent, null, and empty-string all fall back.
 /// - Unmatched `${...}` (no closing `}`, or not `args.` prefix) → kept literal
@@ -69,10 +69,13 @@ pub fn substitute_args(s: &str, caller_args: &serde_json::Value) -> String {
 
 /// Pass 2: replace `{<key>}` in `s` using `context` output map.
 ///
-/// - `{diff}` → context["diff"] if present; left literal `{diff}` if not.
+/// - `{diff}` → `context["diff"]` if present; left literal `{diff}` if not.
 /// - `{{` / `}}` are left as-is (not escape sequences — just brace literals).
 /// - Any `{...}` whose key is not in `context` is left literal.
-pub fn substitute_context(s: &str, context: &HashMap<String, String>) -> String {
+pub fn substitute_context<S: std::hash::BuildHasher>(
+    s: &str,
+    context: &HashMap<String, String, S>,
+) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(open) = rest.find('{') {

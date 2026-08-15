@@ -15,6 +15,10 @@
 // 2. Add the name to the `matches!` block in `provider_known()`.
 // 3. Add the dispatch arm in `run_provider()`.
 
+// See `render.rs` for why this writes into the buffer instead of pushing a
+// freshly-formatted `String`, and why the infallible `Result` is discarded.
+use std::fmt::Write as _;
+
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -337,12 +341,11 @@ fn run_bounded(
     if let Some(e) = wait_error {
         return Err(e);
     }
-    let status = match status {
-        Some(s) => s,
-        // Unreachable: the loop only leaves without a status by setting one of
-        // the two cases above.  Reported rather than asserted — a provider must
-        // degrade, never panic half-way through building a prompt.
-        None => return Err(format!("{program}: exited without reporting a status")),
+    // Unreachable: the loop only leaves without a status by setting one of the
+    // two cases above.  Reported rather than asserted — a provider must degrade,
+    // never panic half-way through building a prompt.
+    let Some(status) = status else {
+        return Err(format!("{program}: exited without reporting a status"));
     };
     if !status.success() {
         let stderr = lock(&err_buf).render("stderr");
@@ -378,10 +381,11 @@ impl Capped {
     fn render(&self, label: &str) -> String {
         let mut s = String::from_utf8_lossy(&self.buf).into_owned();
         if self.dropped > 0 {
-            s.push_str(&format!(
+            let _ = write!(
+                s,
                 "\n[{label}: output truncated at {} bytes, {} elided]",
                 self.cap, self.dropped
-            ));
+            );
         }
         s
     }
@@ -412,7 +416,8 @@ fn spawn_reader<R: Read + Send + 'static>(
                     last_output_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                     lock(&buf).push(&chunk[..n]);
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                // EINTR is not a read failure: go round and read again.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
@@ -691,7 +696,10 @@ mod tests {
         if !init {
             return; // no git — nothing to assert
         }
-        let big: String = (0..20_000).map(|i| format!("line {i} of a very large diff\n")).collect();
+        let big = (0..20_000).fold(String::new(), |mut s, i| {
+            let _ = writeln!(s, "line {i} of a very large diff");
+            s
+        });
         std::fs::write(repo.path().join("big.txt"), &big).unwrap();
         let added = std::process::Command::new("git")
             .args(["add", "big.txt"])

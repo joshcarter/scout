@@ -151,7 +151,7 @@ pub fn load(dir: &Path) -> Vec<Preset> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("scout: cannot read preset dir {dir:?}: {e}");
+            eprintln!("scout: cannot read preset dir {}: {e}", dir.display());
             return presets;
         }
     };
@@ -165,9 +165,9 @@ pub fn load(dir: &Path) -> Vec<Preset> {
 
     for path in paths {
         match std::fs::read_to_string(&path) {
-            Err(e) => eprintln!("scout: cannot read {path:?}: {e}"),
+            Err(e) => eprintln!("scout: cannot read {}: {e}", path.display()),
             Ok(source) => match loader::parse(&source) {
-                Err(e) => eprintln!("scout: preset {path:?} parse error: {e}"),
+                Err(e) => eprintln!("scout: preset {} parse error: {e}", path.display()),
                 Ok(p) => presets.push(p),
             },
         }

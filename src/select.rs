@@ -523,7 +523,7 @@ pub fn round_trip(
     // It is a no-op for a silent record and when no dashboard is listening, so
     // `complete_streaming` here is the same call `complete` was.
     let result = crate::live::with_token_stream(&rec, |sink| {
-        client.complete_streaming(messages, None, sink)
+        client.complete_streaming(&messages, None, sink)
     })
     .and_then(|(text, usage)| {
         if text.trim().is_empty() {

@@ -25,6 +25,15 @@
 //! *context* line is simply cut at the cap.  That is a terminal concern only —
 //! `--format json` and `--format vimgrep` are untouched by it.
 
+// `write!` into a `String` is how the per-hit and per-line loops below append:
+// it formats straight into the buffer instead of allocating a throwaway
+// `String` per line the way `push_str(&format!(..))` does.  `fmt::Write` is
+// fallible in general, so `write!` hands back a `Result` — but the `String`
+// implementation only ever grows the buffer and cannot fail, so every call
+// site discards it with `let _ =`, the way the rest of the codebase marks a
+// deliberately ignored result.
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 // ── ANSI ─────────────────────────────────────────────────────────────
@@ -114,21 +123,21 @@ fn render_hit(out: &mut String, hit: &Value, index: Option<(usize, usize)>, opts
     if let Some((n, width)) = index {
         let label = format!("{n:>width$}. ");
         if opts.color {
-            out.push_str(&format!("{BOLD}{label}{RESET}"));
+            let _ = write!(out, "{BOLD}{label}{RESET}");
         } else {
             out.push_str(&label);
         }
     }
     if opts.color {
-        out.push_str(&format!("{MAGENTA}{file}{RESET}:{GREEN}{line}{RESET}"));
+        let _ = write!(out, "{MAGENTA}{file}{RESET}:{GREEN}{line}{RESET}");
     } else {
-        out.push_str(&format!("{file}:{line}"));
+        let _ = write!(out, "{file}:{line}");
     }
     // Rerank mode only; the two bypass paths have no model verdict to show.
     if let Some(why) =
         hit.get("why").and_then(Value::as_str).map(str::trim).filter(|w| !w.is_empty())
     {
-        out.push_str(&format!(" · {why}"));
+        let _ = write!(out, " · {why}");
     }
     out.push('\n');
 
@@ -364,7 +373,7 @@ pub fn render_vimgrep(payload: &Value) -> String {
             .map(str::trim_end)
             .filter(|t| !t.is_empty())
             .unwrap_or(NO_TEXT);
-        out.push_str(&format!("{file}:{line}:{col}: {text}\n"));
+        let _ = writeln!(out, "{file}:{line}:{col}: {text}");
     }
     out
 }

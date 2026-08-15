@@ -7,6 +7,8 @@
 //! fail, and everything else is written as a pure function precisely so it can
 //! be tested without one.
 
+use std::fmt::Write as _;
+
 use super::*;
 use crate::filter_config::FindConfig;
 use crate::select::Ctx;
@@ -205,7 +207,10 @@ fn a_seed_is_a_candidate_like_any_other_and_the_guard_judges_it() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "pub fn draw_waterslide(v: WaterslideView) {}\n")
         .unwrap();
-    let common: String = (0..40).map(|i| format!("// view {i}\n")).collect();
+    let common = (0..40).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "// view {i}");
+        s
+    });
     std::fs::write(dir.path().join("b.rs"), common).unwrap();
 
     let seeds = seed_candidates("main rendering function for the waterslide view", &[], &[]);
@@ -285,27 +290,32 @@ fn the_reflect_pattern_list_is_capped() {
 
 // ── Reflect: loop semantics ──────────────────────────────────────────
 
-fn reflection(answered: bool, patterns: &[&str]) -> Option<Reflection> {
-    Some(Reflection {
+fn reflection(answered: bool, patterns: &[&str]) -> Reflection {
+    Reflection {
         answered,
         patterns: patterns
             .iter()
             .map(|p| Candidate { pattern: (*p).to_string(), ..Default::default() })
             .collect(),
-    })
+    }
 }
 
 #[test]
 fn answered_stops_the_loop_and_unanswered_with_patterns_re_rounds() {
-    assert_eq!(next_patterns(reflection(true, &[]), &[]), None, "answered: return what we have");
     assert_eq!(
-        next_patterns(reflection(true, &["ignored"]), &[]),
+        next_patterns(Some(reflection(true, &[])), &[]),
+        None,
+        "answered: return what we have"
+    );
+    assert_eq!(
+        next_patterns(Some(reflection(true, &["ignored"])), &[]),
         None,
         "answered wins over patterns"
     );
 
     let next =
-        next_patterns(reflection(false, &["draw_waterslide", "fn draw_waterslide"]), &[]).unwrap();
+        next_patterns(Some(reflection(false, &["draw_waterslide", "fn draw_waterslide"])), &[])
+            .unwrap();
     assert_eq!(
         next.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>(),
         vec!["draw_waterslide", "fn draw_waterslide"]
@@ -318,7 +328,7 @@ fn a_parse_failure_or_an_empty_refinement_returns_the_current_results() {
     // loop with what the rerank already kept.
     assert_eq!(next_patterns(None, &[]), None, "unparseable reply");
     assert_eq!(
-        next_patterns(reflection(false, &[]), &[]),
+        next_patterns(Some(reflection(false, &[])), &[]),
         None,
         "'no' with nothing to try instead"
     );
@@ -329,9 +339,10 @@ fn a_refinement_that_only_repeats_what_was_searched_stops_the_loop() {
     // Re-searching a tried pattern would spend a whole round reproducing the
     // result we are already holding.
     let tried = vec!["render".to_string(), "(?i)waterslide".to_string()];
-    assert_eq!(next_patterns(reflection(false, &["render", "waterslide"]), &tried), None);
+    assert_eq!(next_patterns(Some(reflection(false, &["render", "waterslide"])), &tried), None);
     // ...but one new pattern among repeats is still worth a round.
-    let next = next_patterns(reflection(false, &["render", "draw_waterslide"]), &tried).unwrap();
+    let next =
+        next_patterns(Some(reflection(false, &["render", "draw_waterslide"])), &tried).unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].pattern, "draw_waterslide");
 }
@@ -418,7 +429,10 @@ fn an_over_cap_candidate_loses_every_hit_not_just_the_excess() {
     // The point of the guard is discrimination, not volume: 400 hits from
     // `parse` in a parser are not 300 good hits plus 100 bad ones.
     let dir = tempfile::tempdir().unwrap();
-    let common: String = (0..40).map(|i| format!("fn parse_{i}() {{}}\n")).collect();
+    let common = (0..40).fold(String::new(), |mut s, i| {
+        let _ = writeln!(s, "fn parse_{i}() {{}}");
+        s
+    });
     std::fs::write(dir.path().join("a.rs"), common).unwrap();
     std::fs::write(dir.path().join("b.rs"), "fn load_config() {}\n").unwrap();
 
