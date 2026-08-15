@@ -162,3 +162,49 @@ tight as it is. Raising it buys auto-approvals and costs latency on the
 failure path, and the right tradeoff probably is not one number for all
 presets. Note the dashboard's TTL sweep already removes the *accounting*
 consequence of a kill, so this is no longer urgent — only wrong.
+
+# `check_output`'s timeouts are compiled in
+
+Three values decide whether a build is killed, and none of them can be
+changed without a rebuild:
+
+- `verify::IDLE_TIMEOUT` (120s) — no output while the process is still alive.
+  This is the one that actually decides "wedged", and it is the one most
+  likely to need moving: a monorepo whose link step is silent for four
+  minutes is working, not stuck.
+- `check_output::DEFAULT_TIMEOUT_SECS` (900) and `MAX_TIMEOUT_SECS` (3600) —
+  the wall-clock circuit breaker and the ceiling on the caller's
+  `timeout_seconds` argument.
+
+The per-call `timeout_seconds` tool argument covers the wall clock, so a
+caller who knows a command is slow can already ask for more. Nothing exposes
+the idle deadline at all, which is backwards: the wall clock is now a
+backstop and idle is the real policy.
+
+Wanted: a `[check_output]` section with `idle_timeout_seconds` and
+`default_timeout_seconds`, following the existing per-subsystem convention
+(`[llm] [extract] [grep] [cli] [find] [dashboard]`).
+
+**Rejected: a dedicated `[timeouts]` section.** Timeouts are not a group
+anyone tunes together — they are properties of subsystems. Hoisting them
+would separate `[llm] idle_timeout_seconds` from the `stream` and `endpoint`
+settings that give it meaning (it only applies to a streaming call), which is
+cohesion by datatype over cohesion by subject. It would also imply the two
+hook budgets belong there, and they emphatically do not: a hook blocks a
+human staring at a terminal, so its ceiling is patience, not model health.
+Deriving those from config is the shadowing bug described above, not the fix
+for it.
+
+**Do the parser unification first.** Adding a section means picking one of
+scout's two config parsers, and they disagree: `config.rs` is strict (a
+malformed `[llm]` errors loudly) while `filter_config.rs` is lenient (a
+mistyped `[grep]` silently discards every tunable under it, and
+`read_to_string(...).ok()` makes a permission error indistinguishable from an
+absent file). Today the failure mode a user gets for a typo depends on which
+section they typed it in. Adding `[check_output]` before unifying just picks
+one of those semantics by accident. `config.rs:7-9` also still claims to be
+"the sole config parser in scout, and deliberately so", which is false and
+should go either way.
+
+Small related gap: `[dashboard]` is parsed by `filter_config.rs` but appears
+nowhere in `config.example.toml`.
