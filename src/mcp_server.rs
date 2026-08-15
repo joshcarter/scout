@@ -23,7 +23,7 @@ use std::time::Duration;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{schemars, ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -36,6 +36,36 @@ use crate::client::LlmClient;
 // `presets::inherit_mcp_schema`), and two copies of it would drift.
 use crate::presets::{Preset, MCP_PRESETS};
 use crate::select::{Ctx, ToolError, ToolResult};
+
+// The newest protocol era this server actually speaks.
+//
+// rmcp 3.1's `KNOWN_VERSIONS` lists `2026-07-28`, but it knows that era only
+// well enough to apply SEP-2243's HTTP headers: it does not serialize the
+// per-result cache fields (`ttlMs`, `cacheScope`) the era requires on
+// `tools/list`.  Negotiation echoes back any version on the advertised list
+// (`negotiate_protocol_version`), so leaving the default in place means
+// agreeing to a contract this server cannot honour — Claude Code offers
+// `2026-07-28`, rmcp agrees, and then every `tools/list` result fails the
+// client's schema check.  It retries three times and drops the server with no
+// tools registered, which surfaces as a *working* plugin advertising nothing:
+// the binary is fine, the hooks still fire, and the redirect they issue points
+// at tools that are not there.
+//
+// Narrowing the advertised list is the SDK's own lever for this — anything not
+// on it falls back to `get_info`'s version, which is why the two are pinned to
+// the same constant and a test holds them together.  Raise this only with
+// evidence that the newer era's wire format is actually produced.
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+// Every era from the original release up to `MAX_PROTOCOL_VERSION`.  Spelled
+// out rather than sliced from `KNOWN_VERSIONS`, so adding an era upstream
+// cannot silently widen what this server claims to serve.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2024_11_05,
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    MAX_PROTOCOL_VERSION,
+];
 
 const INSTRUCTIONS: &str = "scout offloads small problems to a local LLM so they never consume \
 cloud-model context. Prefer its tools for classifying build/test output and targeted file/search \
@@ -159,8 +189,16 @@ fn schema_object(v: &Value) -> serde_json::Map<String, Value> {
 impl ServerHandler for Scout {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(MAX_PROTOCOL_VERSION)
             .with_server_info(Implementation::new("scout", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS.to_string())
+    }
+
+    // The fallback above is only consulted for versions off this list, so this
+    // is the half that actually stops the over-claim.  See
+    // `MAX_PROTOCOL_VERSION`.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     async fn list_tools(
@@ -378,5 +416,42 @@ mod tests {
         assert_eq!(info.server_info.name, "scout");
         assert!(info.capabilities.tools.is_some());
         assert!(info.instructions.unwrap().contains("local LLM"));
+    }
+
+    #[test]
+    fn the_advertised_list_omits_eras_this_server_cannot_serialize() {
+        let supported = ServerHandler::supported_protocol_versions(&server());
+        assert!(
+            !supported.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 wants ttlMs/cacheScope on every tools/list result and rmcp 3.1 emits \
+             neither; advertising it makes the client reject the tool list outright"
+        );
+        assert!(
+            supported.contains(&MAX_PROTOCOL_VERSION),
+            "the fallback version must itself be advertised"
+        );
+    }
+
+    #[test]
+    fn the_negotiation_fallback_matches_the_advertised_maximum() {
+        // Two independent surfaces decide what a client ends up with: the list
+        // (for versions it offers) and `get_info` (for everything else).  Let
+        // them drift and the off-list path lands on an era that is not on the
+        // list — the exact shape of the original bug.
+        let info = server().get_info();
+        assert_eq!(info.protocol_version, MAX_PROTOCOL_VERSION);
+        assert!(ServerHandler::supported_protocol_versions(&server()).contains(&info.protocol_version));
+    }
+
+    #[test]
+    fn the_advertised_list_is_a_prefix_of_what_the_sdk_knows() {
+        // Guards the hand-written list against a typo'd or invented era.
+        let supported = ServerHandler::supported_protocol_versions(&server());
+        for v in supported.iter() {
+            assert!(
+                ProtocolVersion::KNOWN_VERSIONS.contains(v),
+                "advertised a version the SDK does not know: {v}"
+            );
+        }
     }
 }
