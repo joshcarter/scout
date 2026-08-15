@@ -1,8 +1,27 @@
-# Claude guidance to use appropriate tools
+# License
 
-Make sure Claude gets what it needs to know about scout's features,
-and guidance to favor using them. Builds, unit test runs, etc. should
-be going through scout with some consistency.
+Decide on and add license.
+
+# Shell Script Madness
+
+There's a bunch of complicated shell scripts with a bunch of regexps.
+Is that the better call vs. invoking a scout command to run the logic?
+For example `sed` gets invoked all over the place--is that really
+better than invoking `scout`?
+
+# Publish to crates.io
+
+See `docs/distribution.md`.
+
+# Rewrite README.md
+
+Have Fable do a full review and rewrite, then redo at least the start
+by hand. Include examples of CLI and Claude Code use. Include note
+that only LM Studio has been tested.
+
+# Grok Build compatibility
+
+See `docs/grok-hooks.md`.
 
 # `LlmError::RequestFailed` is too coarse to classify
 

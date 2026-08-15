@@ -425,8 +425,11 @@ is inert on Grok — and per §2.5 no other location or spelling changes
 that.
 
 The build/test redirect and the shell-safety auto-allow are therefore
-**Claude-only features**. Say so plainly in the README rather than
-letting a Grok user infer that scout is misbehaving.
+**Claude-only features** as long as they live only in `hooks/hooks.json`.
+Say so plainly in the README rather than letting a Grok user infer that
+scout is misbehaving. Getting the same scripts to run under Grok is a
+registration-and-envelope problem, not a second copy of the hooks —
+see [`grok-hooks.md`](grok-hooks.md).
 
 Worth naming the layer that does not transfer: under Claude, scout's
 steering is three layers — guidance, MCP tool descriptions, and

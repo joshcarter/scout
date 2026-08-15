@@ -146,7 +146,9 @@ than at the repo root: a `.mcp.json` sitting inside a plugin folder gets
 attributed to the plugin, so any project-level MCP config you keep for
 working on this checkout belongs above it. See
 [`docs/plugin-packaging.md`](docs/plugin-packaging.md) for the full
-picture of how each harness loads this.
+picture of how each harness loads this, and
+[`docs/distribution.md`](docs/distribution.md) for how the git
+marketplace and crates.io relate — they do not install each other.
 
 Verify the MCP handshake without Claude:
 
