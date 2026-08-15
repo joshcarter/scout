@@ -1,10 +1,11 @@
 # Spec: `scout dashboard` — a local web view of local-LLM traffic
 
-**Status:** **P1–P4 shipped — the dashboard shows the call, not just
-metadata about it, and a `find` shows its own reasoning.** No open design
-questions remain; §7 records the decisions and §6 the remaining phases.
-Streaming behavior in §5.5 is measured against the configured endpoint,
-not assumed.
+**Status:** **P1–P5 shipped — the dashboard shows the call as it is being
+written, not just metadata about it, and a `find` shows its own
+reasoning.** Every functional phase is done; P6 and P7 are optional. No
+open design questions remain; §7 records the decisions and §6 the
+phases. Streaming behavior in §5.5 is measured against the configured
+endpoint, not assumed.
 
 | Phase | State | What it delivers |
 |---|---|---|
@@ -13,7 +14,7 @@ not assumed.
 | — op grouping fix | ✅ `cee6d14` | recorded `op` replaces P2's idle-gap heuristic |
 | **P3** — live channel | ✅ | unix datagram socket, SSE, prompt/response bodies, in-flight calls |
 | **P4** — `find` refinement events | ✅ | per-round internals: patterns, hits, rerank, reflect |
-| **P5** — token streaming | ⬜ | `call.token` deltas; cleared by measurement (§5.5) |
+| **P5** — token streaming | ✅ | `call.token` deltas, coalesced at 50 ms; `[llm] stream`, default on |
 | **P6** — bodies sidecar | ⬜ optional | retroactive bodies on disk; build only if missed |
 | **P7** — auto-start | ⬜ optional | SessionStart hook calls the idempotent start |
 
@@ -28,9 +29,12 @@ bodies while the daemon is up. A `find` streams its own rounds — the
 patterns it guessed and which were the question's own words, what each
 one matched and which the degenerate guard threw away, the rerank's keeps
 with their scores and `why`, and the reflect verdict — behind a round tab
-strip in the detail pane.
+strip in the detail pane. The reply itself arrives as it is generated:
+the response block fills token by token while the call is still running,
+and the authoritative body replaces it on `call.end`.
 
-**What is missing:** token streaming (P5). P6 and P7 are optional.
+**What is missing:** nothing functional. P6 (bodies on disk) and P7
+(auto-start) remain optional and unbuilt.
 
 **One operational note:** per `CLAUDE.md`, the plugin's binary is a copy
 in `$CLAUDE_PLUGIN_DATA/bin` refreshed on session restart. Until a
@@ -215,7 +219,10 @@ questions.
 **Coalesce `call.token`** on a ~50 ms timer rather than one datagram per
 token. 210 tokens × ~1 µs is still noise against a 3 s call, but the
 browser cannot render faster than a frame anyway, and it keeps the
-daemon's SSE fan-out cheap.
+daemon's SSE fan-out cheap. *(Measured after P5: a real `extract` sent
+187 completion tokens as 62 datagrams — the local 35B is slower than the
+window, so the timer mostly bundles two or three tokens at a time and the
+saving is a third rather than the 5× a faster host would see.)*
 
 ### Two consequences worth naming
 
@@ -574,7 +581,7 @@ URL, and returns immediately.
 
 Idempotent start matters more than it looks: it makes `scout dashboard`
 safe to put in a shell profile or a SessionStart hook, which is what
-turns P5 (§6) from a feature into a one-line config flip.
+turns P7 (§6) from a feature into a one-line config flip.
 
 **Detaching**, on both Linux and macOS: re-exec self with
 `--foreground`, `stdin` from `/dev/null`, `stdout`/`stderr` to the daemon
@@ -735,6 +742,46 @@ Two implementation details the test surfaced:
 - **~1 content delta per token** (86 deltas / 87 completion tokens),
   which confirms §2.5's coalescing: one datagram per delta is 86
   syscalls where a 50 ms timer gives ~40.
+
+### How a delta reaches the channel — a delta sink
+
+Decided when P5 was built; §5.5 as first written said streaming was safe
+without ever saying what the read loop hands the event to, and that gap
+is the only design question the phase actually had.
+
+**A sink, not a threaded `CallRecord`:**
+
+```rust
+pub fn complete(&self, messages: Vec<Value>, max_tokens: Option<u64>)
+    -> Result<(String, Value), LlmError>
+{ self.complete_streaming(messages, max_tokens, &mut |_| {}) }
+
+pub fn complete_streaming(&self, messages: Vec<Value>, max_tokens: Option<u64>,
+                          on_delta: &mut dyn FnMut(&str))
+    -> Result<(String, Value), LlmError> { … }
+```
+
+Four properties, each of which the obvious alternative gives up:
+
+1. **`task.rs` has no `CallRecord` to thread.** `task::handle` calls
+   `complete`; the record lives above it in `main::run_task`. With the
+   sink, `task.rs` needed no edit at all.
+2. **`CallRecord::silent` stays enforced where it already is.** A silent
+   caller installs no sink, and `client.rs` never learns the concept —
+   so a unit test cannot fire tokens into a developer's dashboard by
+   forgetting a flag in a second place.
+3. **The coalescer is testable without a socket.** The 50 ms buffering
+   lives in `live.rs`, driven in tests by a collecting closure;
+   `client.rs` only yields deltas as they arrive.
+4. **`usage` never touches the sink.** It arrives in the final chunk and
+   comes back in the return value; `call.end` remains its only path to
+   the dashboard, so there is no second usage path to keep in agreement
+   with the first.
+
+The sink is **best-effort and must not block** — it runs inside the HTTP
+read loop, where a slow consumer stalls the model call itself. The one
+implementation scout ships is a buffer append plus an occasional
+non-blocking `sendto`.
 
 ### Verdict
 
@@ -908,18 +955,62 @@ never on `/api/history`. A 300-operation page carrying every round's
 pattern and keep list would dwarf the summary rows it exists to deliver,
 and the pane fetches the one operation it is painting anyway.
 
-### ⬜ P5 — token streaming
+### ✅ P5 — token streaming
 
-`client.rs` gains a streaming read loop and `[llm] stream`;
-`call.token` events coalesce on a 50 ms timer. **Cleared by measurement
-already** (§5.5) — no latency cost, no usage loss, `LlmError` taxonomy
-unchanged — so this is implementation, not investigation. Carry the two
-measured gotchas: send `stream_options: {include_usage: true}` or usage
-vanishes entirely, and guard the final chunk's empty `"choices": []`.
+`client.rs`'s streaming read loop and `[llm] stream` (default on);
+`call.token` coalesced on a 50 ms timer; the detail pane's response
+block filling as the reply is written. **Cleared by measurement already**
+(§5.5) — no latency cost, no usage loss, `LlmError` taxonomy unchanged —
+so this was implementation, not investigation, and both measured gotchas
+held: `stream_options: {include_usage: true}` is required, and the final
+chunk's `"choices": []` is real.
 
-Sequenced last of the functional phases because it is the only one
-touching a path every tool depends on, and it needs P3's channel to have
-somewhere to send. ~200 lines.
+Delivered ~730 lines (≈290 Rust impl, ≈375 Rust test, ~63 HTML, 8 config
+comment) against an estimated ~200. The test-to-impl ratio is the
+overrun: the delta sink exists so the coalescer can be driven by a
+closure and the SSE reader by a `Cursor`, and having made both testable
+without a socket it was worth testing both properly.
+
+**Re-verified against LM Studio, `qwen/qwen3.6-35b-a3b`**, since §5.5's
+error claim is what the whole `LlmError` taxonomy rests on: a malformed
+request with `"stream": true` still answers `400 Bad Request` with
+`Content-Type: application/json` and no event stream at all, so ureq's
+`Error::Status` arm fires exactly as before. Same prompt both ways
+returns the same usage (28/20/48 streamed and not), and a real `scout
+extract` streamed 187 completion tokens as **62 datagrams** over 15.1 s —
+the coalescer doing what §2.5 asked, and the concatenated deltas equal
+to `call.end`'s authoritative body byte for byte.
+
+**ollama remains untested.** Nothing here found a reason to doubt it, and
+nothing here confirms it either; if it drops `include_usage` under
+streaming, `stream = false` is the supported answer and `scout stats`
+keeps its numbers.
+
+Where it landed differently from the brief:
+
+- **`[DONE]` is not the only terminator worth honoring.** A stream is
+  complete when it says `data: [DONE]` *or* when a chunk carries a
+  non-null `finish_reason`; LM Studio sends both, in that order, and
+  requiring only the former would make scout's correctness depend on a
+  frame that is conventional rather than specified. EOF with neither is
+  an error — a reply cut off mid-flight reads exactly like a short one to
+  every caller above `client.rs`, which is the failure mode worth being
+  loud about.
+- **The truncation ladder was the wrong place to bound a token event.**
+  §7.6's lesson applied again and gave a different answer: a token
+  payload is one unstructured string, so there is nothing for
+  `fit_event` to shrink *intelligently* — the fix is to bound the
+  producer, flushing the buffer at 8 KiB whatever the timer says, and to
+  leave the ladder as the backstop it is.
+- **The daemon stores no token text.** Fan out to SSE subscribers and
+  forget: a partial reply held in the body cache would outlive a failed
+  call looking like a whole one, and §2.5 already calls the token stream
+  landfill once the call is over. The browser keeps the partial instead,
+  where it is labelled as one.
+- **The pane appends, it does not repaint.** A repaint every 50 ms would
+  fight the reader for scroll position and drop any text selected
+  mid-read, so the first delta installs the response block and every
+  delta after it appends a text node to it.
 
 ### ⬜ P6 — bodies sidecar (optional)
 
@@ -984,8 +1075,9 @@ Resolved by §2.5 — recorded so they aren't re-litigated:
 ### Where the spec was wrong
 
 Recorded because each was found by building, not by reading, and the
-pattern is worth trusting: three of the four came from an implementer
-pushing back on the brief.
+pattern is worth trusting: nearly all of them came from an implementer
+pushing back on the brief, and the one that did not (§7.4) is a hazard
+that review invented and building never found.
 
 1. **Byte accounting had no single capture point** (P1). "Cheap to
    capture where both values are in hand" — no such point exists.
@@ -1010,11 +1102,37 @@ pushing back on the brief.
    trim. Produced array halving and the `truncated` marker. The general
    lesson: a fail-open contract has to be re-checked against each new
    *shape* of payload, not just each new payload.
-7. **"Mostly instrumentation at points that already compute the values"
+7. **"No config branch to reason about" and `[llm] stream` are the same
+   paragraph** (P5, §5.5). The verdict said "stream unconditionally, no
+   config branch", then kept the flag two sentences later because only
+   one host had been measured. Both are right, and the resolution is
+   that the branch is allowed to exist in exactly one place: which
+   *reader* consumes the response. Everything above `client.rs` —
+   callers, the error taxonomy, the log, the `call.end` payload — has no
+   idea which way the wire went, and the return value is the same pair
+   either way. A flag that reaches further than that would have been the
+   thing §5.5 was right to refuse.
+8. **§5.5 cleared streaming without saying how a delta reaches the
+   channel** (P5). It measured latency, usage and error shape — the
+   things that could have killed the phase — and left the only real
+   design question unstated. Produced the delta sink, now written down
+   in §5.5. The pattern is the mirror of §7.4: a spec section can be
+   thorough about the hazards it went looking for and silent about the
+   decision that actually shapes the code.
+9. **A fail-open ladder cannot fix an unbounded producer** (P5). §7.6
+   said to re-check `fit_event` against each new payload *shape*, which
+   was done — and the answer this time was that the ladder is the wrong
+   layer. A coalesced token run is one string with no internal structure
+   to trim, so it is bounded where it is produced, at 8 KiB. Refining
+   §7.6: check each new shape against the ladder, and be willing to
+   conclude the ladder is not where that shape belongs.
+10. **"Mostly instrumentation at points that already compute the values"
    was half right** (P4) — the same shape of claim §7.1 records for P1's
    byte accounting, and wrong the same way. Two of the four values live
    one function away from where the brief pointed. Cheap to fix here;
    worth distrusting the phrasing next time it appears.
 
-**No open design questions remain. P5 (token streaming) is next, and
-§5.5 has already cleared it by measurement.**
+**No open design questions remain, and no functional phase is
+outstanding. What is left (P6, P7) is optional by construction: build the
+bodies sidecar only if retroactive detail turns out to be missed, and
+auto-start only if opening a port unasked stops feeling rude.**

@@ -194,6 +194,114 @@ pub fn is_listening() -> bool {
     matches!(slot.as_ref(), Some(Sock::Ready(_)))
 }
 
+// ── call.token (P5) ─────────────────────────────────────────────────────────
+
+/// Coalescing window for `call.token` (SPEC-dashboard §2.5).
+///
+/// ~1 content delta per token was measured (§5.5); one datagram per delta is
+/// 86 syscalls for a short reply where a 50 ms timer is ~40, and a browser
+/// cannot paint faster than a frame anyway.
+pub const TOKEN_COALESCE_MS: u64 = 50;
+
+/// Flush early once the buffer reaches this, whatever the timer says.
+///
+/// The fail-open ladder in `fit_event` has to be re-checked against every new
+/// *shape* of payload (§7.6) — and a token event's shape is one long string
+/// with no structure to shrink intelligently. Bounding the buffer well under
+/// `MAX_DGRAM` means the elision path is unreachable in practice rather than
+/// merely handled.
+pub const MAX_TOKEN_CHUNK: usize = 8 * 1024;
+
+/// Buffer deltas, emit at most one event per window.
+///
+/// The timer lives here rather than in `client.rs` so it can be driven with a
+/// collecting closure and no socket: the sink `client.rs` sees is just "here
+/// is some text", and everything about batching is testable from a unit test.
+pub struct Coalescer<E: FnMut(&str, u64)> {
+    buf: String,
+    index: u64,
+    last: std::time::Instant,
+    interval: Duration,
+    emit: E,
+}
+
+impl<E: FnMut(&str, u64)> Coalescer<E> {
+    pub fn new(interval: Duration, emit: E) -> Self {
+        Coalescer {
+            buf: String::new(),
+            index: 0,
+            last: std::time::Instant::now(),
+            interval,
+            emit,
+        }
+    }
+
+    /// Append one delta, flushing if the window has closed or the buffer is
+    /// full. Never allocates a datagram per token, never blocks.
+    pub fn push(&mut self, delta: &str) {
+        self.buf.push_str(delta);
+        if self.buf.len() >= MAX_TOKEN_CHUNK || self.last.elapsed() >= self.interval {
+            self.flush();
+        }
+    }
+
+    /// Emit whatever is buffered. A no-op on an empty buffer, so the end of a
+    /// call that landed exactly on a window boundary does not emit an empty
+    /// event.
+    pub fn flush(&mut self) {
+        self.last = std::time::Instant::now();
+        if self.buf.is_empty() {
+            return;
+        }
+        (self.emit)(&self.buf, self.index);
+        self.index += 1;
+        self.buf.clear();
+    }
+}
+
+/// Run `f` with a delta sink that streams `call.token` events for `rec`.
+///
+/// The sink is a no-op — and no coalescer is built at all — for a silent
+/// record or when nobody is listening. `is_listening` is the same cached
+/// lookup `emit_find`'s callers use, so the cost of the whole feature with no
+/// dashboard running is one mutex acquisition per call.
+///
+/// The final partial buffer is flushed when `f` returns, which is why this is
+/// a scope rather than a constructor: a call whose last window is 3 ms long
+/// must still deliver its tail.
+pub fn with_token_stream<T>(rec: &CallRecord, f: impl FnOnce(&mut dyn FnMut(&str)) -> T) -> T {
+    if rec.silent || !is_listening() {
+        return f(&mut |_| {});
+    }
+    let id = rec.id.clone();
+    let op = rec.op.clone();
+    let mut co = Coalescer::new(Duration::from_millis(TOKEN_COALESCE_MS), move |text, index| {
+        emit_token(&id, &op, index, text);
+    });
+    let out = f(&mut |delta| co.push(delta));
+    co.flush();
+    out
+}
+
+/// `call.token` — one coalesced run of text from a reply still in flight.
+///
+/// Deliberately thin: no usage, no outcome, nothing the authoritative
+/// `call.end` also carries. The daemon fans these out and forgets them.
+fn emit_token(id: &str, op: &str, index: u64, text: &str) {
+    let ev = json!({
+        "v": 1,
+        "id": id,
+        "run": stats::run_id(),
+        "op": op,
+        "seq": next_seq(),
+        "kind": "call.token",
+        "ts": now_ts(),
+        "index": index,
+        "text": text,
+    });
+    emit_bytes(&fit_event(ev));
+}
+
 /// `find.*` — one round's internals (SPEC-dashboard §2.5, P4).
 ///
 /// `kind` is the bare suffix (`patterns`, `hits`, `rerank`, `reflect`) and
@@ -243,7 +351,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
     if bytes.len() <= MAX_DGRAM {
         return bytes;
     }
-    for key in ["system", "user", "response"] {
+    for key in ["system", "user", "response", "text"] {
         if let Some(Value::String(s)) = v.get_mut(key) {
             *s = elide(s, 8 * 1024);
         }
@@ -254,7 +362,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
     }
     // Still too big: keep shrinking the longest body field.
     for _ in 0..8 {
-        let longest = ["system", "user", "response"]
+        let longest = ["system", "user", "response", "text"]
             .into_iter()
             .filter_map(|k| v.get(k).and_then(Value::as_str).map(|s| (k, s.len())))
             .max_by_key(|(_, n)| *n);
@@ -293,7 +401,7 @@ fn fit_event(mut v: Value) -> Vec<u8> {
     }
 
     // Last resort: drop the bodies entirely. Metadata still has to land.
-    for key in ["system", "user", "response"] {
+    for key in ["system", "user", "response", "text"] {
         if let Some(obj) = v.as_object_mut() {
             obj.remove(key);
         }
@@ -538,6 +646,15 @@ impl LiveStore {
                         let mut b = inner.bodies.get(&id).cloned().unwrap_or_default();
                         b.response = Some(s.to_string());
                         put_bodies(&mut inner, id, b);
+                    }
+                }
+                // Fan out and forget. A token run is only meaningful in
+                // motion (§2.5): the authoritative body arrives on `call.end`,
+                // and storing partial text here would let a failed call leave
+                // half a reply behind looking like a whole one.
+                "call.token" => {
+                    if v.get("text").and_then(Value::as_str).is_none() {
+                        return false;
                     }
                 }
                 k if k.starts_with("find.") => {
@@ -963,6 +1080,171 @@ mod tests {
         assert!(store.bodies_of(&format!("id-{}", MAX_BODIES + 2)).is_some());
         let (_, n, _, _) = store.snapshot();
         assert_eq!(n, MAX_BODIES);
+    }
+
+    // ── call.token (P5) ──────────────────────────────────────────────────
+    // The coalescer is driven with a collecting closure: no socket, no
+    // daemon, and the timer is a constructor argument so a test can make a
+    // window close without sleeping for the real 50 ms.
+
+    /// Every `(text, index)` a coalescer emitted, in order.
+    type Emitted = Arc<Mutex<Vec<(String, u64)>>>;
+
+    fn collect(interval: Duration) -> (Coalescer<impl FnMut(&str, u64)>, Emitted) {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&out);
+        let co = Coalescer::new(interval, move |text: &str, index: u64| {
+            sink.lock().unwrap().push((text.to_string(), index));
+        });
+        (co, out)
+    }
+
+    #[test]
+    fn the_coalescer_batches_a_window_into_one_event() {
+        let (mut co, out) = collect(Duration::from_millis(50));
+        for d in ["Hel", "lo, ", "wor", "ld"] {
+            co.push(d);
+        }
+        assert!(out.lock().unwrap().is_empty(), "four deltas are not four events");
+        std::thread::sleep(Duration::from_millis(60));
+        co.push("!");
+        let got = out.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "one closed window, one event: {got:?}");
+        assert_eq!(got[0].0, "Hello, world!", "the whole window, in order");
+        assert_eq!(got[0].1, 0, "events are indexed from zero");
+    }
+
+    #[test]
+    fn a_partial_buffer_is_flushed_at_the_end_of_the_call() {
+        let (mut co, out) = collect(Duration::from_millis(50));
+        co.push("tail");
+        assert!(out.lock().unwrap().is_empty());
+        co.flush();
+        assert_eq!(out.lock().unwrap().clone(), [("tail".to_string(), 0)]);
+        // A second flush on an empty buffer must not emit an empty event: a
+        // call that ended exactly on a window boundary is the common case.
+        co.flush();
+        assert_eq!(out.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_run_of_deltas_larger_than_the_chunk_cap_flushes_early() {
+        // The timer alone cannot bound the payload — a fast host can produce
+        // more text in one window than a datagram can carry.
+        let (mut co, out) = collect(Duration::from_secs(3600));
+        let block = "x".repeat(1024);
+        for _ in 0..12 {
+            co.push(&block);
+        }
+        let got = out.lock().unwrap().clone();
+        assert!(!got.is_empty(), "the size cap never fired");
+        for (text, _) in &got {
+            assert!(text.len() < MAX_DGRAM, "a chunk would not fit a datagram");
+        }
+        assert!(got.iter().map(|(t, _)| t.len()).sum::<usize>() >= 8 * 1024);
+        assert_eq!(got[0].1, 0);
+        assert!(got.iter().enumerate().all(|(i, (_, n))| *n == i as u64), "{got:?}");
+    }
+
+    #[test]
+    fn a_silent_record_streams_no_tokens() {
+        // `CallRecord::silent` is enforced here, where it already was —
+        // `client.rs` never learns the concept, it just gets no sink.
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        with_sock_env(&path, || {
+            let mut r = rec("grep");
+            r.silent = true;
+            with_token_stream(&r, |sink| {
+                for _ in 0..200 {
+                    sink("token ");
+                }
+            });
+            let mut buf = vec![0u8; MAX_DGRAM];
+            match listener.recv(&mut buf) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Ok(n) => panic!("a silent record sent {n} bytes"),
+                Err(e) => panic!("unexpected recv error: {e}"),
+            }
+        });
+    }
+
+    #[test]
+    fn a_streamed_call_lands_as_call_token_events() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        let _ = listener.set_read_timeout(Some(Duration::from_secs(2)));
+        with_sock_env(&path, || {
+            let r = rec("check_output");
+            with_token_stream(&r, |sink| {
+                sink("Hello, ");
+                sink("world");
+            });
+            let mut buf = vec![0u8; MAX_DGRAM];
+            let n = listener.recv(&mut buf).expect("datagram");
+            let v: Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(v["kind"], "call.token");
+            assert_eq!(v["id"], r.id, "the row id, so the pane knows where to append");
+            assert_eq!(v["op"], r.op);
+            assert_eq!(v["text"], "Hello, world");
+            assert_eq!(v["index"], 0);
+            // Usage has exactly one path to the dashboard, and it is not this
+            // one (§5.5): `call.end` carries it, as it always did.
+            assert!(v.get("usage").is_none(), "usage must not ride the token stream");
+        });
+    }
+
+    #[test]
+    fn streaming_costs_nothing_when_nobody_is_listening() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-such.sock");
+        with_sock_env(&path, || {
+            let r = rec("grep");
+            let start = std::time::Instant::now();
+            with_token_stream(&r, |sink| {
+                for _ in 0..10_000 {
+                    sink("tok");
+                }
+            });
+            assert!(start.elapsed() < Duration::from_secs(1), "the sink cost real time");
+            match sender_slot().as_ref() {
+                Some(Sock::Missing) => {}
+                other => panic!("expected cached Missing, got {other:?}"),
+            }
+            assert!(!path.exists());
+        });
+    }
+
+    #[test]
+    fn a_token_event_fans_out_without_becoming_a_row_or_a_body() {
+        let store = LiveStore::new();
+        let rx = store.subscribe();
+        let ev = json!({
+            "v": 1, "id": "r-1", "run": "r", "op": "op-a", "seq": 1,
+            "kind": "call.token", "ts": 1.0, "index": 0, "text": "par",
+        });
+        assert!(store.apply_json(&ev.to_string()));
+        let got: Value = serde_json::from_str(&rx.try_recv().expect("fanned out")).unwrap();
+        assert_eq!(got["text"], "par");
+        // Nothing is kept: the authoritative body arrives on `call.end`, and a
+        // stored partial would outlive a failed call looking whole (§2.5).
+        assert!(store.inflight_rows().is_empty());
+        assert!(store.bodies_of("r-1").is_none());
+        let (_, bodies, _, _) = store.snapshot();
+        assert_eq!(bodies, 0);
+    }
+
+    #[test]
+    fn a_token_event_without_text_is_rejected() {
+        let store = LiveStore::new();
+        let ev = json!({"v":1,"id":"r-1","run":"r","op":"op-a","kind":"call.token","ts":1.0});
+        assert!(!store.apply_json(&ev.to_string()));
     }
 
     // ── find.* (P4) ──────────────────────────────────────────────────────

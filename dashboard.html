@@ -171,6 +171,13 @@
     padding: 6px 8px; font-size: 11.5px; max-height: 320px; overflow: auto;
   }
   pre.body.placeholder { color: var(--dim); font-style: italic; }
+  /* A reply still arriving (P5). The caret is the only motion on the page,
+     which is the point: it says "the model is producing" where the row's
+     spinner only says "something is happening". */
+  pre.body.streaming::after {
+    content: '▋'; color: var(--green); animation: blink 1.1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { visibility: hidden; } }
   /* find's per-round internals (P4). Same slab as pre.body so the round reads
      as one more block of the detail pane rather than a second design. */
   .fr {
@@ -295,6 +302,11 @@
   const ops = [];                 // oldest → newest
   const byId = new Map();         // op id → op
   const bodiesByRowId = new Map(); // row id → {system, user, response}
+  // Text streamed for a call still in flight (P5). Superseded by the
+  // authoritative body on `call.end`; kept only when the call ends without
+  // one, where a partial reply is the most informative thing there is.
+  const streamedByRowId = new Map(); // row id → accumulated text
+  const MAX_STREAMED = 200;
   let cursor = '';                // opaque server cursor (a row id)
   let pinnedId = null;            // null ⇒ Live
   let missedWhilePinned = 0;
@@ -618,8 +630,11 @@
             'Bodies travel the live channel (SPEC-dashboard \u00a72.5) and are not written to the log.',
         true);
     }
+    const streamed = streamedByRowId.get(r.id);
     if (bodies.response != null && bodies.response !== '') {
       html += block('model response', bodies.response, false);
+    } else if (streamed) {
+      html += streamBlock(r.id, streamed, r.kind === 'running');
     } else if (r.kind === 'running') {
       html += block('model response', 'waiting for the model\u2026', true);
     } else {
@@ -781,6 +796,20 @@
       '<button class="copy" data-copy="' + idx + '">copy</button></div>' +
       '<pre class="body' + (placeholder ? ' placeholder' : '') + '">' + esc(text) + '</pre></div>';
   }
+  /** The response block for a reply that arrived over `call.token` (P5).
+   *
+   *  Carries the row id and its copy-buffer slot on the node so a delta can
+   *  be appended in place: a repaint every 50 ms would fight the reader for
+   *  the scroll position and drop any text they had selected mid-read. */
+  function streamBlock(rowId, text, running) {
+    const idx = copyBlocks.push(text) - 1;
+    return '<div class="block"><div class="block-head">' +
+      '<span>model response <span class="muted">' +
+      (running ? 'streaming' : 'partial — the call did not finish') + '</span></span>' +
+      '<button class="copy" data-copy="' + idx + '">copy</button></div>' +
+      '<pre class="body' + (running ? ' streaming' : '') + '" id="live-stream" ' +
+      'data-row="' + esc(rowId) + '" data-copy-idx="' + idx + '">' + esc(text) + '</pre></div>';
+  }
   $('detail').addEventListener('click', e => {
     const fr = e.target.closest('[data-fround]');
     if (fr) {
@@ -909,8 +938,36 @@
     for (const o of ops) { if (o.op === opId) return o; }
     return null;
   }
+  /** A coalesced run of text from a reply still in flight (P5).
+   *
+   *  Appends to the pane's response block directly when that block is the one
+   *  on screen, and accumulates regardless — a call whose tokens arrived while
+   *  another row was pinned still shows its text when you click back to it. */
+  function applyTokenDelta(ev) {
+    if (typeof ev.text !== 'string' || !ev.text) return;
+    const prev = streamedByRowId.get(ev.id) || '';
+    streamedByRowId.set(ev.id, prev + ev.text);
+    if (streamedByRowId.size > MAX_STREAMED) {
+      streamedByRowId.delete(streamedByRowId.keys().next().value);
+    }
+    const el = $('live-stream');
+    if (el && el.getAttribute('data-row') === ev.id) {
+      el.appendChild(document.createTextNode(ev.text));
+      const idx = parseInt(el.getAttribute('data-copy-idx'), 10);
+      if (idx >= 0) copyBlocks[idx] = streamedByRowId.get(ev.id);
+      return;
+    }
+    // No block to append to yet: the pane painted "waiting for the model"
+    // before the first delta landed. One repaint installs it, and every
+    // delta after this one takes the cheap path above.
+    const cur = currentOp();
+    if (!cur) return;
+    const r = cur.rows[Math.min(renderedRound, cur.rows.length - 1)];
+    if (r && r.id === ev.id && r.kind === 'running') paintDetail(cur);
+  }
   function applyLiveEvent(ev) {
     if (!ev || !ev.id || !ev.kind) return;
+    if (ev.kind === 'call.token') { applyTokenDelta(ev); return; }
     if (ev.kind.indexOf('find.') === 0) {
       const opId = ingestFindEvent(ev);
       // Repaint in place rather than clearing `renderedDetailId`: a round the
@@ -920,6 +977,12 @@
       return;
     }
     ingestBodies(ev);
+    // The authoritative body supersedes whatever was streamed. Dropped only
+    // when there is one: a call that failed mid-reply keeps its partial text,
+    // which is the only record of how far it got.
+    if (ev.kind === 'call.end' && typeof ev.response === 'string' && ev.response !== '') {
+      streamedByRowId.delete(ev.id);
+    }
     if (ev.kind === 'call.start') {
       upsertLiveRow(ev);
     } else if (ev.kind === 'call.end') {

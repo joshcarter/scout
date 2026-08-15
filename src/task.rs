@@ -50,6 +50,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             api_key: None,
             max_tokens: None,
+            stream: true,
         })
     }
 

@@ -191,7 +191,11 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
 
     crate::live::emit_start(&rec, &system, &user);
     let start = std::time::Instant::now();
-    let (text, usage) = match client.complete(messages, None) {
+    // Streams `call.token` to the dashboard while the reply arrives (P5); a
+    // no-op sink when nothing is listening.
+    let result =
+        crate::live::with_token_stream(&rec, |sink| client.complete_streaming(messages, None, sink));
+    let (text, usage) = match result {
         Ok(r) => r,
         Err(e) => {
             rec = rec

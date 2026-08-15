@@ -22,6 +22,14 @@ model = "qwen3:27b"
 # argument overrides this.
 # max_tokens = 2048
 
+# Read the reply as it is generated instead of in one piece. Purely
+# observability: the text and the token counts are identical either way,
+# and the only visible difference is that `scout dashboard` fills the
+# response pane live instead of at the end. Measured at no latency cost
+# against LM Studio; turn it off if your host drops the token counts
+# under streaming (ollama is untested here) — `scout stats` reads them.
+# stream = true
+
 # Filter tunables. Both tables are parsed leniently: an absent or
 # unusable value silently keeps the default rather than erroring, unlike
 # [llm] above.

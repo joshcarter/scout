@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::io::BufRead;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -8,6 +9,13 @@ pub struct Config {
     pub timeout: Duration,
     pub api_key: Option<String>,
     pub max_tokens: Option<u64>,
+    /// Ask the endpoint for `text/event-stream` and read the reply delta by
+    /// delta (SPEC-dashboard §5.5, P5). Observability only — the accumulated
+    /// text and the `usage` object are the same either way, and a `false`
+    /// here is a fully supported path, not a vestige: §5.5 was measured on
+    /// LM Studio, and any host that drops `include_usage` under streaming
+    /// gets its numbers back by turning this off.
+    pub stream: bool,
 }
 
 #[derive(Debug)]
@@ -115,20 +123,53 @@ impl LlmClient {
         (reachable, start.elapsed().as_millis() as u64)
     }
 
-    /// POST /chat/completions (non-streaming). Returns (content, usage_object).
+    /// POST /chat/completions. Returns (content, usage_object).
     ///
     /// `max_tokens` overrides the configured default for this call only.
+    ///
+    /// The plain form for every caller that has nothing to watch the reply
+    /// with: it delegates with a sink that discards. Whether the wire is
+    /// streamed is `[llm] stream`'s business, not the caller's — the return
+    /// value is identical either way (§5.5).
     pub fn complete(
         &self,
         messages: Vec<Value>,
         max_tokens: Option<u64>,
     ) -> Result<(String, Value), LlmError> {
+        self.complete_streaming(messages, max_tokens, &mut |_| {})
+    }
+
+    /// `complete`, plus a sink that sees each content delta as it lands.
+    ///
+    /// Two contract points, both load-bearing:
+    ///
+    /// * **`on_delta` is best-effort and must not block.** It runs inside the
+    ///   HTTP read loop, so a slow sink stalls the model call itself. The one
+    ///   implementation scout ships (`live::with_token_stream`) is a buffer
+    ///   append and an occasional non-blocking `sendto`.
+    /// * **`usage` never reaches the sink.** It arrives in the final chunk and
+    ///   comes back in the return value exactly as it always has; `call.end`
+    ///   remains its only path to the dashboard.
+    ///
+    /// A caller that must stay silent (`CallRecord::silent`) simply installs no
+    /// sink — this file has never heard of the concept.
+    pub fn complete_streaming(
+        &self,
+        messages: Vec<Value>,
+        max_tokens: Option<u64>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(String, Value), LlmError> {
         let url = format!("{}/chat/completions", self.config.endpoint);
         let mut body = json!({
             "model": self.config.model,
             "messages": messages,
-            "stream": false,
+            "stream": self.config.stream,
         });
+        if self.config.stream {
+            // Measured (§5.5): omit this and `usage` is absent from the
+            // stream entirely. It is not a nicety.
+            body["stream_options"] = json!({"include_usage": true});
+        }
         if let Some(mt) = max_tokens.or(self.config.max_tokens) {
             body["max_tokens"] = json!(mt);
         }
@@ -183,20 +224,115 @@ impl LlmClient {
             }
         })?;
 
-        let resp_str = resp
-            .into_string()
-            .map_err(|e| LlmError::RequestFailed(format!("read response body: {e}")))?;
-        let data: Value = serde_json::from_str(&resp_str)
-            .map_err(|e| LlmError::RequestFailed(format!("parse LLM response: {e}")))?;
-
-        let content = data["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| LlmError::RequestFailed("no content field in LLM response".into()))?
-            .to_string();
-
-        let usage = data.get("usage").cloned().unwrap_or(Value::Null);
-        Ok((content, usage))
+        // The response has arrived, which per §5.5 is where the two paths
+        // diverge and nowhere else: an HTTP error is a normal 4xx with a JSON
+        // body delivered *before* any stream begins, so the whole taxonomy
+        // above fires identically whether or not `stream` is set.
+        if self.config.stream {
+            read_stream(std::io::BufReader::new(resp.into_reader()), on_delta)
+        } else {
+            let resp_str = resp
+                .into_string()
+                .map_err(|e| LlmError::RequestFailed(format!("read response body: {e}")))?;
+            parse_completion(&resp_str)
+        }
     }
+}
+
+/// Pull `(content, usage)` out of one whole non-streamed response body.
+pub(crate) fn parse_completion(resp_str: &str) -> Result<(String, Value), LlmError> {
+    let data: Value = serde_json::from_str(resp_str)
+        .map_err(|e| LlmError::RequestFailed(format!("parse LLM response: {e}")))?;
+
+    let content = data["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| LlmError::RequestFailed("no content field in LLM response".into()))?
+        .to_string();
+
+    let usage = data.get("usage").cloned().unwrap_or(Value::Null);
+    Ok((content, usage))
+}
+
+/// Read an OpenAI-style `text/event-stream` reply to its end.
+///
+/// Returns the same `(content, usage)` the non-streamed path returns: the
+/// deltas are accumulated on the way past and handed to `on_delta` as they
+/// land, but nothing about the result depends on anyone listening.
+///
+/// Three details the measurement in §5.5 surfaced, all of them here:
+///
+/// * **The final chunk carries `"choices": []`** — an empty array, alongside
+///   the usage object. `chunk["choices"][0]["delta"]` on every chunk breaks on
+///   exactly that one, so usage is read first and deltas are read defensively.
+/// * **A stream that stops early must fail, not truncate quietly.** A reply cut
+///   off mid-flight looks like a short answer to every caller above, and a
+///   short answer from a summariser is indistinguishable from a real one. EOF
+///   without either `[DONE]` or a `finish_reason` is an error.
+/// * **Anything that is not a `data:` line is ignored** — SSE comment
+///   keep-alives (`: ping`) and `event:` lines are legal and carry nothing.
+pub(crate) fn read_stream<R: BufRead>(
+    mut reader: R,
+    on_delta: &mut dyn FnMut(&str),
+) -> Result<(String, Value), LlmError> {
+    let mut text = String::new();
+    let mut usage = Value::Null;
+    let mut finished = false;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(|e| {
+            if is_timeout_io_error(&e) {
+                LlmError::Timeout
+            } else {
+                // Same classification the pre-stream Io arm uses: the endpoint
+                // answered and then went away, which from the caller's chair is
+                // the same problem as never answering.
+                LlmError::RequestFailed(format!("network I/O error: {e}"))
+            }
+        })?;
+        if n == 0 {
+            break;
+        }
+        let Some(payload) = line.trim_end().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if payload == "[DONE]" {
+            finished = true;
+            break;
+        }
+        let chunk: Value = serde_json::from_str(payload)
+            .map_err(|e| LlmError::RequestFailed(format!("parse LLM stream chunk: {e}")))?;
+
+        // Usage first: the chunk that carries it has no choices at all.
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                usage = u.clone();
+            }
+        }
+        let Some(choice) = chunk["choices"].get(0) else {
+            continue;
+        };
+        if let Some(delta) = choice["delta"]["content"].as_str() {
+            if !delta.is_empty() {
+                text.push_str(delta);
+                on_delta(delta);
+            }
+        }
+        if choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
+            // A host that closes without `[DONE]` (the frame is conventional,
+            // not universal) still said the completion was complete.
+            finished = true;
+        }
+    }
+
+    if !finished {
+        return Err(LlmError::RequestFailed(
+            "LLM stream ended mid-reply — no [DONE] frame and no finish_reason".into(),
+        ));
+    }
+    Ok((text, usage))
 }
 
 #[cfg(test)]
@@ -210,6 +346,7 @@ mod tests {
             timeout: Duration::from_secs(2),
             api_key: None,
             max_tokens: None,
+            stream: true,
         })
     }
 
@@ -232,6 +369,137 @@ mod tests {
 
 
 
+
+    // ── Streaming read loop (P5) ─────────────────────────────────────────
+    // The reader is split out from the HTTP call precisely so these run
+    // against a `Cursor` instead of a socket. Every chunk shape below was
+    // taken from the §5.5 measurement against LM Studio.
+
+    fn delta(content: &str) -> String {
+        format!(
+            "data: {}\n\n",
+            json!({"choices": [{"index": 0, "delta": {"content": content}}]})
+        )
+    }
+
+    fn read(sse: &str) -> Result<(String, Value, Vec<String>), LlmError> {
+        let mut seen = Vec::new();
+        let (text, usage) = {
+            let mut sink = |d: &str| seen.push(d.to_string());
+            read_stream(std::io::Cursor::new(sse.as_bytes()), &mut sink)?
+        };
+        Ok((text, usage, seen))
+    }
+
+    #[test]
+    fn deltas_accumulate_in_order_and_reach_the_sink() {
+        let sse = format!(
+            "{}{}{}data: [DONE]\n\n",
+            delta("Hel"),
+            delta("lo, "),
+            delta("world")
+        );
+        let (text, usage, seen) = read(&sse).unwrap();
+        assert_eq!(text, "Hello, world");
+        assert_eq!(seen, ["Hel", "lo, ", "world"]);
+        assert!(usage.is_null(), "no usage chunk was sent: {usage}");
+    }
+
+    #[test]
+    fn the_final_usage_chunk_has_empty_choices_and_still_parses() {
+        // The measured gotcha (§5.5): `"choices": []`, not a populated array.
+        // `chunk["choices"][0]["delta"]` on this one is what breaks a naive
+        // reader, and it is the chunk carrying the only numbers scout wants.
+        let sse = format!(
+            "{}data: {}\n\ndata: [DONE]\n\n",
+            delta("hi"),
+            json!({"choices": [], "usage": {"prompt_tokens": 15, "completion_tokens": 3, "total_tokens": 18}})
+        );
+        let (text, usage, seen) = read(&sse).unwrap();
+        assert_eq!(text, "hi");
+        assert_eq!(seen, ["hi"], "the usage chunk is not a delta");
+        assert_eq!(usage["prompt_tokens"], 15);
+        assert_eq!(usage["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn streamed_and_whole_replies_produce_the_same_pair() {
+        // The `stream = false` escape hatch has to be a supported path, not a
+        // vestige: the same completion delivered either way must be
+        // indistinguishable to every caller above `client.rs`.
+        let whole = json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hello, world"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 3, "total_tokens": 18},
+        })
+        .to_string();
+        let sse = format!(
+            "{}{}data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            delta("Hello, "),
+            delta("world"),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {"prompt_tokens": 15, "completion_tokens": 3, "total_tokens": 18}})
+        );
+        let (a_text, a_usage) = parse_completion(&whole).unwrap();
+        let (b_text, b_usage, _) = read(&sse).unwrap();
+        assert_eq!(a_text, b_text);
+        assert_eq!(a_usage["prompt_tokens"], b_usage["prompt_tokens"]);
+        assert_eq!(a_usage["completion_tokens"], b_usage["completion_tokens"]);
+    }
+
+    #[test]
+    fn a_truncated_stream_is_an_error_not_a_short_answer() {
+        // The failure this guards is silent: half a summary reads exactly like
+        // a whole one to `check_output`, `grep` and `extract` alike.
+        let sse = format!("{}{}", delta("The answer i"), "data: {\"choi");
+        let err = read(&sse).unwrap_err();
+        match &err {
+            LlmError::RequestFailed(m) => assert!(m.contains("parse LLM stream chunk"), "{m}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+
+        // Clean EOF, no `[DONE]`, no finish_reason: nothing malformed, and
+        // still not a complete reply.
+        let err = read(&delta("The answer i")).unwrap_err();
+        match &err {
+            LlmError::RequestFailed(m) => assert!(m.contains("mid-reply"), "{m}"),
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+        assert_eq!(err.outcome(), crate::stats::Outcome::ParseFailure);
+    }
+
+    #[test]
+    fn a_finish_reason_closes_a_stream_that_never_says_done() {
+        let sse = format!(
+            "{}data: {}\n\n",
+            delta("hi"),
+            json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+        );
+        let (text, _, _) = read(&sse).unwrap();
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn comments_blank_lines_and_empty_deltas_are_ignored() {
+        let sse = format!(
+            ": ping\n\nevent: message\n{}data: {}\n\n{}data: [DONE]\n\n",
+            delta("a"),
+            json!({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
+            delta("")
+        );
+        let (text, _, seen) = read(&sse).unwrap();
+        assert_eq!(text, "a");
+        assert_eq!(seen, ["a"], "an empty delta is not worth an event");
+    }
+
+    #[test]
+    fn a_stream_with_no_content_at_all_is_an_empty_string_not_an_error() {
+        // `run_cmd` and `task` both turn this into `EmptyResponse` themselves;
+        // the reader's job is only to report what arrived.
+        let (text, usage, seen) = read("data: [DONE]\n\n").unwrap();
+        assert!(text.is_empty());
+        assert!(usage.is_null());
+        assert!(seen.is_empty());
+    }
 
     // ── Display rendering ────────────────────────────────────────────────
     // Every failure the filters report to the caller goes through this.
@@ -344,6 +612,7 @@ mod tests {
             timeout: Duration::from_secs(120),
             api_key: None,
             max_tokens: Some(64),
+            stream: true,
         });
 
         let (reachable, ms) = client.check_endpoint();
@@ -357,5 +626,55 @@ mod tests {
         assert!(usage.is_object(), "usage should be an object, got: {usage}");
         assert!(usage["prompt_tokens"].is_number(), "missing prompt_tokens");
         assert!(usage["completion_tokens"].is_number(), "missing completion_tokens");
+    }
+
+    /// The §5.5 measurement, as a test: same prompt both ways, same text and
+    /// the same token counts, with the deltas actually arriving one by one.
+    ///
+    /// Run with:
+    ///   LM_HOST=http://localhost:1234/v1 LM_MODEL=<loaded model> \
+    ///     cargo test -- --ignored stream_matches_non_stream
+    #[test]
+    #[ignore]
+    fn live_stream_matches_non_stream() {
+        let endpoint =
+            std::env::var("LM_HOST").unwrap_or_else(|_| "http://localhost:1234/v1".into());
+        let model = std::env::var("LM_MODEL").unwrap_or_else(|_| "qwen/qwen3.6-35b-a3b".into());
+        let cfg = |stream: bool| Config {
+            endpoint: endpoint.clone(),
+            model: model.clone(),
+            timeout: Duration::from_secs(120),
+            api_key: None,
+            max_tokens: Some(64),
+            stream,
+        };
+        let prompt = vec![json!({
+            "role": "user",
+            "content": "Count from one to ten in words, separated by commas. /no_think",
+        })];
+
+        let (plain, plain_usage) = LlmClient::new(cfg(false))
+            .complete(prompt.clone(), None)
+            .expect("non-streaming call");
+
+        let mut deltas: Vec<String> = Vec::new();
+        let (streamed, streamed_usage) = {
+            let mut sink = |d: &str| deltas.push(d.to_string());
+            LlmClient::new(cfg(true))
+                .complete_streaming(prompt, None, &mut sink)
+                .expect("streaming call")
+        };
+
+        assert!(deltas.len() > 1, "no deltas observed: {deltas:?}");
+        assert_eq!(deltas.concat(), streamed, "the sink saw a different reply");
+        assert!(streamed_usage.is_object(), "usage vanished: {streamed_usage}");
+        assert_eq!(
+            plain_usage["prompt_tokens"], streamed_usage["prompt_tokens"],
+            "prompt tokens differ: {plain_usage} vs {streamed_usage}"
+        );
+        // Completion length is the model's choice, not the transport's, so
+        // this compares the shape rather than the count.
+        assert!(streamed_usage["completion_tokens"].as_u64().unwrap_or(0) > 0);
+        assert!(!plain.is_empty() && !streamed.is_empty());
     }
 }

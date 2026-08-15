@@ -110,3 +110,18 @@ it. Options, roughly in order of appeal:
 
 Whichever way it goes, the fix should also make the empty-`bin/` case *loud*:
 a hook that cannot find its binary should say so once, not disappear.
+
+# `call.end` blanks a live row's preset until the next log poll
+
+Found while verifying P5's detail pane. `dashboard.html`'s
+`liveRowFromEvent` fills `preset`/`tool`/`via`/`input` from the event, and
+`emit_end` (`src/live.rs`) carries none of them — so the `Object.assign(row,
+fresh)` on `call.end` overwrites the values `call.start` supplied with empty
+strings. The visible effect is small and short-lived: the detail pane's
+`preset` row and the call tab strip's label go blank for the second or two
+until `/api/history` replaces the operation from the log. Pre-dates P5.
+
+Two ways to fix, and the second is probably right: have `call.end` carry the
+identifying fields too (more bytes on every event, for data that cannot have
+changed), or have the merge treat an absent field as "unchanged" rather than
+as "empty" — which is what the rest of the reconciliation already does.

@@ -142,12 +142,21 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
         .and_then(|v| v.as_integer())
         .map(|v| v.max(0) as u64);
 
+    // Defaults on, and an unusable value keeps the default rather than
+    // erroring — this is a diagnostic knob, not a load-bearing one, and no
+    // caller's result changes with it (SPEC-dashboard §5.5).
+    let stream = section
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     Ok(Config {
         endpoint,
         model,
         timeout: Duration::from_secs(timeout_seconds),
         api_key,
         max_tokens,
+        stream,
     })
 }
 
@@ -199,6 +208,30 @@ mod tests {
         assert_eq!(cfg.timeout, Duration::from_secs(60));
         assert_eq!(cfg.api_key.as_deref(), Some("secret"));
         assert_eq!(cfg.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn load_config_streams_by_default_and_honors_the_escape_hatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n";
+        assert!(load_config(&write_config(&dir, base)).unwrap().stream);
+        assert!(
+            !load_config(&write_config(&dir, &format!("{base}stream = false\n")))
+                .unwrap()
+                .stream
+        );
+        // Parsed leniently, like every other tunable: a diagnostic knob must
+        // never be the reason scout refuses to run.
+        assert!(
+            load_config(&write_config(&dir, &format!("{base}stream = \"yes\"\n")))
+                .unwrap()
+                .stream
+        );
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_stream() {
+        assert!(DEFAULT_CONFIG.contains("# stream = true"), "config.example.toml is the only place a user learns the knob exists");
     }
 
     #[test]

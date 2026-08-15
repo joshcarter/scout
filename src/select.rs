@@ -486,7 +486,12 @@ pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String,
     let rec = ctx.record(preset_name, args);
     crate::live::emit_start(&rec, &system, &user);
     let start = std::time::Instant::now();
-    match client.complete(messages, None) {
+    // The sink streams `call.token` while the reply is still arriving (P5).
+    // It is a no-op for a silent record and when no dashboard is listening, so
+    // `complete_streaming` here is the same call `complete` was.
+    let result =
+        crate::live::with_token_stream(&rec, |sink| client.complete_streaming(messages, None, sink));
+    match result {
         Ok((text, usage)) => {
             let ms = start.elapsed().as_millis() as u64;
             let rec = rec.usage(&usage).ms(ms);
