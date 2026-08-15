@@ -84,6 +84,19 @@ it a full week — the log has multi-day gaps, and daily volume swings with what
 is being worked on (421 allows over one 8-day window, but 232 of them on a
 single day).
 
+The substitution fast-path has since been deleted, which makes this experiment
+*better*, not stale: every command carrying a `$()` now reaches step 3 instead
+of some of them being auto-approved before the model saw them. The shadow count
+therefore measures the hook's whole contribution rather than a subset. It also
+means a fresh run is not comparable to counts taken before that deletion — the
+old numbers understate step 3's traffic.
+
+Worth knowing before reading a result: the fast path fired 34 times ever, all
+of them payloads written while testing it. On the day it shipped, 589 hook
+invocations and 274 commands with expansions produced zero fast-path hits. If
+the shadow experiment shows a similarly small number, that is the hook's real
+value and not a measurement artifact.
+
 If it goes: delete `hooks/shell-safety.sh`, its `hooks.json` block,
 `tests/test-shell-safety.sh`, and the auto-allow paragraph in
 `scripts/session-context.sh`. Then `presets/shell_safety.toml` has no caller —
@@ -227,3 +240,92 @@ should go either way.
 
 Small related gap: `[dashboard]` is parsed by `filter_config.rs` but appears
 nowhere in `config.example.toml`.
+
+# Subprocess capture is implemented twice
+
+`verify::capture_with_deadlines` and `presets::providers::run_bounded` are the
+same ~80 lines: bounded buffer, a reader thread per pipe, a poll loop on
+`try_wait()` against a wall-clock and an idle deadline, kill on expiry.
+
+The second one exists for a real reason, not laziness. `capture_with_deadlines`
+takes a command *string* and runs it through `sh -c`, while `git()` needs argv:
+`base` arrives from `${args.*}`, and a user preset under `$XDG_CONFIG_HOME` can
+shadow an MCP-exposed preset and wire a git provider to a model-controlled
+argument. Reusing the string form would have meant interpolating that value
+into a shell line, trading a hang for a command injection.
+
+The fix is an argv-taking sibling in `verify.rs` that both delegate to —
+`capture_argv(program, args, …)` with the existing `sh -c` entry point becoming
+a thin wrapper. Then `run_bounded` disappears. Note the two are not quite
+identical today: `capture_with_deadlines` puts the child in its own process
+group via `setsid` and kills the group, because `sh -c` may never exec its
+argument; `run_bounded` does not, so a helper `git` forks (a credential helper,
+a smudge filter) can outlive a timeout. The unified version should keep the
+process-group behaviour for both.
+
+This duplication is an artifact of how the work was split across agents, not a
+considered decision — `verify.rs` was read-only for the one that needed it.
+
+# `resolve_project` is written three times
+
+`cli.rs`, `run_cmd.rs` and `mcp_server.rs` each have their own copy of "resolve
+the project root, defaulting to `$PWD`". They agree today. Nothing makes them
+keep agreeing, and the project root decides where `extract`/`grep`/`find`
+resolve relative paths, so a divergence would be quiet and confusing rather
+than loud.
+
+Now that `src/lib.rs` exists there is an obvious home for one copy.
+
+# `handle_stream` can park a thread on a client that stops reading
+
+`dashboard.rs`'s SSE handler writes with a blocking `write_all`. A browser tab
+that stops reading — suspended, throttled, a laptop lid — leaves the handler
+blocked in the kernel until the socket buffer drains, holding one of
+`MAX_STREAMS = 8` slots.
+
+This is the last way to hold a stream slot for a long time; the `Full` vs
+`Disconnected` fix removed the other one. Lower stakes than that was: a
+genuinely dead client eventually errors and releases, so this is a stall rather
+than a permanent leak. A write timeout on the socket, or a bounded write with
+the same deadline shape the header phase now uses, would close it.
+
+# `prefer-local-llm.sh` has no `jq` guard
+
+`suggest-scout.sh` checks `command -v jq` and exits cleanly when it is missing.
+`prefer-local-llm.sh` does not: without `jq` it parses the payload as empty,
+logs `matched:false`, and exits 0. Fail-open, so nothing breaks — but the hook
+becomes a silent no-op on a machine without `jq`, which is the same
+disappear-without-a-word failure mode as the `CLAUDE_PLUGIN_ROOT` bug. It
+should say so once rather than vanish.
+
+Worth doing at the same time: the hooks depend on `jq`, `sed`, `awk` and
+`python3` (the last only for `[shell_safety] deny`), and nothing declares that
+anywhere a user would read.
+
+# The hook audit logs are still created at the umask
+
+`~/.claude/scout-intercepts.jsonl` and `~/.claude/scout-shell-safety.jsonl` are
+written by the bash hooks, so the `0600`/`0700` work on the Rust side did not
+reach them. They carry every Bash command the agent ran, with its cwd. Same
+reasoning as `calls.jsonl`: low stakes on a single-user box, cheap to fix, and
+the kind of thing that reads badly in a public repo.
+
+Neither log rotates, either, while `calls.jsonl` rotates at 8 MB. They get a
+row per Bash tool call, so they grow faster than the file that has a cap.
+
+# A preset override can still declare a *wrong* schema
+
+`inherit_mcp_schema` fixes the case where an override says nothing about
+`[preset.input_schema]`. An override that declares one which disagrees with
+what the Rust handler reads is still accepted, and still produces a tool the
+model calls incorrectly.
+
+There is nothing declarative to validate against: the handlers read arguments
+ad hoc (`args["pattern"]`), so the schema and the contract are only related by
+convention. The cheap 80% is a startup assertion that each MCP tool's
+advertised `required` covers a small hardcoded per-tool list — which is exactly
+what `tests/mcp_stdio.rs::each_tools_required_args_match_what_its_handler_reads`
+already pins for the built-ins, so promoting it to a runtime check is mostly a
+move. The real fix is typed argument structs the schema can be derived from,
+which is a bigger change and would also delete the hand-written schemas in the
+preset TOMLs.
