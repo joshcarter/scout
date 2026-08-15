@@ -9,6 +9,9 @@
 //! project root, clamp the timeout, capture with `verify::run_command_capture`,
 //! inject the output into the preset args, call the model.
 //!
+//! Written from scratch rather than adapted from any existing file, and
+//! deliberately so — this module has no inherited provenance to trace.
+//!
 //! Invariants:
 //!
 //! * The command runs exactly once, with its output capped before it is ever
