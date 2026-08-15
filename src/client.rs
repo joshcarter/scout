@@ -118,7 +118,7 @@ impl std::fmt::Display for LlmError {
         match self {
             LlmError::EndpointUnavailable { endpoint } => write!(
                 f,
-                "local LLM endpoint {endpoint} is not responding — start the host (e.g. `ollama serve`) and retry"
+                "local LLM endpoint {endpoint} is not responding — start the host (LM Studio's local server, or `ollama serve`) and retry"
             ),
             LlmError::RequestFailed(msg) => write!(f, "request failed: {msg}"),
             // Each arm names the knob that governs the clock that fired.

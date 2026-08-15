@@ -9,8 +9,8 @@
 //
 // ```toml
 // [llm]                      # see config.rs — endpoint/model/timeout
-// endpoint = "http://localhost:11434/v1"
-// model    = "qwen3:27b"
+// endpoint = "http://localhost:1234/v1"
+// model    = "qwen/qwen3.6-35b-a3b"
 //
 // [extract]
 // bypass_max_lines  = 200

@@ -7,13 +7,19 @@
 
 [llm]
 # Any OpenAI-compatible chat-completions base URL. A trailing slash is
-# stripped. Common hosts: ollama on :11434, LM Studio on :1234.
-endpoint = "http://localhost:11434/v1"
-model = "qwen3:27b"
+# stripped. The values below are LM Studio on its default port, which is
+# the only host scout has been tested against — ollama (:11434, and model
+# names like `qwen3:27b`) speaks the same API and is expected to work, but
+# is unverified. `model` must name a model the host has loaded; ask yours
+# what it is (`curl http://localhost:1234/v1/models`) rather than trusting
+# this line, which is only the author's.
+endpoint = "http://localhost:1234/v1"
+model = "qwen/qwen3.6-35b-a3b"
 
 # Sent as `Authorization: Bearer <key>`. Local hosts usually ignore the
-# value but some require the header to be present at all.
-# api_key = "local"
+# value but some require the header to be present at all. LM Studio
+# ignores it; any non-empty string will do where one is needed.
+# api_key = "lm-studio"
 
 # The outer bound on a whole call — connect, request, and the entire
 # reply. Clamped to 1..3600.
