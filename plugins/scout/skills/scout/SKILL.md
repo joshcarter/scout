@@ -23,6 +23,24 @@ plugin-derived prefix. If a scout tool is not already in your loaded toolset,
 look it up by its unqualified name (`check_output`, `extract`, `grep`) to
 resolve the full name and load its schema.
 
+## What scout is actually best at
+
+`extract` and `grep` earn their round-trip on text that no code index covers,
+and on match sets too large to skim:
+
+- **Logs and run output** — CI logs, crash dumps, `.jsonl` event streams,
+  profiler output. Nothing indexes these, they are enormous, and you almost
+  always want one answer rather than the file.
+- **Generated and vendored trees** — lockfiles, `node_modules`, `target/`,
+  protobuf/OpenAPI output, migrations. Real text, deliberately unindexed,
+  frequently huge.
+- **Long prose and config** — changelogs, specs, ADRs, large YAML/TOML. The
+  question ("when did the retry default change?") is semantic, so a pattern
+  match is the wrong shape for it.
+- **Semantic filtering of a big match set** — when the pattern is right but
+  most hits are not, `intent` throws away the noise locally. This is the one
+  case that applies to indexed source too.
+
 ## When NOT to use it
 
 Small files and narrow searches are cheaper read directly — a 40-line config,
@@ -32,6 +50,14 @@ short-circuit on small inputs anyway.
 
 Do not route every identifier search through it. Native search is the right
 tool for "where is this defined."
+
+**If a structural code-intelligence tool is available** — an LSP, a
+tree-sitter-backed indexer, anything that resolves symbols — prefer it for
+indexed source. Outlines, call graphs, "find every caller", and "show me this
+function" are questions with exact answers, served from an index, with no model
+in the loop. scout answers a different kind of question, on text that tool
+cannot see. Reaching for scout there is slower and less accurate; the list
+above is the boundary.
 
 ## Build and test output
 

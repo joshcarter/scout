@@ -41,9 +41,13 @@ GUIDANCE="Prefer scout over raw Bash/Read/Grep for token-heavy work: it runs the
 
 Those three are MCP tools; the names above are unqualified. Their full names carry a plugin-derived prefix (mcp__plugin_<plugin>_<server>__check_output). If a scout tool is not already in your loaded toolset, it is also deferred: run ToolSearch for its unqualified name (e.g. \"check_output\") to resolve the full name and load its schema.
 
+Where extract/grep pay: text no code index covers, and match sets too large to skim — logs and run output, generated or vendored trees, long prose and config, plus intent-filtering a big result set. If a structural code tool (LSP, tree-sitter indexer) is available, prefer it for indexed source: outlines, call graphs and \"find every caller\" have exact answers and need no model. See the scout skill for the full boundary.
+
 A PreToolUse hook denies bare build/test Bash commands (cargo build|test|check|clippy, go build|test|vet, npm/npx tsc, python -m pytest, pytest) and redirects to check_output so raw output never floods context. If you already know you need the full raw log (e.g. the classifier could not parse prior output), re-run the SAME command with a \"# raw-output\" marker appended once to bypass the redirect.
 
-A second PreToolUse hook silently auto-allows confidently-safe Bash commands via local classification — it only ever adds an allow, never blocks; on any error it is a no-op and the normal permission prompt applies."
+A second PreToolUse hook silently auto-allows confidently-safe Bash commands via local classification — it only ever adds an allow, never blocks; on any error it is a no-op and the normal permission prompt applies.
+
+A third PreToolUse hook is purely advisory: on a large Read or a broad uncapped grep it adds a note pointing at extract/grep. It emits no permission decision at all and changes nothing about what runs — take it or ignore it on the merits above."
 
 if command -v jq >/dev/null 2>&1; then
   jq -n --arg status "$STATUS" --arg guidance "$GUIDANCE" \

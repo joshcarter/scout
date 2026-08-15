@@ -66,6 +66,11 @@ run them directly. All three matter when touching hooks:
 - `bash tests/test-prefer-local-llm.sh` — redirect hook (deny shape, escape
   hatch, redirect text).
 - `bash tests/test-shell-safety.sh` — command classification.
+- `bash tests/test-suggest-scout.sh` — advisory extract/grep nudge hook
+  (trigger thresholds, throttle, fail-open). Fully green, and *not* subject to
+  the isolation gap below: it builds a curated PATH containing the tools the
+  hook needs but no `scout`, so the missing-binary branch is really reached.
+  Copy that approach if you ever fix the other two.
 
 Known pre-existing failure, one in each shell suite: the `[missing binary]` case
 expects a `missing-binary` log reason but gets `endpoint-unreachable`
