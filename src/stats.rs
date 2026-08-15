@@ -47,10 +47,8 @@ pub fn log_path() -> Option<PathBuf> {
 pub fn run_id() -> &'static str {
     static RUN: OnceLock<String> = OnceLock::new();
     RUN.get_or_init(|| {
-        let ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let ms =
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
         format!("{ms:x}-{}", std::process::id())
     })
 }
@@ -380,8 +378,7 @@ impl CallRecord {
     pub fn to_json(&self) -> Value {
         let ts = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+            .map_or(0.0, |d| d.as_secs_f64());
         let mut m = Map::new();
         m.insert("v".into(), Value::from(2));
         m.insert("id".into(), Value::from(self.id.clone()));
@@ -560,7 +557,7 @@ impl Ledger {
     pub fn finish(&self, payload: &Value) {
         let Some(mut rec) = self.pending.take() else { return };
         if rec.returned_bytes.is_none() {
-            let bytes = serde_json::to_string(payload).map(|s| s.len() as u64).unwrap_or(0);
+            let bytes = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
             rec.returned_bytes = Some(bytes);
         }
         // The rerank's verdict is only known once every batch is in, which is
@@ -694,7 +691,7 @@ fn append_line(path: &Path, line: &str) {
         ensure_private_dir(parent);
     }
     let Ok(mut f) = open_for_append(path) else { return };
-    if f.metadata().map(|m| m.len() >= MAX_LOG_BYTES).unwrap_or(false) {
+    if f.metadata().is_ok_and(|m| m.len() >= MAX_LOG_BYTES) {
         drop(f);
         let _ = std::fs::rename(path, rotated_path(path));
         // The rotated-away name is gone from `path`, so this is a fresh
@@ -774,12 +771,11 @@ fn fold_file(path: &Path, acc: &mut Accumulator) -> std::io::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                acc.parse_errors += 1;
-                continue;
-            }
+        let v: Value = if let Ok(v) = serde_json::from_str(&line) {
+            v
+        } else {
+            acc.parse_errors += 1;
+            continue;
         };
 
         if let Some(ts) = record_ts(&v) {
@@ -862,12 +858,11 @@ fn human_bytes(n: u64) -> String {
 /// then the three things the record now carries that the table cannot show:
 /// context saved, calls served without the model, and failures by kind.
 pub fn print_report() -> anyhow::Result<()> {
-    let path = match log_path() {
-        Some(p) => p,
-        None => {
-            println!("scout stats: $HOME not set and $SCOUT_CALLS_LOG not set; no log to read");
-            return Ok(());
-        }
+    let path = if let Some(p) = log_path() {
+        p
+    } else {
+        println!("scout stats: $HOME not set and $SCOUT_CALLS_LOG not set; no log to read");
+        return Ok(());
     };
 
     if !path.exists() {
@@ -984,7 +979,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lines_of(f: &NamedTempFile) -> Vec<Value> {
@@ -1282,7 +1277,7 @@ mod tests {
         // line per call would take 90k writes.
         let fat = json!({"ts": 1_770_000_000u64, "preset": "grep", "tokens_in": 1,
                          "tokens_out": 1, "ms": 10, "ok": true, "pad": "x".repeat(4096)});
-        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_LOG_BYTES {
+        while std::fs::metadata(&path).map_or(0, |m| m.len()) < MAX_LOG_BYTES {
             append_line(&path, &fat.to_string());
         }
         let before = std::fs::metadata(&path).unwrap().len();
@@ -1366,7 +1361,7 @@ mod tests {
         let path = dir.path().join("calls.jsonl");
         let fat =
             json!({"ts": 1_770_000_000u64, "preset": "grep", "ok": true, "pad": "x".repeat(4096)});
-        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_LOG_BYTES {
+        while std::fs::metadata(&path).map_or(0, |m| m.len()) < MAX_LOG_BYTES {
             append_line(&path, &fat.to_string());
         }
         assert_eq!(mode_of(&path), 0o600, "pre-rotation generation is 0600");

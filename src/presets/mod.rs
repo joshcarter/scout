@@ -151,13 +151,13 @@ pub fn load(dir: &Path) -> Vec<Preset> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("scout: cannot read preset dir {:?}: {e}", dir);
+            eprintln!("scout: cannot read preset dir {dir:?}: {e}");
             return presets;
         }
     };
 
     let mut paths: Vec<_> = entries
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
         .collect();
@@ -165,9 +165,9 @@ pub fn load(dir: &Path) -> Vec<Preset> {
 
     for path in paths {
         match std::fs::read_to_string(&path) {
-            Err(e) => eprintln!("scout: cannot read {:?}: {e}", path),
+            Err(e) => eprintln!("scout: cannot read {path:?}: {e}"),
             Ok(source) => match loader::parse(&source) {
-                Err(e) => eprintln!("scout: preset {:?} parse error: {e}", path),
+                Err(e) => eprintln!("scout: preset {path:?} parse error: {e}"),
                 Ok(p) => presets.push(p),
             },
         }
@@ -272,8 +272,7 @@ pub fn load_presets() -> Vec<Preset> {
     let user_dir = std::env::var("SCOUT_PRESET_DIR")
         .ok()
         .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| crate::config::config_dir().join("presets"));
+        .map_or_else(|| crate::config::config_dir().join("presets"), std::path::PathBuf::from);
     load_all(Some(&user_dir))
 }
 

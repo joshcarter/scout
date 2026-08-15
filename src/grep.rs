@@ -86,8 +86,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let max_hits = args
         .get("max_hits")
         .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(10)
+        .map_or(10, |n| n as usize)
         .clamp(1, MAX_HITS_CEILING);
 
     // ── 1. Run the real search engine ────────────────────────────────
@@ -182,7 +181,7 @@ pub fn rerank(
     ctx.note(&format!(
         "filtering {} hits with {}…",
         considered.len(),
-        ctx.client.map(|c| c.model()).unwrap_or("the local model")
+        ctx.client.map_or("the local model", super::client::LlmClient::model)
     ));
 
     let batch_size = cfg.batch_size.max(1);

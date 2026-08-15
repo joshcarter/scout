@@ -323,7 +323,7 @@ pub fn capture_with_deadlines(
 /// Take a buffer lock, ignoring poisoning: a panicked reader loses its own
 /// thread, and the bytes it already appended are still worth reporting.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Drain one pipe into `buf`, stamping `last_output_ms` on every read that

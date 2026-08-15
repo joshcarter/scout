@@ -140,7 +140,7 @@ impl Scout {
 /// The MCP server's notion of "the project": the directory Claude Code
 /// launched it in.
 fn project_root() -> String {
-    std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
+    std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
 }
 
 /// Coerce a JSON Schema `Value` into the object map rmcp wants, falling back

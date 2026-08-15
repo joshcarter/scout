@@ -1,3 +1,41 @@
+[lints.clippy]
+# Pedantic is on so the *next* instance of a real idiom problem gets caught.
+# That only works if the build is quiet, so everything allowed below was
+# looked at and judged noise for this codebase rather than waved through:
+pedantic = { level = "warn", priority = -1 }
+
+# scout is one binary and one internal library. `#[must_use]` on 82 internal
+# functions documents nothing a caller could get wrong.
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+
+# Same reasoning for prose sections. Errors are described where they are
+# returned, and the crate has no external consumers to write reference docs for.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# Flags ordinary English in comments — `elapsed_ms`, `endpoint_unavailable`,
+# `Grok Build` — as needing backticks. This codebase's comments are prose that
+# explains why, and prose is the point.
+doc_markdown = "allow"
+
+# Wants Duration::from_secs(120) rewritten as from_mins(2). The domain unit is
+# seconds everywhere — `[llm] timeout_seconds`, `timeout_seconds` in the MCP
+# schema — so from_secs is the spelling that matches the config it implements.
+duration_suboptimal_units = "allow"
+
+# Checked case by case in an earlier review: every one is either a display-only
+# float cast or already behind a sign/range guard clippy cannot see through.
+# 42 warnings, no findings.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+# A `const MAX_BYTES` declared next to the code that uses it reads better than
+# one hoisted to the top of the function away from its reason.
+items_after_statements = "allow"
+
 [package]
 name = "scout-llm"
 version = "0.1.0"

@@ -145,9 +145,7 @@ struct Tail {
 /// Distinguishes "deliberately skipped" from "malformed" for the two counters
 /// above; `Row::parse` returns `None` for both.
 fn is_legacy_record(line: &str) -> bool {
-    serde_json::from_str::<Value>(line)
-        .map(|v| v.get("v").and_then(Value::as_u64) != Some(2))
-        .unwrap_or(false)
+    serde_json::from_str::<Value>(line).is_ok_and(|v| v.get("v").and_then(Value::as_u64) != Some(2))
 }
 
 /// `(dev, ino)` — the pair that identifies a file across a rename.
@@ -240,7 +238,7 @@ impl Tail {
     }
 
     fn log_bytes(&self) -> u64 {
-        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.path).map_or(0, |m| m.len())
     }
 }
 
@@ -268,12 +266,11 @@ fn group_ops(rows: &[Row]) -> Vec<Vec<usize>> {
     let mut ops: Vec<Vec<usize>> = Vec::new();
     let mut slot: HashMap<&str, usize> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        match slot.get(row.op.as_str()) {
-            Some(&at) => ops[at].push(i),
-            None => {
-                slot.insert(row.op.as_str(), ops.len());
-                ops.push(vec![i]);
-            }
+        if let Some(&at) = slot.get(row.op.as_str()) {
+            ops[at].push(i)
+        } else {
+            slot.insert(row.op.as_str(), ops.len());
+            ops.push(vec![i]);
         }
     }
     ops
@@ -350,10 +347,8 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 /// sum is the same either way, but going through `op_json` keeps one definition
 /// of "an operation's context saved" instead of two that can drift.
 fn overview(tail: &Tail) -> Value {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let now =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let rows = &tail.rows;
 
     let mut bypassed = 0u64;
@@ -517,10 +512,8 @@ struct Reach {
 }
 
 fn check_reachability() -> Reach {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
+    let now =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     match crate::config::load_config(&crate::config::config_path()) {
         Ok(cfg) => {
             let timeout_secs = cfg.timeout.as_secs();
@@ -556,11 +549,11 @@ struct State {
 
 impl State {
     fn status_json(&self) -> Value {
-        let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tail = self.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         tail.refresh();
         let overview = overview(&tail);
         drop(tail);
-        let reach = self.reach.lock().unwrap_or_else(|e| e.into_inner());
+        let reach = self.reach.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (inflight, bodies, finds, streams) = self.live.snapshot();
         let (running, abandoned) = self.live.inflight_split();
         json!({
@@ -572,7 +565,7 @@ impl State {
             "pid": std::process::id(),
             "port": self.port,
             "started": unix_secs(self.started),
-            "uptime_secs": self.started.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+            "uptime_secs": self.started.elapsed().map_or(0, |d| d.as_secs()),
             "log_path": stats::log_path().map(|p| p.display().to_string()),
             "llm": {
                 "model": reach.model,
@@ -623,12 +616,12 @@ fn socket_still_bound(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
-        std::fs::metadata(path).map(|m| m.file_type().is_socket()).unwrap_or(false)
+        std::fs::metadata(path).is_ok_and(|m| m.file_type().is_socket())
     }
 }
 
 fn unix_secs(t: SystemTime) -> u64 {
-    t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// Bind with `SO_REUSEADDR` set before bind, so a well-known port can be
@@ -650,7 +643,7 @@ fn bind_tcp_reuse(port: u16) -> std::io::Result<TcpListener> {
             fd,
             libc::SOL_SOCKET,
             libc::SO_REUSEADDR,
-            &optval as *const _ as *const libc::c_void,
+            (&raw const optval).cast::<libc::c_void>(),
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
         let mut sa: libc::sockaddr_in = std::mem::zeroed();
@@ -660,7 +653,7 @@ fn bind_tcp_reuse(port: u16) -> std::io::Result<TcpListener> {
             libc::in_addr { s_addr: u32::from_ne_bytes(std::net::Ipv4Addr::LOCALHOST.octets()) };
         let bound = libc::bind(
             fd,
-            &sa as *const _ as *const libc::sockaddr,
+            (&raw const sa).cast::<libc::sockaddr>(),
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         );
         if bound < 0 {
@@ -1186,18 +1179,18 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
 
     match path {
         "/" | "/index.html" => {
-            respond(&mut stream, 200, "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes())
+            respond(&mut stream, 200, "text/html; charset=utf-8", DASHBOARD_HTML.as_bytes());
         }
         "/api/status" => respond_json(&mut stream, 200, &state.status_json()),
         "/api/history" => {
-            let mut tail = state.tail.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tail = state.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tail.refresh();
             let body = history_with_live(&tail, Some(state.live.as_ref()), &params);
             drop(tail);
             respond_json(&mut stream, 200, &body);
         }
         "/api/stats" => {
-            let mut tail = state.tail.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tail = state.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tail.refresh();
             let body = stats_json(&tail);
             drop(tail);
@@ -1205,11 +1198,10 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
         }
         "/api/stream" => {
             handle_stream(state, stream);
-            return;
         }
         p if p.starts_with("/api/call/") => {
             let id = url_decode(&p["/api/call/".len()..]);
-            let mut tail = state.tail.lock().unwrap_or_else(|e| e.into_inner());
+            let mut tail = state.tail.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             tail.refresh();
             let found = call_with_live(&tail, Some(state.live.as_ref()), &id);
             drop(tail);
@@ -1326,7 +1318,7 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
                     .live
                     .set_abandon_after_secs(fresh.timeout_secs + crate::live::ABANDON_GRACE_SECS);
             }
-            *state.reach.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+            *state.reach.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
             // `bound` is re-derived here rather than left as the startup
             // snapshot it used to be; see `socket_still_bound`.
             if let Some(path) = &state.live_socket {
@@ -1370,7 +1362,7 @@ fn probe(port: u16) -> Option<Value> {
 fn pid_for_port(port: u16) -> Option<u64> {
     let path = pid_path_for(port)?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    (v.get("port").and_then(Value::as_u64) == Some(port as u64))
+    (v.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
         .then(|| v.get("pid").and_then(Value::as_u64))
         .flatten()
 }
@@ -1400,7 +1392,7 @@ fn url_for(port: u16) -> String {
 /// Truncate the daemon log if it has grown past the cap.  Diagnostics, not
 /// history — there is no rotation here on purpose.
 fn trim_daemon_log(path: &Path) {
-    if std::fs::metadata(path).map(|m| m.len() > MAX_DAEMON_LOG_BYTES).unwrap_or(false) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_DAEMON_LOG_BYTES) {
         let _ = std::fs::write(path, b"");
     }
 }
@@ -1545,30 +1537,27 @@ fn human_secs(secs: u64) -> String {
 /// `--status`: running/not, pid, port, uptime, log path. Exit 0/1.
 fn status(port: u16) -> anyhow::Result<bool> {
     let log = daemon_log_path().map(|p| p.display().to_string()).unwrap_or_default();
-    match probe(port) {
-        Some(v) => {
-            let get = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-            println!("scout dashboard: running");
-            println!("  url      {}", url_for(port));
-            println!("  pid      {}", get("pid"));
-            println!("  port     {}", get("port"));
-            println!("  uptime   {}", human_secs(get("uptime_secs")));
-            println!("  version  {}", v.get("version").and_then(Value::as_str).unwrap_or("?"));
-            println!("  calls    {} rows", v["overview"]["rows"].as_u64().unwrap_or(0));
-            println!("  log      {log}");
-            Ok(true)
+    if let Some(v) = probe(port) {
+        let get = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+        println!("scout dashboard: running");
+        println!("  url      {}", url_for(port));
+        println!("  pid      {}", get("pid"));
+        println!("  port     {}", get("port"));
+        println!("  uptime   {}", human_secs(get("uptime_secs")));
+        println!("  version  {}", v.get("version").and_then(Value::as_str).unwrap_or("?"));
+        println!("  calls    {} rows", v["overview"]["rows"].as_u64().unwrap_or(0));
+        println!("  log      {log}");
+        Ok(true)
+    } else {
+        if pid_for_port(port).is_some() {
+            clear_pidfile(port);
+            println!("scout dashboard: not running (stale pidfile cleared)");
+        } else {
+            println!("scout dashboard: not running");
         }
-        None => {
-            if pid_for_port(port).is_some() {
-                clear_pidfile(port);
-                println!("scout dashboard: not running (stale pidfile cleared)");
-            } else {
-                println!("scout dashboard: not running");
-            }
-            println!("  port     {port}");
-            println!("  log      {log}");
-            Ok(false)
-        }
+        println!("  port     {port}");
+        println!("  log      {log}");
+        Ok(false)
     }
 }
 
@@ -1585,10 +1574,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         return run_foreground(port);
     }
     if args.status {
-        return match status(port)? {
-            true => Ok(()),
-            false => std::process::exit(1),
-        };
+        return if status(port)? { Ok(()) } else { std::process::exit(1) };
     }
     if args.stop {
         stop(port)?;
@@ -1974,7 +1960,7 @@ mod tests {
     #[test]
     fn limit_caps_the_page_at_the_newest_operations() {
         let lines: Vec<String> = (1..=10)
-            .map(|i| v2(&format!("a{i}-1"), &format!("a{i}"), 100.0 + i as f64 * 10.0, ""))
+            .map(|i| v2(&format!("a{i}-1"), &format!("a{i}"), 100.0 + f64::from(i) * 10.0, ""))
             .collect();
         let h = history_json(&tail_of(&lines), &q(&[("limit", "3")]));
         let ops = h["ops"].as_array().unwrap();
@@ -2161,7 +2147,7 @@ mod tests {
         let rotated = rotated_path(&path);
 
         for i in 1..=3 {
-            append(&path, &v2(&format!("old{i}-1"), &format!("old{i}"), 100.0 + i as f64, ""));
+            append(&path, &v2(&format!("old{i}-1"), &format!("old{i}"), 100.0 + f64::from(i), ""));
         }
         let mut t = Tail::new(path.clone());
         t.refresh();

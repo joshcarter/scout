@@ -155,14 +155,14 @@ fn redirect_span(word: &str) -> Option<usize> {
     if !rest.starts_with('>') && !rest.starts_with('<') {
         return None;
     }
-    let target = rest.trim_start_matches(|c| matches!(c, '<' | '>' | '&' | '|'));
+    let target = rest.trim_start_matches(['<', '>', '&', '|']);
     // Operator with no filename glued on → the target is the following word.
     Some(if target.is_empty() { 2 } else { 1 })
 }
 
 /// A `timeout`/`sleep`-style duration argument: `60`, `1.5`, `30s`, `2m`.
 fn is_duration(word: &str) -> bool {
-    let core = word.trim_end_matches(|c| matches!(c, 's' | 'm' | 'h' | 'd'));
+    let core = word.trim_end_matches(['s', 'm', 'h', 'd']);
     !core.is_empty() && core.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
@@ -178,7 +178,7 @@ fn head_words(words: &[String]) -> Vec<&str> {
         let word = out[i];
 
         // Grouping tokens: `(`, `{`, `!`, and anything glued to them.
-        let stripped = word.trim_start_matches(|c| matches!(c, '(' | '{' | '!'));
+        let stripped = word.trim_start_matches(['(', '{', '!']);
         if stripped != word {
             if stripped.is_empty() {
                 i += 1;
@@ -523,7 +523,7 @@ impl Lexer {
         if self.peek(1) == Some('&') {
             self.i += 2;
             self.end_segment();
-        } else if matches!(self.prev(), Some('>') | Some('<')) || self.peek(1) == Some('>') {
+        } else if matches!(self.prev(), Some('>' | '<')) || self.peek(1) == Some('>') {
             self.i += 1;
             self.push_char('&');
         } else {
@@ -580,7 +580,7 @@ impl Lexer {
         if strip_tabs {
             self.i += 1;
         }
-        while matches!(self.peek(0), Some(' ') | Some('\t')) {
+        while matches!(self.peek(0), Some(' ' | '\t')) {
             self.i += 1;
         }
 

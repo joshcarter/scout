@@ -61,7 +61,7 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let pair = args.get(i).ok_or("--arg requires a value")?;
                 let (k, v) = pair
                     .split_once('=')
-                    .ok_or_else(|| format!("--arg: expected k=v, got {:?}", pair))?;
+                    .ok_or_else(|| format!("--arg: expected k=v, got {pair:?}"))?;
                 named.insert(k.to_string(), v.to_string());
             }
             "--project" => {
@@ -85,8 +85,11 @@ pub(crate) fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
 /// goes to stdout (LLM response) or stderr (diagnostics).
 pub fn run_subcommand(raw_args: &[String]) -> ! {
     // Skip the "run" token if it's still present at the front.
-    let tail: &[String] =
-        if raw_args.first().map(|s| s.as_str()) == Some("run") { &raw_args[1..] } else { raw_args };
+    let tail: &[String] = if raw_args.first().map(std::string::String::as_str) == Some("run") {
+        &raw_args[1..]
+    } else {
+        raw_args
+    };
 
     let args = match parse_run_args(tail) {
         Ok(a) => a,
@@ -121,24 +124,22 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
     }
 
     // ── Preset invocation path ───────────────────────────────────────────────
-    let preset_name = match &args.preset {
-        Some(n) => n.clone(),
-        None => {
-            eprintln!("scout run: --preset NAME is required (or use --ping)");
-            std::process::exit(1);
-        }
+    let preset_name = if let Some(n) = &args.preset {
+        n.clone()
+    } else {
+        eprintln!("scout run: --preset NAME is required (or use --ping)");
+        std::process::exit(1);
     };
 
     // Load presets from the same source the MCP server uses: embedded
     // built-ins overlaid with any user overrides.
     let loaded = presets::load_presets();
-    let preset = match loaded.iter().find(|p| p.name == preset_name) {
-        Some(p) => p,
-        None => {
-            let available: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
-            eprintln!("scout run: preset {:?} not found (available: {:?})", preset_name, available);
-            std::process::exit(1);
-        }
+    let preset = if let Some(p) = loaded.iter().find(|p| p.name == preset_name) {
+        p
+    } else {
+        let available: Vec<&str> = loaded.iter().map(|p| p.name.as_str()).collect();
+        eprintln!("scout run: preset {preset_name:?} not found (available: {available:?})");
+        std::process::exit(1);
     };
 
     // Build a JSON Value of the named args for `presets::resolve`.
@@ -150,7 +151,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
 
     // Project root defaults to $PWD.
     let project = args.project.unwrap_or_else(|| {
-        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
     });
 
     // A context provider that failed (no staged diff, a `git` timeout, an
@@ -194,7 +195,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
             if empty {
                 eprintln!("scout run: LLM returned empty response");
             } else {
-                eprintln!("scout run: LLM call failed: {:?}", e);
+                eprintln!("scout run: LLM call failed: {e:?}");
             }
             std::process::exit(1);
         }

@@ -73,8 +73,7 @@ impl Row {
         let id = s("id")?;
         let kind = v["outcome"]["kind"]
             .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| if ok { "ok" } else { "unknown" }.to_string());
+            .map_or_else(|| if ok { "ok" } else { "unknown" }.to_string(), str::to_string);
         Some(Row {
             op: s("op").unwrap_or_else(|| id.clone()),
             run: s("run").unwrap_or_else(|| id.clone()),

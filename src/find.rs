@@ -132,15 +132,13 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let max_hits = args
         .get("max_hits")
         .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(10)
+        .map_or(10, |n| n as usize)
         .clamp(1, MAX_HITS_CEILING);
     // `--attempts` overrides `[find] max_attempts`; 1 means "no retry".
     let attempts = args
         .get("attempts")
         .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(find_cfg.max_attempts)
+        .map_or(find_cfg.max_attempts, |n| n as usize)
         .max(1);
 
     let root = Path::new(&ctx.project);
@@ -181,35 +179,32 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         // Either the reflect stage already said what to search next, or this is
         // a synthesis round and the pattern preset gets asked.
         let mut from_reflect = false;
-        let mut candidates = match refined.take() {
-            Some(c) => {
-                from_reflect = true;
-                c
-            }
-            None => {
-                let reply = call_preset(
-                    ctx,
-                    "find_patterns",
-                    &json!({
-                        "question": question,
-                        "tree": tree,
-                        "max_patterns": find_cfg.max_patterns,
-                        "failed": retry_note(&whiffed, &too_common),
-                    }),
-                )
-                .map_err(|e| fail(&e))?;
+        let mut candidates = if let Some(c) = refined.take() {
+            from_reflect = true;
+            c
+        } else {
+            let reply = call_preset(
+                ctx,
+                "find_patterns",
+                &json!({
+                    "question": question,
+                    "tree": tree,
+                    "max_patterns": find_cfg.max_patterns,
+                    "failed": retry_note(&whiffed, &too_common),
+                }),
+            )
+            .map_err(|e| fail(&e))?;
 
-                let c = parse_candidates(&reply, find_cfg.max_patterns);
-                if c.is_empty() {
-                    // Nothing to search and nothing to tell the next round.
-                    // Remember it: if no round ever produces patterns, that is
-                    // an LLM failure (exit 2), not the "no pattern worked"
-                    // verdict (exit 1).
-                    parse_error = Some("local LLM proposed no usable patterns".to_string());
-                    continue;
-                }
-                c
+            let c = parse_candidates(&reply, find_cfg.max_patterns);
+            if c.is_empty() {
+                // Nothing to search and nothing to tell the next round.
+                // Remember it: if no round ever produces patterns, that is
+                // an LLM failure (exit 2), not the "no pattern worked"
+                // verdict (exit 1).
+                parse_error = Some("local LLM proposed no usable patterns".to_string());
+                continue;
             }
+            c
         };
         // The question's own words are candidates too, and they cost no LLM
         // call at all — see `seed_candidates`.
@@ -553,7 +548,7 @@ pub fn question_tokens(question: &str) -> Vec<String> {
     for raw in question.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
         let token = raw.to_lowercase();
         if token.chars().count() < 3
-            || token.chars().all(|c| c.is_numeric())
+            || token.chars().all(char::is_numeric)
             || STOPWORDS.contains(&token.as_str())
             || out.contains(&token)
         {
@@ -958,7 +953,7 @@ pub fn sketch(paths: &[String], max_bytes: usize) -> String {
     if truncated {
         // Give the marker room by dropping paths, not by overrunning the cap.
         while !lines.is_empty() && used + MARKER.len() > max_bytes {
-            used -= lines.pop().map(|l| l.len() + 1).unwrap_or(0);
+            used -= lines.pop().map_or(0, |l| l.len() + 1);
         }
     }
     let mut out = String::with_capacity(used);
@@ -1114,7 +1109,7 @@ fn reflect_event(reflection: Option<&Reflection>, next: Option<&[Candidate]>) ->
     json!({
         "parsed": reflection.is_some(),
         // Unparseable reads as "answered", which is what the loop does with it.
-        "answered": reflection.map(|r| r.answered).unwrap_or(true),
+        "answered": reflection.is_none_or(|r| r.answered),
         "patterns": reflection.map(|r| names(&r.patterns)).unwrap_or_default(),
         "refining": next.map(names).unwrap_or_default(),
     })

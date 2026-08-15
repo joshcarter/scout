@@ -283,6 +283,6 @@ n = 10
         let preset = parse(toml).expect("parse failed");
         let ctx = &preset.context[0];
         assert_eq!(ctx.provider, "git_recent_commits");
-        assert_eq!(ctx.extra.get("n").and_then(|v| v.as_u64()), Some(10));
+        assert_eq!(ctx.extra.get("n").and_then(serde_json::Value::as_u64), Some(10));
     }
 }

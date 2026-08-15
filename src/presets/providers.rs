@@ -72,7 +72,7 @@ fn provider_git_staged_diff(args: &ProviderArgs) -> Result<String, String> {
 }
 
 fn provider_git_recent_commits(args: &ProviderArgs) -> Result<String, String> {
-    let n = args.named.get("n").and_then(|v| v.as_u64()).unwrap_or(5);
+    let n = args.named.get("n").and_then(serde_json::Value::as_u64).unwrap_or(5);
     let n_str = format!("-{n}");
     // Optional `format` static arg — defaults to `--oneline` if absent.
     // Use `format = "%B%n---"` for full commit messages with separators.
@@ -101,7 +101,7 @@ fn provider_git_diff_range(args: &ProviderArgs) -> Result<String, String> {
     let base = args
         .positional
         .first()
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .or_else(|| args.named.get("base").and_then(|v| v.as_str()))
         .ok_or_else(|| "git_diff_range requires 'base' arg".to_string())?;
     // Trailing `--`: an empty pathspec, which pins `base` to the revision slot
@@ -114,7 +114,7 @@ fn provider_git_diff_stat(args: &ProviderArgs) -> Result<String, String> {
     let base = args
         .positional
         .first()
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .or_else(|| args.named.get("base").and_then(|v| v.as_str()));
     match base {
         Some(b) => git(args.project_root, &["diff", "--stat", checked_rev(b)?, "--"]),
@@ -126,7 +126,7 @@ fn provider_git_log_range(args: &ProviderArgs) -> Result<String, String> {
     let base = args
         .positional
         .first()
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .or_else(|| args.named.get("base").and_then(|v| v.as_str()))
         .ok_or_else(|| "git_log_range requires 'base' arg".to_string())?;
     let range = format!("{}..HEAD", checked_rev(base)?);
@@ -137,7 +137,7 @@ fn provider_file_read(args: &ProviderArgs) -> Result<String, String> {
     let path = args
         .positional
         .first()
-        .map(|s| s.as_str())
+        .map(std::string::String::as_str)
         .or_else(|| args.named.get("path").and_then(|v| v.as_str()))
         .ok_or_else(|| "file_read requires 'path' arg".to_string())?;
     const MAX_BYTES: u64 = 1_048_576; // 1 MiB — guard against large/infinite files
@@ -390,7 +390,7 @@ impl Capped {
 /// Take a buffer lock, ignoring poisoning: a panicked reader loses its own
 /// thread, and the bytes it already appended are still worth reporting.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Drain one pipe into `buf`, stamping `last_output_ms` on every read that
@@ -605,8 +605,7 @@ mod tests {
             .args(["rev-parse", "--git-dir"])
             .current_dir(dir)
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+            .is_ok_and(|o| o.status.success())
     }
 
     #[test]
@@ -688,8 +687,7 @@ mod tests {
             .args(["init", "-q"])
             .current_dir(repo.path())
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if !init {
             return; // no git — nothing to assert
         }
@@ -699,8 +697,7 @@ mod tests {
             .args(["add", "big.txt"])
             .current_dir(repo.path())
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         assert!(added, "git add failed");
 
         let out = run_bounded(
@@ -764,8 +761,7 @@ mod tests {
             .args(["init", "-q"])
             .current_dir(repo.path())
             .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+            .is_ok_and(|o| o.status.success());
         if ok {
             let args = empty_args(&repo_path);
             let err = run_provider("git_staged_diff", &args).unwrap_err();

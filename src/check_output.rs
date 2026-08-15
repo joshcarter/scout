@@ -62,8 +62,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&ctx.project));
+        .map_or_else(|| PathBuf::from(&ctx.project), PathBuf::from);
     if !cwd.is_dir() {
         return Err(fail(&format!("cwd {} is not a directory", cwd.display())));
     }
@@ -88,7 +87,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     // `language` is injected into the preset args too so a user-authored
     // override can key its prompt on the toolchain (`${args.language}`); the
     // built-in preset ignores it.
-    let language = verify::detect_language(&cwd).map(|l| l.as_str());
+    let language = verify::detect_language(&cwd).map(super::verify::Language::as_str);
 
     // A killed command short-circuits: no model, no round-trip, and a row that
     // says what actually happened rather than `ok`.
@@ -99,7 +98,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let mut call_args = args.clone();
     call_args["command"] = Value::String(command.clone());
     call_args["output"] = Value::String(capture.output);
-    call_args["language"] = language.map(Value::from).unwrap_or(Value::Null);
+    call_args["language"] = language.map_or(Value::Null, Value::from);
 
     let text = call_preset(ctx, "check_output", &call_args).map_err(|e| fail(&e))?;
 

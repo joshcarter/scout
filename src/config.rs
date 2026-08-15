@@ -98,7 +98,7 @@ pub fn seed_default_config(path: &Path) -> Result<bool, String> {
     }
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)
-            .map_err(|e| format!("cannot create config dir {:?}: {e}", parent))?;
+            .map_err(|e| format!("cannot create config dir {parent:?}: {e}"))?;
     }
     // create_new: two scout processes starting at once (an MCP server and a
     // CLI call, say) must not race into a half-written file. Losing the race
@@ -114,11 +114,11 @@ pub fn seed_default_config(path: &Path) -> Result<bool, String> {
         Ok(mut f) => {
             use std::io::Write;
             f.write_all(DEFAULT_CONFIG.as_bytes())
-                .map_err(|e| format!("cannot write config {:?}: {e}", path))?;
+                .map_err(|e| format!("cannot write config {path:?}: {e}"))?;
             Ok(true)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(format!("cannot create config {:?}: {e}", path)),
+        Err(e) => Err(format!("cannot create config {path:?}: {e}")),
     }
 }
 
@@ -139,13 +139,13 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     }
 
     let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read config {:?}: {e}", path))?;
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read config {path:?}: {e}"))?;
 
     let root: toml::Value =
         toml::from_str(&content).map_err(|e| format!("config parse error: {e}"))?;
 
     let section =
-        root.get("llm").ok_or_else(|| format!("config: [llm] section not found in {:?}", path))?;
+        root.get("llm").ok_or_else(|| format!("config: [llm] section not found in {path:?}"))?;
 
     let endpoint = section
         .get("endpoint")
@@ -162,11 +162,10 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
 
     let timeout_seconds = section
         .get("timeout_seconds")
-        .and_then(|v| v.as_integer())
+        .and_then(toml::Value::as_integer)
         // Clamp before cast: negative values wrap to near-maxint u64 via `as`.
         // Minimum 1 s so the Duration is never zero; cap at 3600 s (1 hour).
-        .map(|v| v.clamp(1, 3600) as u64)
-        .unwrap_or(120);
+        .map_or(120, |v| v.clamp(1, 3600) as u64);
 
     // The two progress budgets. Same clamp, same cast discipline, same
     // reason: `v as u64` on a negative i64 wraps to near-maxint, which turns a
@@ -180,25 +179,23 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
     // tight. Streaming only: `stream = false` has no progress signal to watch.
     let first_token_timeout_seconds = section
         .get("first_token_timeout_seconds")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.clamp(1, 3600) as u64)
-        .unwrap_or(60);
+        .and_then(toml::Value::as_integer)
+        .map_or(60, |v| v.clamp(1, 3600) as u64);
 
     let idle_timeout_seconds = section
         .get("idle_timeout_seconds")
-        .and_then(|v| v.as_integer())
-        .map(|v| v.clamp(1, 3600) as u64)
-        .unwrap_or(15);
+        .and_then(toml::Value::as_integer)
+        .map_or(15, |v| v.clamp(1, 3600) as u64);
 
     let api_key = section.get("api_key").and_then(|v| v.as_str()).map(String::from);
 
     let max_tokens =
-        section.get("max_tokens").and_then(|v| v.as_integer()).map(|v| v.max(0) as u64);
+        section.get("max_tokens").and_then(toml::Value::as_integer).map(|v| v.max(0) as u64);
 
     // Defaults on, and an unusable value keeps the default rather than
     // erroring — this is a diagnostic knob, not a load-bearing one, and no
     // caller's result changes with it (docs/dashboard.md §6).
-    let stream = section.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    let stream = section.get("stream").and_then(toml::Value::as_bool).unwrap_or(true);
 
     Ok(Config {
         endpoint,
@@ -424,7 +421,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]

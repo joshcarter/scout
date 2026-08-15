@@ -441,8 +441,7 @@ impl LlmClient {
                         let timed_out = (t as &dyn Error)
                             .source()
                             .and_then(|s| s.downcast_ref::<std::io::Error>())
-                            .map(is_timeout_io_error)
-                            .unwrap_or(false);
+                            .is_some_and(is_timeout_io_error);
                         if timed_out || call_start.elapsed() >= self.config.timeout {
                             // Nothing has been read yet, so neither progress
                             // budget can have an opinion: the only clock that
@@ -942,7 +941,7 @@ mod tests {
         .unwrap_err();
         match err {
             LlmError::Timeout(Deadline::FirstToken(d)) => {
-                assert_eq!(d, Duration::from_millis(300))
+                assert_eq!(d, Duration::from_millis(300));
             }
             other => panic!("expected a first-token timeout, got {other:?}"),
         }

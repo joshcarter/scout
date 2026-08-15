@@ -107,7 +107,7 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
 pub fn split_lines(text: &str) -> Vec<String> {
     let mut lines: Vec<String> =
         text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
-    if lines.last().map(String::is_empty).unwrap_or(false) {
+    if lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
     lines
@@ -237,11 +237,8 @@ pub fn build_overrides(root: &Path, globs: &[String]) -> Result<Option<Override>
 pub fn type_definitions() -> Vec<(String, Vec<String>)> {
     let mut b = TypesBuilder::new();
     b.add_defaults();
-    let mut defs: Vec<(String, Vec<String>)> = b
-        .definitions()
-        .iter()
-        .map(|d| (d.name().to_string(), d.globs().iter().map(|g| g.to_string()).collect()))
-        .collect();
+    let mut defs: Vec<(String, Vec<String>)> =
+        b.definitions().iter().map(|d| (d.name().to_string(), d.globs().to_vec())).collect();
     defs.sort_by(|a, b| a.0.cmp(&b.0));
     defs
 }
@@ -261,7 +258,7 @@ pub fn list_paths(root: &Path, opts: &SearchOptions, max_entries: usize) -> Vec<
         .standard_filters(true)
         .parents(true)
         .require_git(false)
-        .sort_by_file_path(|a, b| a.cmp(b));
+        .sort_by_file_path(std::cmp::Ord::cmp);
     if let Some(types) = &opts.types {
         builder.types(types.clone());
     }
@@ -275,7 +272,7 @@ pub fn list_paths(root: &Path, opts: &SearchOptions, max_entries: usize) -> Vec<
             break;
         }
         let Ok(entry) = entry else { continue };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         paths.push(display_path(root, entry.path()));
@@ -311,7 +308,7 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
         // Apply .gitignore even outside a git checkout — an exported tree or a
         // vendored directory still means what its ignore file says.
         .require_git(false)
-        .sort_by_file_path(|a, b| a.cmp(b));
+        .sort_by_file_path(std::cmp::Ord::cmp);
     // Only touched when the caller actually asked for a filter, so the
     // no-filter walk is bit-for-bit what it was before these existed.
     if let Some(types) = &opts.types {
@@ -331,7 +328,7 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
             Ok(e) => e,
             Err(_) => continue, // unreadable dir/symlink loop — skip, never abort
         };
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();

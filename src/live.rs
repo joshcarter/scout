@@ -140,7 +140,7 @@ enum Sock {
 
 fn sender_slot() -> std::sync::MutexGuard<'static, Option<Sock>> {
     static SLOT: Mutex<Option<Sock>> = Mutex::new(None);
-    SLOT.lock().unwrap_or_else(|e| e.into_inner())
+    SLOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn resolve() -> Sock {
@@ -409,7 +409,7 @@ fn next_seq() -> u64 {
 }
 
 pub(crate) fn now_ts() -> f64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// Shrink body fields until the serialized event fits in `MAX_DGRAM`.
@@ -572,7 +572,7 @@ fn raise_rcvbuf(sock: &std::os::unix::net::UnixDatagram) {
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            &buf as *const _ as *const libc::c_void,
+            (&raw const buf).cast::<libc::c_void>(),
             std::mem::size_of_val(&buf) as libc::socklen_t,
         );
     }
@@ -902,7 +902,7 @@ impl LiveStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1028,7 +1028,7 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn reset_sender() {
@@ -1289,7 +1289,7 @@ mod tests {
                     fd,
                     libc::SOL_SOCKET,
                     libc::SO_RCVBUF,
-                    &buf as *const _ as *const libc::c_void,
+                    (&raw const buf).cast::<libc::c_void>(),
                     std::mem::size_of_val(&buf) as libc::socklen_t,
                 );
             }

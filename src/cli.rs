@@ -506,7 +506,7 @@ fn collect_globs(globs: &[String], dirs: &[String], exclude_dirs: &[String]) -> 
 /// `--project`, or `$PWD`.
 fn resolve_project(project: Option<String>) -> String {
     project.unwrap_or_else(|| {
-        std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string())
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
     })
 }
 
@@ -580,13 +580,14 @@ fn run_filter(
     let result = run_pipeline(tool, tool, project, &args, grep_out.is_some());
 
     match result {
-        Ok(payload) => match &grep_out {
-            Some(out) => finish_grep(&payload, out),
-            None => {
+        Ok(payload) => {
+            if let Some(out) = &grep_out {
+                finish_grep(&payload, out)
+            } else {
                 println!("{}", pretty_json(&payload));
                 std::process::exit(0);
             }
-        },
+        }
         Err(e) => {
             // `ToolError::text` already names the tool and the fallback.
             eprintln!("{}", e.text());
@@ -616,7 +617,7 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
         eprintln!("{line}");
     }
     let returned = payload.get("hits").and_then(|h| h.as_array()).map_or(0, Vec::len);
-    std::process::exit(if returned > 0 { 0 } else { 1 });
+    std::process::exit(i32::from(returned <= 0));
 }
 
 /// The stderr status lines for one grep result (docs/search-cli.md §2).
@@ -734,7 +735,7 @@ pub fn run_task(prompt: &str) -> ! {
         }
         Err(e) => {
             rec.log();
-            eprintln!("scout task: {:?}", e);
+            eprintln!("scout task: {e:?}");
             std::process::exit(1);
         }
     }
@@ -894,7 +895,7 @@ mod tests {
         for flag in ["--no-filter", "--regex"] {
             match Cli::try_parse_from(["scout", "find", "a question", flag]) {
                 Err(e) => {
-                    assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "flag: {flag}")
+                    assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "flag: {flag}");
                 }
                 Ok(_) => panic!("find must not accept {flag}"),
             }

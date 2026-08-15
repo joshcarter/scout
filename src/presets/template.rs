@@ -85,7 +85,7 @@ pub fn substitute_context(s: &str, context: &HashMap<String, String>) -> String 
             } else {
                 // Unknown key — leave the braces and content literal
                 result.push('{');
-                result.push_str(&after_open[..close + 1]); // includes '}'
+                result.push_str(&after_open[..=close]); // includes '}'
             }
             rest = &after_open[close + 1..];
         } else {

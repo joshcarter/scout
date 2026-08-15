@@ -200,13 +200,13 @@ pub fn split_words(s: &str) -> Vec<String> {
         match (quote, c) {
             // A backslash escapes the next character outside quotes and inside
             // double quotes; inside single quotes it is literal, as in sh.
-            (None, '\\') | (Some('"'), '\\') => {
+            (None | Some('"'), '\\') => {
                 started = true;
                 if let Some(next) = chars.next() {
                     cur.push(next);
                 }
             }
-            (None, '\'') | (None, '"') => {
+            (None, '\'' | '"') => {
                 started = true;
                 quote = Some(c);
             }

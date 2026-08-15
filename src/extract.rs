@@ -50,8 +50,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let max_lines = args
         .get("max_lines")
         .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(cfg.default_max_lines)
+        .map_or(cfg.default_max_lines, |n| n as usize)
         .clamp(1, MAX_LINES_CEILING);
 
     // ── 1. Read the file ─────────────────────────────────────────────
