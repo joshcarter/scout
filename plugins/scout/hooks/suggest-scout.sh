@@ -66,9 +66,12 @@ READ_MIN_BYTES="${SCOUT_SUGGEST_MIN_BYTES:-51200}"
 THROTTLE_SECS="${SCOUT_SUGGEST_THROTTLE_SECS:-600}"
 STAMP_DIR="${SCOUT_SUGGEST_STAMP_DIR:-$HOME/.claude/scout-suggest}"
 
-# Same resolution order as prefer-local-llm.sh; see its header for why the PATH
-# fallback is load-bearing.
-SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
+# ── Resolve the scout binary ─────────────────────────────────────────────────
+# Payload first, then the legacy data dir, then PATH. See the fuller comment on
+# the identical block in prefer-local-llm.sh for why each entry is there and why
+# this is duplicated rather than sourced. Keep the three copies byte-identical.
+SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
+[ -x "$SCOUT_BIN" ] || SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 [ -x "$SCOUT_BIN" ] || exit 0
 

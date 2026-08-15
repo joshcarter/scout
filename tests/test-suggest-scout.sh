@@ -61,6 +61,13 @@ printf '#!/bin/sh\nexit 0\n' > "$STUB_DIR/scout"
 chmod +x "$STUB_DIR/scout"
 export CLAUDE_PLUGIN_DATA="$TMPROOT/stub"
 
+# The hook resolves $CLAUDE_PLUGIN_ROOT/bin/scout ahead of the data dir, so an
+# ambient CLAUDE_PLUGIN_ROOT — present whenever this suite is run from inside a
+# Claude Code session with the plugin installed — would quietly swap the real
+# payload binary in for the stub above. Clear it here; the tests that mean to
+# exercise that path set it explicitly on the command line.
+unset CLAUDE_PLUGIN_ROOT
+
 # Throttle off by default; the throttle tests re-enable it explicitly.
 export SCOUT_SUGGEST_THROTTLE_SECS=0
 export SCOUT_SUGGEST_STAMP_DIR="$TMPROOT/stamps"
@@ -286,6 +293,17 @@ out=$(printf '%s' "$READ_PAYLOAD" | \
   env CLAUDE_PLUGIN_DATA="$TMPROOT/nonexistent" PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "missing scout binary is silent"
 assert_eq "$rc" "0" "missing scout binary exits 0"
+
+# ...and the converse: the binary found via CLAUDE_PLUGIN_ROOT alone, which is
+# where the plugin actually ships it. Same curated PATH and same dead
+# CLAUDE_PLUGIN_DATA as the case above, so the only thing that can satisfy the
+# hook is $CLAUDE_PLUGIN_ROOT/bin/scout. $TMPROOT/stub already has that layout.
+reset_stamps
+out=$(printf '%s' "$READ_PAYLOAD" | \
+  env CLAUDE_PLUGIN_ROOT="$TMPROOT/stub" CLAUDE_PLUGIN_DATA="$TMPROOT/nonexistent" \
+  PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null); rc=$?
+assert_fires "$out" "binary found via CLAUDE_PLUGIN_ROOT alone"
+assert_eq "$rc" "0" "CLAUDE_PLUGIN_ROOT resolution exits 0"
 
 reset_stamps
 out=$(printf '%s' "$READ_PAYLOAD" | env -u HOME "$HOOK" 2>/dev/null); rc=$?

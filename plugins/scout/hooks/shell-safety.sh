@@ -44,12 +44,12 @@ set -euo pipefail
 AUDIT_LOG="${HOME}/.claude/scout-shell-safety.jsonl"
 LLM_TIMEOUT_SECS=5
 
-# The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and bin/scout use. The PATH fallback is
-# load-bearing even though the plugin is the only Claude Code install: it covers
-# a CLI install (make install) and any context where CLAUDE_PLUGIN_DATA is not
-# exported — running this hook by hand, or from a test harness.
-SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
+# ── Resolve the scout binary ─────────────────────────────────────────────────
+# Payload first, then the legacy data dir, then PATH. See the fuller comment on
+# the identical block in prefer-local-llm.sh for why each entry is there and why
+# this is duplicated rather than sourced. Keep the three copies byte-identical.
+SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
+[ -x "$SCOUT_BIN" ] || SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 
 # Wrapper: use timeout/gtimeout if available, otherwise run bare (the LLM
@@ -252,38 +252,76 @@ if [ -n "$CONFIG_DENY" ]; then
 fi
 
 # ── Step 2c: Fast-path allowlist ───────────────────────────────────────────────
-# Auto-allow commands whose only expansions are known-safe read-only substitutions.
-# Conditions: (1) no bare $VAR references (unknowable values), (2) every $()
-# substitution matches the safe-patterns set. Zero LLM round-trip.
+# Auto-allow commands whose only expansions are known-safe read-only
+# substitutions. Zero LLM round-trip — and the ONLY step in this hook that
+# emits `allow`, so it is deliberately paranoid. Fail toward ask: a missed
+# auto-approve costs one permission prompt, a wrong allow is a hole.
 #
-# Safe substitution patterns: git rev-parse/describe, pwd, date, basename/dirname,
-# whoami, uname, echo. Tight list — only add patterns with zero side-effects.
-SAFE_SUB_RE='^\$\((git (rev-parse|describe)|pwd|date |basename |dirname |whoami|uname |echo )'
+# Same rigor as step 2c-bis: a SINGLE simple command built from literal words
+# and safe substitutions. Any command separator (; | & && ||), subshell,
+# backtick, real-file redirection, bare $VAR, or newline falls through to the
+# LLM (step 3). Conditions, all required:
+#   (1) no bare $VAR reference — unknowable value,
+#   (2) at least one $( — otherwise step 1 already handled it,
+#   (3) no backtick ANYWHERE — `...` is a substitution this test cannot see
+#       into, and it can ride along beside a genuinely safe $(),
+#   (4) every substitution matches SAFE_SUB_RE end to end,
+#   (5) nothing but literal words and trusted redirection left over.
+#
+# Safe substitution set: git rev-parse/describe, pwd, date, basename, dirname,
+# whoami, uname, echo — zero side effects. Tight list; only extend it with
+# verbs that read. The pattern is anchored at BOTH ends of the substitution
+# (\$\( … \)) and its argument body excludes every shell metacharacter, so no
+# payload can ride behind a safe-looking prefix:
+#   $(echo hi; curl …)         — `;` is not an argument character
+#   $(git rev-parse $(curl …)) — nor are `$` and `(`, so the outer sub never
+#                                matches and its `$(` survives into the residue
+#   $(echofoo)                 — the verb must end at a blank or `)`, so the
+#                                verb list matches whole words only
+#   $(cat x > /tmp/y)          — `>` is not an argument character either
+SAFE_SUB_RE='\$\((git[[:blank:]]+(rev-parse|describe)|pwd|date|basename|dirname|whoami|uname|echo)([[:blank:]]+[^;&|`()<>$[:space:]]+)*\)'
 
 HAS_VAR_REF=false
 printf '%s' "$COMMAND" | grep -qE '\$\{|\$[A-Za-z_]' 2>/dev/null && HAS_VAR_REF=true
 
-if [ "$HAS_VAR_REF" = false ]; then
-  # Extract all $(...) substitutions; check each against safe set
-  ALL_SUBS=$(printf '%s' "$COMMAND" | grep -oE '\$\([^)]*\)' 2>/dev/null) || ALL_SUBS=""
-  if [ -n "$ALL_SUBS" ]; then
-    UNSAFE_SUB=$(printf '%s' "$ALL_SUBS" | grep -vE "$SAFE_SUB_RE" 2>/dev/null | head -1) || UNSAFE_SUB=""
-    if [ -z "$UNSAFE_SUB" ]; then
-      _log "allow-fastpath"
-      jq -n '{
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "allow"
-        }
-      }'
-      exit 0
-    fi
+HAS_SUB=false
+case "$COMMAND" in *'$('*) HAS_SUB=true ;; esac
+
+if [ "$HAS_VAR_REF" = false ] && [ "$HAS_SUB" = true ]; then
+  FASTPATH_OK=true
+  # (3) Backtick substitution — never fast-path, at any position.
+  case "$COMMAND" in *'`'*) FASTPATH_OK=false ;; esac
+  # A newline starts a second command.
+  case "$COMMAND" in *"
+"*) FASTPATH_OK=false ;; esac
+
+  # (4)+(5) Blank out every WHOLE safe substitution, strip the only redirections
+  # we trust — fd duplications (2>&1, >&2) and /dev/null-family targets, same
+  # set as step 2c-bis — then reject if ANY control operator, parenthesis,
+  # further redirection, or leftover `$` survives. An unsafe or nested
+  # substitution cannot be blanked out, so its `$(` is exactly what trips this.
+  # Fail closed if sed errors.
+  RESIDUE=$(printf '%s' "$COMMAND" | sed -E "s#${SAFE_SUB_RE}#__SAFE_SUB__#g") || FASTPATH_OK=false
+  RESIDUE=$(printf '%s' "$RESIDUE" \
+    | sed -E 's/[0-9]?>&[0-9]//g' \
+    | sed -E 's#[0-9]?(>>?|<)[[:space:]]*/dev/(null|zero|stdout|stderr|tty|full|fd/[0-9]+)##g') || FASTPATH_OK=false
+  printf '%s' "$RESIDUE" | grep -qE '[;|&`()<>$]' 2>/dev/null && FASTPATH_OK=false
+
+  if [ "$FASTPATH_OK" = true ]; then
+    _log "allow-fastpath"
+    jq -n '{
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow"
+      }
+    }'
+    exit 0
   fi
 fi
 
 # ── Step 2c-bis: Trusted plugin-script fast-path ──────────────────────────────
 # Any plugin's own scripts under $CLAUDE_PLUGIN_ROOT/scripts (the convention
-# scout's own scripts/ensure-binary.sh follows) are vetted, version-controlled
+# scout's own scripts/session-context.sh follows) are vetted, version-controlled
 # code, and CLAUDE_PLUGIN_ROOT is set by Claude Code — not the model. Neutralize
 # that one trusted token in a copy of the command, then apply the SAME
 # expansion-safety test as step 2c. If locating a trusted script was the *only*

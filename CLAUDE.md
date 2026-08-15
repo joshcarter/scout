@@ -67,15 +67,27 @@ run them directly. All three matter when touching hooks:
   hatch, redirect text).
 - `bash tests/test-shell-safety.sh` — command classification.
 - `bash tests/test-suggest-scout.sh` — advisory extract/grep nudge hook
-  (trigger thresholds, throttle, fail-open). Fully green, and *not* subject to
-  the isolation gap below: it builds a curated PATH containing the tools the
-  hook needs but no `scout`, so the missing-binary branch is really reached.
-  Copy that approach if you ever fix the other two.
+  (trigger thresholds, throttle, fail-open).
 
-Known pre-existing failure, one in each shell suite: the `[missing binary]` case
-expects a `missing-binary` log reason but gets `endpoint-unreachable`
-(prefer-local-llm) or `parse-failure` (shell-safety). Both hooks fall back to
-`command -v scout` when the configured path is absent, so they find a real
-binary on `PATH` and never reach the missing-binary branch. Test-isolation gap,
-not a hook bug — but it means both suites sit at n-1, so check the count rather
-than assuming green.
+All three are fully green (44 + 202 + 42). They were not, for a long time, and
+the reason is worth keeping: each suite's `[missing binary]` case expected a
+`missing-binary` log reason and got `endpoint-unreachable` or `parse-failure`
+instead. This note used to call that a test-isolation gap, "not a hook bug."
+That was wrong on both counts.
+
+It *was* a hook bug — all three hooks resolved the binary from
+`$CLAUDE_PLUGIN_DATA/bin/scout`, a path nothing has ever populated, and only
+worked because `command -v scout` found a `make install` copy on `PATH`. On a
+plugin-only install every hook silently no-opped. The test was correctly
+reporting that the primary path was dead and the fallback was load-bearing; the
+"known failure" label is what kept anyone from reading it that way.
+
+The isolation gap was real too, and it is what hid the first problem: with a
+real `scout` on `PATH`, the missing-binary branch is unreachable and the
+assertion tests nothing. Every suite now builds a curated `PATH` carrying the
+tools the hook needs but no `scout`, and unsets `CLAUDE_PLUGIN_ROOT` at setup —
+without that, running a suite from inside a plugin-enabled session swaps the
+real payload binary in for the stubs and the counts quietly change.
+
+Moral, for the next one of these: a test that has been red long enough to earn a
+paragraph in this file is evidence about the code, not about the test.
