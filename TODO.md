@@ -85,3 +85,28 @@ latency case to protect. All four rationales expire with the hook.
 Docs to sweep: `README.md`, `CLAUDE.md`, `SPEC-grok-plugin.md`,
 `SPEC-dashboard.md`, `PLAN.md`, and the contrast comments in
 `hooks/prefer-local-llm.sh` explaining why that hook is the one that denies.
+
+# Make the GitHub install path work
+
+`README.md` now tells both harnesses to install from a local checkout,
+because `/plugin marketplace add joshcarter/scout` produces a payload that
+cannot run: `plugins/scout/bin/scout` is gitignored, so the fetched snapshot
+has an empty `bin/`, and both the MCP server and the hooks resolve
+`${CLAUDE_PLUGIN_ROOT}/bin/scout` to a file that is not there. The failure is
+silent from the user's side — the hooks simply stop firing, with nothing
+logged, because the script never runs.
+
+Anyone who finds scout on GitHub will try the marketplace line first, so this
+needs a real answer before the repo is useful to someone who is not building
+it. Options, roughly in order of appeal:
+
+- Publish a release with per-platform binaries and have the plugin fetch on
+  first use. Needs a bootstrap step that survives ETXTBSY (see CLAUDE.md) and
+  some notion of verifying what was downloaded.
+- Commit binaries. Simple, and wrong for an 11 MB artifact per platform.
+- Ship a `SessionStart` bootstrap that builds from source when `bin/` is empty
+  and cargo is present. Works for the developer audience scout has today, and
+  degrades to a clear error rather than silence for everyone else.
+
+Whichever way it goes, the fix should also make the empty-`bin/` case *loud*:
+a hook that cannot find its binary should say so once, not disappear.

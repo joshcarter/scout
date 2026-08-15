@@ -71,7 +71,7 @@ make build
 **Claude Code:**
 
 ```
-/plugin marketplace add joshcarter/scout
+/plugin marketplace add <path-to-checkout>
 /plugin install scout@scout
 ```
 
@@ -81,6 +81,16 @@ make build
 grok plugin marketplace add <path-to-checkout>
 grok plugin install scout --trust
 ```
+
+Both harnesses install from the local checkout — **not** from GitHub.
+`/plugin marketplace add joshcarter/scout` looks like it should work and
+does not: the payload's binary is gitignored, so a marketplace fetched
+from GitHub arrives with an empty `bin/`, and the MCP server declared as
+`${CLAUDE_PLUGIN_ROOT}/bin/scout` then points at a file that is not
+there. The hooks resolve the same path and go quiet the same way.
+Installing from a directory also makes `CLAUDE_PLUGIN_ROOT` resolve into
+this working tree, so edits to `hooks/`, `scripts/` and `skills/` take
+effect on the next session with no reinstall.
 
 The MCP server is declared as `${CLAUDE_PLUGIN_ROOT}/bin/scout`, which
 both harnesses expand to the installed payload, so it comes up on the
