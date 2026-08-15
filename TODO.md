@@ -313,6 +313,54 @@ the kind of thing that reads badly in a public repo.
 Neither log rotates, either, while `calls.jsonl` rotates at 8 MB. They get a
 row per Bash tool call, so they grow faster than the file that has a cap.
 
+# `grep` should drop content, never existence
+
+The intent filter currently decides which hits the caller learns about
+at all. That gives it the wrong kind of authority: its dangerous failure
+is the false negative — it drops the one relevant hit, the payload reads
+"nothing relevant", and the caller concludes *not there* and moves on.
+Nothing prompts an escalation, because absence of evidence looks exactly
+like evidence of absence. (This is also why a spooled raw-hit-list
+fallback, per docs/wrap-watch.md §2, buys nothing here — a fallback
+nobody is prompted to consult isn't recoverability. And unlike `wrap`,
+grep doesn't need one: a search is deterministic, fast, and side-effect
+free, so the raw is always one `--no-filter` re-run away. The missing
+piece is the *trigger*, and it has to ride in the payload itself.)
+
+Three changes, in order of importance:
+
+- **Restrict the filter's authority to quoting, not existence.** It
+  selects which hits get snippets and context; every other hit still
+  appears as a bare location, grouped compactly — `dropped: 89 in
+  tests/, 61 in vendor/, 18 in src/ (src/retry.rs:41,88,
+  src/client.rs:203, …)`. Locations are nearly free (a couple hundred
+  hits compress to a few hundred tokens without content), and a
+  mis-filter becomes *visible*: a retry-related search with
+  `src/retry.rs` sitting in the dropped pile is one Read away from
+  recovery instead of a silent wrong answer.
+
+- **Zero-kept results get a special contract.** "0 of 214 hits
+  relevant" is the maximum-damage payload and precisely the case where
+  the filter is likeliest wrong. Never return that verdict bare: when
+  kept-count is zero (or tiny relative to total), skip the confident
+  summary and return the grouped location digest instead, with an
+  explicit line — "the intent filter kept nothing; if you expected a
+  match, these are the N locations." An instruction embedded in the
+  tool result at the moment of decision is the one nudge that reliably
+  lands on the cloud model, unlike the advisory hook.
+
+- **Bias the filter prompt asymmetrically.** Drop only what it is
+  *confident* is irrelevant; keep on uncertainty. False positives cost
+  tokens; false negatives cost correctness. The current framing ("keep
+  what matches the intent") optimizes the wrong side.
+
+Touches `presets/grep.toml`, the hit-assembly side of `src/grep.rs` /
+`src/select.rs`, and the terminal contract in docs/search-cli.md (the
+CLI presumably wants the dropped-location digest on stderr, not mixed
+into the hit list). The MCP tool description should also start
+advertising the digest, so the model knows dropped-but-listed is a thing
+it can act on.
+
 # A preset override can still declare a *wrong* schema
 
 `inherit_mcp_schema` fixes the case where an override says nothing about
