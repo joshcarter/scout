@@ -11,7 +11,7 @@
 //     → loader::parse()          → Preset struct
 //     → mod::load(dir)           → Vec<Preset>  (all *.toml in one directory)
 //     → mod::load_all(user_dir)  → Vec<Preset>  (embedded built-ins + user overrides)
-//     → mod::resolve(preset, ..) → (system: String, user: String)
+//     → mod::resolve(preset, ..) → Result<(system: String, user: String)>
 //     → LLM call                 → text
 //
 // ## Built-ins vs. user overrides
@@ -180,9 +180,13 @@ pub fn load_all(user_dir: Option<&Path>) -> Vec<Preset> {
 /// 3. Substitute `{key}` in system_template and user_template.
 /// 4. Return `(system, user)`.
 ///
-/// Provider failures are soft: the failed key maps to an error message string
-/// rather than aborting the whole resolution.
-pub fn resolve(preset: &Preset, args: &Value, project: &str) -> (String, String) {
+/// Provider failures are hard.  They used to be soft — the failed key mapped to
+/// `[provider 'X' error: …]` and resolution carried on — and the failure mode
+/// was worse than the failure it papered over: a git timeout became prompt
+/// text, the model produced a confident review *of an error message*, and the
+/// ledger recorded a successful call.  A missing diff is not context; it is a
+/// reason not to make the call at all.
+pub fn resolve(preset: &Preset, args: &Value, project: &str) -> Result<(String, String), String> {
     let mut context_map: HashMap<String, String> = HashMap::new();
 
     for def in &preset.context {
@@ -213,10 +217,12 @@ pub fn resolve(preset: &Preset, args: &Value, project: &str) -> (String, String)
             project_root: project,
         };
 
-        let output = run_provider(&def.provider, &provider_args).unwrap_or_else(|e| {
-            eprintln!("scout: provider '{}' error for key '{}': {e}", def.provider, def.key);
-            format!("[provider '{}' error: {e}]", def.provider)
-        });
+        let output = run_provider(&def.provider, &provider_args).map_err(|e| {
+            format!(
+                "preset '{}': context '{}' (provider '{}') failed: {e}",
+                preset.name, def.key, def.provider
+            )
+        })?;
         context_map.insert(def.key.clone(), output);
     }
 
@@ -230,5 +236,5 @@ pub fn resolve(preset: &Preset, args: &Value, project: &str) -> (String, String)
     //   with context keys if Pass 2 ran first.
     let user_with_context = template::substitute_context(&preset.user_template, &context_map);
     let user = template::substitute_args(&user_with_context, args);
-    (system, user)
+    Ok((system, user))
 }

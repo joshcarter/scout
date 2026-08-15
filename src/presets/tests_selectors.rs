@@ -76,7 +76,7 @@ fn extract_renders_injected_args() {
         "chunk_of": 1,
         "chunk_total": 1,
     });
-    let (_system, user) = resolve(&preset, &args, ".");
+    let (_system, user) = resolve(&preset, &args, ".").unwrap();
 
     assert!(user.contains("where is the retry loop?"), "question missing: {user}");
     assert!(user.contains("internal/ec/repair.go"), "file missing: {user}");
@@ -92,7 +92,7 @@ fn extract_chunk_markers_default_when_unchunked() {
     // must keep the prompt readable rather than emitting an empty slot.
     let preset = parse_builtin("extract", EXTRACT_TOML);
     let args = json!({"file": "a.rs", "question": "q", "numbered_content": "x", "file_lines": 300});
-    let (_system, user) = resolve(&preset, &args, ".");
+    let (_system, user) = resolve(&preset, &args, ".").unwrap();
     assert!(user.contains("Chunk 1 of 1"), "user: {user}");
 }
 
@@ -159,7 +159,7 @@ fn grep_renders_injected_args() {
         "hits_considered": 57,
         "max_hits": 4,
     });
-    let (_system, user) = resolve(&preset, &args, ".");
+    let (_system, user) = resolve(&preset, &args, ".").unwrap();
 
     assert!(user.contains("call sites that ignore the error return"), "intent missing: {user}");
     assert!(user.contains("WritePack"), "pattern missing: {user}");
@@ -172,6 +172,6 @@ fn grep_renders_injected_args() {
 fn grep_max_hits_defaults_when_caller_omits_it() {
     let preset = parse_builtin("grep", GREP_TOML);
     let args = json!({"pattern": "x", "intent": "y", "hit_list": "[1] a.rs:1\n", "hits_considered": 20});
-    let (_system, user) = resolve(&preset, &args, ".");
+    let (_system, user) = resolve(&preset, &args, ".").unwrap();
     assert!(user.contains("Keep at most 10 hits"), "user: {user}");
 }

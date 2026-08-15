@@ -471,7 +471,9 @@ fn truncate_why(why: &str) -> String {
 pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String, String> {
     let client = ctx.require_client()?;
     let preset = ctx.preset(preset_name)?;
-    let (system, user) = presets::resolve(preset, args, &ctx.project);
+    // Before `ctx.record`, deliberately: a context provider that failed means
+    // there is no call to log, and no half-built prompt to send.
+    let (system, user) = presets::resolve(preset, args, &ctx.project)?;
 
     let messages = vec![
         serde_json::json!({"role": "system", "content": system}),

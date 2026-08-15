@@ -167,7 +167,16 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
             .unwrap_or_else(|_| ".".to_string())
     });
 
-    let (system, user) = presets::resolve(preset, &args_value, &project);
+    // A context provider that failed (no staged diff, a `git` timeout, an
+    // unreadable prompt file) is a reason to stop, not a string to paste into
+    // the prompt and review.  Exit before the call rather than after it.
+    let (system, user) = match presets::resolve(preset, &args_value, &project) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("scout run: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // The preset name is the operation here — `shell_safety` is what a human
     // reading the log is looking for, not "run".  `via` distinguishes a hook

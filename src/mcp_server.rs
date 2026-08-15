@@ -18,6 +18,7 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -30,7 +31,7 @@ use serde_json::Value;
 
 use crate::client::LlmClient;
 use crate::presets::Preset;
-use crate::select::{Ctx, ToolResult};
+use crate::select::{Ctx, ToolError, ToolResult};
 
 const INSTRUCTIONS: &str = "scout offloads small problems to a local LLM so they never consume \
 cloud-model context. Prefer its tools for classifying build/test output and targeted file/search \
@@ -190,10 +191,10 @@ impl ServerHandler for Scout {
         }
 
         let this = self.clone();
+        let tool = name.clone();
         // The filters block on subprocesses and HTTP; keep them off the reactor.
-        let result = tokio::task::spawn_blocking(move || this.dispatch(&name, args))
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("scout: tool task failed: {e}"), None))?;
+        let result =
+            bounded_dispatch(move || this.dispatch(&name, args), DISPATCH_TIMEOUT, &tool).await?;
 
         Ok(match result {
             Ok(payload) => CallToolResult::success(vec![ContentBlock::text(compact(&payload))]),
@@ -203,6 +204,53 @@ impl ServerHandler for Scout {
             Err(e) => CallToolResult::error(vec![ContentBlock::text(e.text())]),
         }
         .into())
+    }
+}
+
+/// Last-resort ceiling on one MCP tool call.
+///
+/// Every deadline that actually belongs to the work lives inside `dispatch` —
+/// `check_output`'s wall clock, the HTTP client's timeout, the git providers'.
+/// This one exists for the path that misses all of them: without it a single
+/// wedged call leaves the calling agent blocked on a tool response that will
+/// never arrive, and nothing anywhere says so.
+///
+/// It has to sit *above* `check_output`'s own ceiling (`MAX_TIMEOUT_SECS`,
+/// 3600 s) plus the classify round-trip that follows it, or an hour-long build
+/// would be pre-empted here instead of reporting its own timeout — which is the
+/// one outcome worse than no backstop, because the build's diagnosis is the
+/// useful answer and this layer's is not.  Ten minutes of margin is far more
+/// than that tail needs, and costs nothing: in normal operation this never
+/// fires.
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(3600 + 600);
+
+/// Run a blocking tool body on the blocking pool under `limit`.
+///
+/// On timeout the blocking task is *not* cancelled: `spawn_blocking` cannot
+/// interrupt a thread mid-syscall, and dropping the handle only detaches it.
+/// So a wedged call keeps one blocking-pool thread for as long as it stays
+/// wedged, and still writes its ledger row if it ever finishes — what the bound
+/// buys is that the *caller* gets an answer instead of waiting forever.  The
+/// pool is finite (512 threads by default), so repeated wedges would eventually
+/// queue new calls rather than run them; that is the reason this is a backstop
+/// for a bug rather than a substitute for the deadlines inside `dispatch`.
+async fn bounded_dispatch<F>(job: F, limit: Duration, tool: &str) -> Result<ToolResult, ErrorData>
+where
+    F: FnOnce() -> ToolResult + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(job);
+    match tokio::time::timeout(limit, handle).await {
+        Ok(joined) => joined
+            .map_err(|e| ErrorData::internal_error(format!("scout: tool task failed: {e}"), None)),
+        // Fail open, as everywhere else here: a tool-level error naming what to
+        // do instead, not a protocol error the agent cannot route around.
+        Err(_) => Ok(Err(ToolError::new(
+            format!(
+                "scout: {tool} passed the {}s server deadline without returning and was abandoned",
+                limit.as_secs()
+            ),
+            "the underlying tool directly",
+        ))),
     }
 }
 
@@ -270,6 +318,49 @@ mod tests {
     fn unknown_tool_is_a_fail_open_error_not_a_panic() {
         let err = server().dispatch("nope", serde_json::json!({})).unwrap_err();
         assert!(err.text().contains("unknown tool"), "{}", err.text());
+    }
+
+    // ── the dispatch backstop ─────────────────────────────────────────────
+
+    #[test]
+    fn a_wedged_tool_call_is_bounded_instead_of_hanging_forever() {
+        // Exercised with a millisecond bound rather than DISPATCH_TIMEOUT: the
+        // real ceiling is deliberately an hour-plus, and what is under test is
+        // the shape of the answer, not the number.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt.block_on(bounded_dispatch(
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(serde_json::json!({"never": "seen"}))
+            },
+            Duration::from_millis(50),
+            "check_output",
+        ));
+        let err = out.expect("a deadline is a tool-level error, not a protocol one").unwrap_err();
+        assert!(err.text().contains("deadline"), "{}", err.text());
+        assert!(err.text().contains("fall back to"), "no named fallback: {}", err.text());
+    }
+
+    #[test]
+    fn a_prompt_tool_call_passes_through_the_bound_untouched() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt.block_on(bounded_dispatch(
+            || Ok(serde_json::json!({"ok": true})),
+            Duration::from_secs(5),
+            "ping",
+        ));
+        assert_eq!(out.unwrap().unwrap()["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn the_backstop_sits_above_check_outputs_own_ceiling() {
+        // The one way this backstop could do harm: pre-empting a legitimate
+        // hour-long build before it reports its own, far more useful, timeout.
+        // 3600 is `check_output::MAX_TIMEOUT_SECS`, private to that module.
+        assert!(
+            DISPATCH_TIMEOUT > Duration::from_secs(3600),
+            "the MCP bound would pre-empt check_output's own ceiling: {DISPATCH_TIMEOUT:?}"
+        );
     }
 
     #[test]
