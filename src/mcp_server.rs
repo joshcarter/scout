@@ -30,7 +30,11 @@ use rmcp::{schemars, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde_json::Value;
 
 use crate::client::LlmClient;
-use crate::presets::Preset;
+// `MCP_PRESETS` — the presets advertised as tools, the other five being
+// CLI-only — lives in `presets` rather than here: the preset overlay needs the
+// same list to decide whose `input_schema` is load-bearing (see
+// `presets::inherit_mcp_schema`), and two copies of it would drift.
+use crate::presets::{Preset, MCP_PRESETS};
 use crate::select::{Ctx, ToolError, ToolResult};
 
 const INSTRUCTIONS: &str = "scout offloads small problems to a local LLM so they never consume \
@@ -85,7 +89,7 @@ impl Scout {
                 tools.push(Tool::new(
                     Cow::Owned(p.name.clone()),
                     Cow::Owned(p.description.clone()),
-                    Arc::new(schema_object(&p.input_schema)),
+                    Arc::new(schema_object(p.input_schema())),
                 ));
             }
         }
@@ -132,10 +136,6 @@ impl Scout {
         result
     }
 }
-
-/// Presets exposed as MCP tools.  The other three (`shell_safety`,
-/// `quality_review`, `test_review`) are CLI-only by design.
-const MCP_PRESETS: &[&str] = &["check_output", "extract", "grep"];
 
 /// The MCP server's notion of "the project": the directory Claude Code
 /// launched it in.

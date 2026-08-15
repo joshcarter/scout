@@ -31,7 +31,7 @@ fn extract_toml_parses() {
 #[test]
 fn extract_input_schema_advertises_only_caller_args() {
     let preset = parse_builtin("extract", EXTRACT_TOML);
-    let required: Vec<&str> = preset.input_schema["required"]
+    let required: Vec<&str> = preset.input_schema()["required"]
         .as_array()
         .expect("required array")
         .iter()
@@ -39,7 +39,7 @@ fn extract_input_schema_advertises_only_caller_args() {
         .collect();
     assert_eq!(required, vec!["file", "question"]);
 
-    let props = preset.input_schema["properties"].as_object().expect("properties object");
+    let props = preset.input_schema()["properties"].as_object().expect("properties object");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, vec!["file", "max_lines", "question"]);
@@ -111,7 +111,7 @@ fn grep_toml_parses() {
 #[test]
 fn grep_input_schema_advertises_only_caller_args() {
     let preset = parse_builtin("grep", GREP_TOML);
-    let required: Vec<&str> = preset.input_schema["required"]
+    let required: Vec<&str> = preset.input_schema()["required"]
         .as_array()
         .expect("required array")
         .iter()
@@ -119,7 +119,7 @@ fn grep_input_schema_advertises_only_caller_args() {
         .collect();
     assert_eq!(required, vec!["pattern", "intent"]);
 
-    let props = preset.input_schema["properties"].as_object().expect("properties object");
+    let props = preset.input_schema()["properties"].as_object().expect("properties object");
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(

@@ -56,6 +56,16 @@ impl Sandbox {
         path
     }
 
+    /// Seed a user preset override into this sandbox's `$SCOUT_PRESET_DIR`.
+    ///
+    /// The directory is otherwise empty on purpose (see `scout()` below), so a
+    /// test that calls this is deliberately putting the overlay in play.
+    pub fn write_preset(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.dir.path().join("presets").join(name);
+        std::fs::write(&path, contents).expect("preset override");
+        path
+    }
+
     /// A `scout` invocation pinned to this sandbox.
     ///
     /// `CARGO_BIN_EXE_scout` is the binary cargo just built for this test run,

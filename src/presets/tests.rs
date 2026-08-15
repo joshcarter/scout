@@ -56,7 +56,7 @@ fn quality_review_toml_parses() {
 #[test]
 fn quality_review_input_schema_requires_both_args() {
     let preset = parse_builtin("quality_review", QUALITY_REVIEW_TOML);
-    let required = preset.input_schema["required"].as_array().expect("required array");
+    let required = preset.input_schema()["required"].as_array().expect("required array");
     assert!(required.iter().any(|v| v.as_str() == Some("git_diff_range")), "should require git_diff_range");
     assert!(required.iter().any(|v| v.as_str() == Some("prompt_file")), "should require prompt_file");
 }
@@ -101,7 +101,7 @@ fn test_review_toml_parses() {
 #[test]
 fn test_review_input_schema_requires_both_args() {
     let preset = parse_builtin("test_review", TEST_REVIEW_TOML);
-    let required = preset.input_schema["required"].as_array().expect("required array");
+    let required = preset.input_schema()["required"].as_array().expect("required array");
     assert!(required.iter().any(|v| v.as_str() == Some("git_diff_range")), "should require git_diff_range");
     assert!(required.iter().any(|v| v.as_str() == Some("prompt_file")), "should require prompt_file");
 }
@@ -125,7 +125,7 @@ fn check_output_toml_parses_with_no_context() {
     let preset = parse_builtin("check_output", CHECK_OUTPUT_TOML);
     assert_eq!(preset.name, "check_output");
     assert!(preset.context.is_empty(), "check_output takes args only, no context providers");
-    let required = preset.input_schema["required"].as_array().expect("required array");
+    let required = preset.input_schema()["required"].as_array().expect("required array");
     assert!(required.iter().any(|v| v.as_str() == Some("command")));
 }
 
@@ -159,7 +159,7 @@ fn shell_safety_toml_parses_with_no_context() {
     let preset = parse_builtin("shell_safety", SHELL_SAFETY_TOML);
     assert_eq!(preset.name, "shell_safety");
     assert!(preset.context.is_empty(), "shell_safety takes args only, no context providers");
-    let required = preset.input_schema["required"].as_array().expect("required array");
+    let required = preset.input_schema()["required"].as_array().expect("required array");
     assert!(required.iter().any(|v| v.as_str() == Some("command")));
 }
 
@@ -215,6 +215,176 @@ description = "USER OVERRIDE"
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// ── override schema inheritance ──────────────────────────────────────────────
+//
+// The seam these pin: the overlay is whole-struct replace by name, and the
+// `input_schema` of an MCP-advertised preset is the one field that must not be
+// replaced by accident.  The argument contract lives in `mcp_server::dispatch`'s
+// routing into `grep::run`, not in the TOML, so a user who only meant to reword
+// a prompt used to publish a `grep` tool with no arguments — advertised,
+// callable, and certain to answer "'pattern' argument is required."
+
+/// A user preset directory holding one file.
+fn preset_dir_with(file: &str, body: &str) -> std::path::PathBuf {
+    let tmp = tempfile_dir();
+    std::fs::write(tmp.join(file), body).unwrap();
+    tmp
+}
+
+fn find<'a>(presets: &'a [Preset], name: &str) -> &'a Preset {
+    presets.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("{name} missing"))
+}
+
+#[test]
+fn override_without_a_schema_inherits_the_builtin_schema() {
+    let tmp = preset_dir_with(
+        "grep.toml",
+        r#"
+system = "overridden"
+user   = "overridden"
+[preset]
+name = "grep"
+description = "USER OVERRIDE"
+"#,
+    );
+    let presets = load_all(Some(&tmp));
+    let grep = find(&presets, "grep");
+
+    // The rest of the override still wins outright — this is not a merge.
+    assert_eq!(grep.description, "USER OVERRIDE");
+    assert_eq!(grep.system_template, "overridden");
+
+    let required: Vec<&str> =
+        grep.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(
+        required,
+        vec!["pattern", "intent"],
+        "an override silent about the interface must keep the built-in's, since \
+         grep::run demands these arguments regardless of what the TOML says"
+    );
+    assert!(
+        grep.input_schema()["properties"].as_object().is_some_and(|p| p.contains_key("pattern")),
+        "inherited schema lost its properties: {}",
+        grep.input_schema()
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn override_declaring_an_empty_schema_gets_an_empty_schema() {
+    // The other side of the distinction: someone who writes the section out has
+    // stated an interface, however unusable, and scout does not second-guess it.
+    // This is why "absent" and "present but empty" have to stay distinguishable
+    // all the way to the overlay.
+    let tmp = preset_dir_with(
+        "grep.toml",
+        r#"
+system = "overridden"
+user   = "overridden"
+[preset]
+name = "grep"
+description = "USER OVERRIDE"
+
+[preset.input_schema]
+type       = "object"
+properties = {}
+required   = []
+"#,
+    );
+    let presets = load_all(Some(&tmp));
+    let grep = find(&presets, "grep");
+    assert!(
+        grep.input_schema()["properties"].as_object().expect("properties object").is_empty(),
+        "a deliberately empty schema must survive: {}",
+        grep.input_schema()
+    );
+    assert!(grep.input_schema()["required"].as_array().expect("required array").is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn override_with_its_own_schema_is_used_as_written() {
+    let tmp = preset_dir_with(
+        "grep.toml",
+        r#"
+system = "overridden"
+user   = "overridden"
+[preset]
+name = "grep"
+description = "USER OVERRIDE"
+
+[preset.input_schema]
+type     = "object"
+required = ["needle"]
+
+[preset.input_schema.properties.needle]
+type        = "string"
+description = "What to look for."
+"#,
+    );
+    let presets = load_all(Some(&tmp));
+    let grep = find(&presets, "grep");
+    let required: Vec<&str> =
+        grep.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(required, vec!["needle"], "a declared schema is the user's to get wrong");
+    let props = grep.input_schema()["properties"].as_object().expect("properties object");
+    assert!(props.contains_key("needle"));
+    assert!(!props.contains_key("pattern"), "nothing should be merged back in");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn builtin_schemas_are_unchanged_with_no_override_in_play() {
+    let presets = load_all(None);
+    for (name, required) in
+        [("check_output", vec!["command"]), ("extract", vec!["file", "question"]), ("grep", vec!["pattern", "intent"])]
+    {
+        let p = find(&presets, name);
+        let got: Vec<&str> =
+            p.input_schema()["required"].as_array().expect("required array").iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(got, required, "{name}: built-in schema drifted");
+    }
+}
+
+#[test]
+fn a_non_mcp_override_without_a_schema_is_left_alone() {
+    // `quality_review` is CLI-only: nothing reads its schema, so there is
+    // nothing to protect and no reason to warn.  Pinned so the narrower rule is
+    // a decision rather than an accident.
+    let tmp = preset_dir_with(
+        "quality_review.toml",
+        r#"
+system = "overridden"
+user   = "overridden"
+[preset]
+name = "quality_review"
+description = "USER OVERRIDE"
+"#,
+    );
+    let presets = load_all(Some(&tmp));
+    let qr = find(&presets, "quality_review");
+    assert!(qr.declared_input_schema.is_none(), "no inheritance for a preset scout never advertises");
+    assert!(qr.input_schema()["properties"].as_object().expect("properties object").is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn a_brand_new_preset_shadowing_nothing_keeps_its_empty_default() {
+    let tmp = preset_dir_with(
+        "explain.toml",
+        r#"
+system = "sys"
+user   = "usr"
+[preset]
+name = "explain"
+description = "Not a builtin."
+"#,
+    );
+    let presets = load_all(Some(&tmp));
+    assert!(find(&presets, "explain").declared_input_schema.is_none());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn load_all_user_preset_adds_new_name_alongside_builtins() {
     let tmp = tempfile_dir();
@@ -247,7 +417,7 @@ fn make_preset(system_template: &str, user_template: &str, context: Vec<ContextD
     Preset {
         name: "test".into(),
         description: "test preset".into(),
-        input_schema: json!({"type":"object"}),
+        declared_input_schema: Some(json!({"type":"object"})),
         system_template: system_template.into(),
         user_template: user_template.into(),
         context,

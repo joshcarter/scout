@@ -16,7 +16,9 @@
 // name        = "quality_review"
 // description = "Route the Quality Pedant reviewer through the local LLM."
 //
-// # input_schema is optional; defaults to an empty object schema.
+// # input_schema is optional; defaults to an empty object schema — except in a
+// # user override of a preset scout advertises over MCP, where omitting it keeps
+// # the built-in's schema (see `presets::load_all`).
 // [preset.input_schema]
 // type     = "object"
 // required = []
@@ -33,7 +35,7 @@
 use super::providers::provider_known;
 use super::Preset;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 
 // ── Serde structs (mirroring the TOML schema) ─────────────────────────────────
@@ -51,16 +53,21 @@ struct PresetFile {
 struct PresetMeta {
     name: String,
     description: String,
-    /// JSON Schema for the tool's input parameters.  Defaults to `{"type":"object"}`.
-    #[serde(default = "default_input_schema")]
-    input_schema: Value,
+    /// JSON Schema for the tool's input parameters, exactly as the file declared
+    /// it — `None` when the file has no `[preset.input_schema]` section at all.
+    ///
+    /// It stays an `Option` rather than defaulting to an empty object schema
+    /// here because the overlay in `presets::load_all` has to tell "the author
+    /// said nothing about the interface" from "the author declared an interface
+    /// with no arguments".  Under the old `#[serde(default = …)]` the two were
+    /// the same `Value` by the time anything could act on them, and a user
+    /// override that only meant to reword a prompt silently replaced the
+    /// built-in MCP tool schema with an empty one.
+    #[serde(default)]
+    input_schema: Option<Value>,
     /// Caller-side verify kind.  `"build"` triggers apply-diff + build check + one repair retry.
     #[serde(default)]
     verify: Option<String>,
-}
-
-fn default_input_schema() -> Value {
-    json!({"type": "object", "properties": {}, "required": []})
 }
 
 /// A single `[context.<key>]` section.
@@ -108,7 +115,7 @@ pub fn parse(source: &str) -> Result<Preset, String> {
     Ok(Preset {
         name: file.preset.name,
         description: file.preset.description,
-        input_schema: file.preset.input_schema,
+        declared_input_schema: file.preset.input_schema,
         system_template: file.system,
         user_template: file.user,
         context: context_defs,
@@ -172,14 +179,49 @@ _args    = ["${args.path}"]
     #[test]
     fn parse_defaults_input_schema_to_empty_object() {
         let preset = parse(MINIMAL_TOML).expect("parse failed");
-        assert_eq!(preset.input_schema["type"], "object");
+        assert_eq!(preset.input_schema()["type"], "object");
+    }
+
+    #[test]
+    fn parse_records_that_a_missing_section_was_never_declared() {
+        // The distinction the overlay depends on: a file with no
+        // `[preset.input_schema]` reads back as `None`, not as the empty
+        // object schema `input_schema()` hands out in its place.
+        let preset = parse(MINIMAL_TOML).expect("parse failed");
+        assert!(
+            preset.declared_input_schema.is_none(),
+            "a file with no [preset.input_schema] must not look like one that declared a schema"
+        );
+    }
+
+    #[test]
+    fn parse_records_a_deliberately_empty_schema_as_declared() {
+        // The other half: someone who writes the section out — even with
+        // nothing in it — has stated an interface, and nothing downstream may
+        // second-guess it.
+        let toml = r#"
+system = "sys"
+user   = "usr"
+
+[preset]
+name = "nullary"
+description = "Takes no arguments, and says so."
+
+[preset.input_schema]
+type       = "object"
+properties = {}
+required   = []
+"#;
+        let preset = parse(toml).expect("parse failed");
+        assert!(preset.declared_input_schema.is_some(), "an explicit empty schema is still a declaration");
+        assert!(preset.input_schema()["properties"].as_object().unwrap().is_empty());
     }
 
     #[test]
     fn parse_custom_input_schema() {
         let preset = parse(WITH_SCHEMA_TOML).expect("parse failed");
-        assert_eq!(preset.input_schema["type"], "object");
-        let required = preset.input_schema["required"].as_array().unwrap();
+        assert_eq!(preset.input_schema()["type"], "object");
+        let required = preset.input_schema()["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("path")));
     }
 

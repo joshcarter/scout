@@ -304,6 +304,56 @@ fn each_tools_required_args_match_what_its_handler_reads() {
 }
 
 #[test]
+fn a_user_override_that_omits_its_schema_still_advertises_a_usable_tool() {
+    // The bug this closes, end to end and through the real binary: the overlay
+    // in `presets::load_all` is whole-struct replace by name, so a `grep.toml`
+    // dropped into `$XDG_CONFIG_HOME/scout/presets/` to reword the prompt used
+    // to replace the built-in schema with `{"properties":{},"required":[]}`.
+    // The tool stayed advertised, the model called it with nothing, and
+    // `grep::run` answered "'pattern' argument is required" — with nothing
+    // logged and nothing warned.
+    let sandbox = Sandbox::new();
+    sandbox.write_preset(
+        "grep.toml",
+        r#"
+system = "You are a grep filter. Answer tersely."
+user   = "Pattern: ${args.pattern}\nIntent: ${args.intent}\n"
+
+[preset]
+name = "grep"
+description = "A user's own wording for the grep tool, changing nothing about its arguments."
+"#,
+    );
+
+    let mut server = McpServer::spawn(&sandbox);
+    handshake(&mut server);
+
+    let result = server.request(2, "tools/list", json!({}));
+    let tools = result["tools"].as_array().expect("tools array");
+    let grep = tools.iter().find(|t| t["name"] == "grep").expect("grep not advertised");
+
+    // The override still wins where it spoke.
+    assert!(
+        grep["description"].as_str().is_some_and(|d| d.starts_with("A user's own wording")),
+        "the override's description should be advertised: {grep}"
+    );
+
+    // …and the built-in schema survives where it did not.
+    let schema = &grep["inputSchema"];
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("grep: no required list: {schema}"))
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(required, vec!["pattern", "intent"], "schema-less override wiped the argument contract: {schema}");
+    assert!(
+        schema["properties"].as_object().is_some_and(|p| p.contains_key("pattern")),
+        "grep advertised without a pattern property: {schema}"
+    );
+}
+
+#[test]
 fn the_server_shuts_down_when_its_stdin_closes() {
     // The stdio transport's only shutdown signal. If this regresses, every
     // Claude Code session leaks a scout process on exit — which is invisible

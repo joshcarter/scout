@@ -402,7 +402,7 @@ fn bare_preset(name: &str) -> Preset {
     Preset {
         name: name.to_string(),
         description: String::new(),
-        input_schema: json!({}),
+        declared_input_schema: Some(json!({})),
         system_template: "you are a test".into(),
         user_template: "answer the test".into(),
         context: Vec::new(),

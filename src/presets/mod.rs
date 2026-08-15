@@ -22,11 +22,17 @@
 // top: a user preset whose `[preset].name` matches a built-in shadows it;
 // anything else is added alongside the built-ins.
 //
+// The shadowing is whole-struct, not a per-field merge, with one carve-out:
+// an override of an MCP-advertised preset that says nothing about
+// `[preset.input_schema]` keeps the built-in's — see `inherit_mcp_schema`.
+//
 // ## Preset struct fields
 //
 //   name            — unique identifier (e.g. "quality_review")
 //   description     — shown in MCP tools/list
-//   input_schema    — JSON Schema for the MCP tool's input parameters
+//   declared_input_schema
+//                   — JSON Schema for the MCP tool's input parameters, as the
+//                     TOML wrote it; read via `input_schema()`
 //   system_template — system prompt; `{key}` slots filled by context providers
 //   user_template   — user message; same substitution
 //   context         — ordered list of providers to run before filling templates
@@ -48,14 +54,18 @@ use std::path::Path;
 
 /// A parsed, validated preset ready for resolution.
 ///
-/// `description` and `input_schema` are what the MCP server advertises in
+/// `description` and `input_schema()` are what the MCP server advertises in
 /// `tools/list` (see `mcp_server.rs`): editing a preset TOML changes what the
 /// calling model is told about the tool, with no code change.
 #[derive(Debug, Clone)]
 pub struct Preset {
     pub name: String,
     pub description: String,
-    pub input_schema: Value,
+    /// The schema exactly as the TOML declared it, or `None` if the file had no
+    /// `[preset.input_schema]` section.  Read it through `input_schema()`
+    /// unless you specifically care whether the author said anything — which
+    /// only `load_all`'s overlay does.
+    pub declared_input_schema: Option<Value>,
     pub system_template: String,
     pub user_template: String,
     pub context: Vec<ContextDef>,
@@ -66,6 +76,20 @@ pub struct Preset {
     /// TOML-schema forward compatibility with user-authored presets.
     #[allow(dead_code)]
     pub verify: Option<String>,
+}
+
+impl Preset {
+    /// The JSON Schema to advertise for this preset: what the TOML declared, or
+    /// an argument-free object schema for a preset that declared nothing.
+    ///
+    /// The empty default is a `OnceLock` rather than a fresh `json!` per call so
+    /// this can hand back a borrow; the value is a constant either way.
+    pub fn input_schema(&self) -> &Value {
+        static EMPTY: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        self.declared_input_schema
+            .as_ref()
+            .unwrap_or_else(|| EMPTY.get_or_init(|| serde_json::json!({"type": "object", "properties": {}, "required": []})))
+    }
 }
 
 /// One `[context.<key>]` section from a preset TOML file.
@@ -150,6 +174,15 @@ pub fn load(dir: &Path) -> Vec<Preset> {
     presets
 }
 
+/// Presets exposed as MCP tools.  The other five (`shell_safety`,
+/// `quality_review`, `test_review`, `find_patterns`, `find_reflect`) are
+/// CLI-only by design.
+///
+/// It lives here rather than in `mcp_server.rs`, where it started, because the
+/// overlay below needs it: whether a preset is advertised to a model is what
+/// decides whether its schema is load-bearing.
+pub const MCP_PRESETS: &[&str] = &["check_output", "extract", "grep"];
+
 /// Load the embedded built-in presets, then overlay any user presets found
 /// in `user_dir` (if given and it exists) — a user preset whose
 /// `[preset].name` matches a built-in shadows it; anything else is added.
@@ -162,7 +195,10 @@ pub fn load_all(user_dir: Option<&Path>) -> Vec<Preset> {
     }
     if let Some(dir) = user_dir {
         if dir.exists() {
-            for p in load(dir) {
+            for mut p in load(dir) {
+                if let Some(shadowed) = by_name.get(&p.name) {
+                    inherit_mcp_schema(&mut p, shadowed);
+                }
                 by_name.insert(p.name.clone(), p);
             }
         }
@@ -170,6 +206,55 @@ pub fn load_all(user_dir: Option<&Path>) -> Vec<Preset> {
     let mut presets: Vec<Preset> = by_name.into_values().collect();
     presets.sort_by(|a, b| a.name.cmp(&b.name));
     presets
+}
+
+/// A user override of an MCP-advertised preset that declares no
+/// `[preset.input_schema]` keeps the built-in's schema, and says so on stderr.
+///
+/// The overlay is whole-struct replace by name, which is right for every other
+/// field — a user rewriting a prompt means to replace the prompt entirely. The
+/// schema is the exception, because it is not really the preset's to state: the
+/// argument contract is `mcp_server::dispatch`'s hardcoded routing into
+/// `grep::run` and friends, and that code still demands `pattern` no matter what
+/// the TOML claims. So the built-in schema is the truth, and a user who was only
+/// rewording a description would otherwise silently publish a tool with no
+/// arguments — advertised, callable, and guaranteed to answer "'pattern'
+/// argument is required."
+///
+/// Rejected alternatives:
+///   - Substituting at the publish site in `mcp_server::tools()` when the
+///     properties come back empty.  That is a heuristic at the wrong layer: it
+///     cannot tell an accident from a preset that genuinely takes no arguments,
+///     and it would silently rewrite the latter.
+///   - Dropping the tool from `tools/list`, or refusing the override outright.
+///     Both trade a silent wrong schema for a silently missing tool, which is
+///     the worse failure: the user still expects `grep` to exist.
+///
+/// Non-MCP presets are deliberately left alone. Nothing reads their schema —
+/// `scout run --preset` passes args straight through without consulting it — so
+/// inheriting one would change no behavior, and warning about it would be noise
+/// on a field that does not matter for those presets.
+///
+/// `shadowed` is whatever this override displaces — the built-in in every real
+/// case, or an earlier user file if two of them claim the same name.
+fn inherit_mcp_schema(user: &mut Preset, shadowed: &Preset) {
+    if user.declared_input_schema.is_some() || !MCP_PRESETS.contains(&user.name.as_str()) {
+        return;
+    }
+    let Some(schema) = shadowed.declared_input_schema.clone() else {
+        return;
+    };
+    // Once per process: `load_all` runs once per `scout` invocation, and for the
+    // MCP server that is once at startup.  stderr, not fatal — the same shape as
+    // every other preset-loading complaint above, because a usable tool with a
+    // reworded prompt is a better outcome than a dead one.
+    eprintln!(
+        "scout: preset override '{}' declares no [preset.input_schema]; keeping the built-in \
+         tool schema, since it is advertised over MCP and its arguments are fixed in code. \
+         Write an explicit [preset.input_schema] to override it.",
+        user.name
+    );
+    user.declared_input_schema = Some(schema);
 }
 
 /// Load the preset set scout uses everywhere: the 8 embedded built-ins,
