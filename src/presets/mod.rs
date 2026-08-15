@@ -61,9 +61,8 @@ pub struct Preset {
     pub context: Vec<ContextDef>,
     /// Caller-side verify kind.  `Some("build")` means the caller should run a
     /// build check after applying the LLM output and retry once on failure.
-    /// `None` means no automatic verify (free-text output). None of the 6
-    /// presets scout keeps set this, and the place→build→restore→retry loop it
-    /// drove did not come across from ct (PLAN §1) — the field is carried for
+    /// `None` means no automatic verify (free-text output). No built-in preset
+    /// sets this and scout runs no such loop — the field is carried purely for
     /// TOML-schema forward compatibility with user-authored presets.
     #[allow(dead_code)]
     pub verify: Option<String>,
@@ -85,9 +84,9 @@ pub struct ContextDef {
 // ── Built-in presets (embedded at compile time) ─────────────────────────────
 
 /// The 8 built-in presets, embedded so a binary-only install always has
-/// them. Order matches PLAN.md §1's kept-preset table, plus `find_patterns`
-/// and `find_reflect` (SPEC-cli §5), which back `scout find`'s two model
-/// stages and are deliberately CLI-only.
+/// them. The last two, `find_patterns` and `find_reflect`
+/// (docs/search-cli.md §5), back `scout find`'s two model stages and are
+/// deliberately CLI-only.
 const BUILTIN_TOML: &[&str] = &[
     include_str!("../../presets/check_output.toml"),
     include_str!("../../presets/shell_safety.toml"),

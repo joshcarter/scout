@@ -7,11 +7,11 @@
 #   - The binary now lives in the payload at ${CLAUDE_PLUGIN_ROOT}/bin/scout,
 #     put there by `make build`, and the MCP server is declared against that
 #     path directly. Nothing has to be copied before the server can spawn, so
-#     the first-session spawn failure is gone. See SPEC-grok-plugin.md §3.2.
+#     the first-session spawn failure is gone. See docs/plugin-packaging.md §3.2.
 #   - Config seeding moved into the binary (src/config.rs), because a hook is
 #     the one place it could not run: not for `make install` users, not for
 #     `cargo install` users, and not at all under Grok, which never executes
-#     plugin hooks (SPEC-grok-plugin.md §2.5).
+#     plugin hooks (docs/plugin-packaging.md §2.5).
 #
 # What is left is Claude-only by nature: additionalContext reaches no other
 # harness. The same guidance ships to Grok as skills/scout/SKILL.md.

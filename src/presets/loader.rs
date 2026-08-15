@@ -216,9 +216,9 @@ system = "sys"
 user   = "usr"
 [preset]
 name = "bad"
-description = "Tries to use a ct provider."
+description = "Tries to use a provider outside the allowlist."
 [context.x]
-provider = "ct_splice"
+provider = "daemon_lookup"
 "#;
         let err = parse(toml).unwrap_err();
         assert!(err.contains("unknown or blocked"), "expected 'unknown or blocked' in: {err}");

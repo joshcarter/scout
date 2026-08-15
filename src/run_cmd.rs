@@ -175,7 +175,7 @@ pub(crate) fn run_subcommand(raw_args: &[String]) -> ! {
     // `$SCOUT_VIA` (hooks/shell-safety.sh sets it).
     let prompt_bytes = (system.len() + user.len()) as u64;
     // One record for the whole invocation so `call.start` and the log line
-    // share an `id` (SPEC-dashboard P3). The old closure reminted on every
+    // share an `id` (docs/dashboard.md P3). The old closure reminted on every
     // arm and would have broken reconciliation.
     let mut rec = crate::stats::CallRecord::new(&preset_name, &preset_name)
         .via(&crate::stats::via_from_env(crate::stats::VIA_RUN))

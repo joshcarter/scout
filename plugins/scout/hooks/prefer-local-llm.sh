@@ -30,7 +30,7 @@
 #
 # Not intercepted: cargo add, cargo fmt, go fmt, go mod, npm install, etc.
 #
-# Matching is two-stage (see SPEC-command-matching.md):
+# Matching is two-stage (see docs/command-matching.md):
 #
 #   Stage 1 — an unanchored grep for any verb's leading word. Runs on every
 #     Bash call, so it stays to one grep; it over-matches deliberately and has
@@ -65,12 +65,9 @@
 #      standalone plugin or not. Before emitting deny, we verify the scout
 #      binary exists AND its local-LLM endpoint responds to a quick ping.
 #      Missing binary or unreachable endpoint → log the reason, exit 0, let
-#      the raw command run. (Ported fix for a known ct issue: "hard-denies
-#      builds with no fallback when the ct MCP server is down" — the
-#      reachability-check option from that writeup, adapted from an MCP-
-#      server-liveness check to a scout-binary/local-LLM-endpoint check,
-#      since scout bundles both in one binary rather than depending on an
-#      external always-on daemon.)
+#      the raw command run. This is the whole reason the reachability check
+#      exists: a redirect hook that denies is only safe if it can first prove
+#      the thing it redirects to is alive.
 #
 # Ordering: this hook emits deny; shell-safety.sh emits allow at most.
 # Claude Code applies deny > ask > allow, so ordering between the two doesn't

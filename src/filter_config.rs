@@ -44,12 +44,10 @@
 // port = 13001
 // ```
 //
-// Deviation from ct: ct nested these under `[plugins.local-llm.extract]` /
-// `[plugins.local-llm.grep]` because the file was shared with ct's own
-// settings.  scout owns its config file outright (PLAN §5, clean break), so
-// the tables sit at the top level.  Unknown keys are ignored, and a missing
-// or malformed file silently yields the defaults — a broken config must not
-// break a read-side filter.
+// scout owns its config file outright, so the tables sit at the top level
+// rather than nested under a plugin namespace.  Unknown keys are ignored,
+// and a missing or malformed file silently yields the defaults — a broken
+// config must not break a read-side filter.
 
 /// Tunables for `extract`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +75,7 @@ impl Default for ExtractConfig {
 }
 
 /// Tunables for `grep` — both the LLM rerank stage and the filesystem search
-/// underneath it (scout runs its own search; ct delegated to the daemon).
+/// underneath it — scout runs the search itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrepConfig {
     /// Hit lists at or below this size skip the LLM entirely.
@@ -110,12 +108,12 @@ impl Default for GrepConfig {
     }
 }
 
-/// Terminal-only tunables (`[cli]`, SPEC-cli §7).
+/// Terminal-only tunables (`[cli]`, docs/search-cli.md §7).
 ///
 /// These exist purely for the CLI renderer — the MCP server never reads them,
 /// so nothing here can change what Claude sees.  That is also why `max_hits`
 /// differs from `grep`'s wire default of 10: a human at a terminal wants a
-/// fuller list, and the cap is a ceiling rather than a quota (SPEC §9).
+/// fuller list, and the cap is a ceiling rather than a quota (docs/search-cli.md §9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliConfig {
     /// `auto` | `always` | `never`.  Kept as a string here and validated by
@@ -127,7 +125,7 @@ pub struct CliConfig {
     pub context: Option<usize>,
     /// Default result cap for terminal invocations.
     pub max_hits: usize,
-    /// Per-line render cap in bytes (`-M`, SPEC-cli §4).  `0` is unlimited —
+    /// Per-line render cap in bytes (`-M`, docs/search-cli.md §4).  `0` is unlimited —
     /// a real choice here, unlike the budget knobs, so zero is accepted.
     pub max_columns: usize,
 }
@@ -138,9 +136,9 @@ impl Default for CliConfig {
     }
 }
 
-/// Tunables for `find` — the intent-only search (SPEC-cli §5, §7).
+/// Tunables for `find` — the intent-only search (docs/search-cli.md §5, §7).
 ///
-/// CLI-only, like `[cli]`: `find` is deliberately not an MCP tool (SPEC §9
+/// CLI-only, like `[cli]`: `find` is deliberately not an MCP tool (docs/search-cli.md §9
 /// defers it until the pattern-synthesis preset proves out), so nothing here
 /// can change what Claude sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,15 +177,14 @@ impl Default for FindConfig {
     }
 }
 
-/// Tunables for `scout dashboard` (SPEC-dashboard §5).
+/// Tunables for `scout dashboard` (docs/dashboard.md §5).
 ///
 /// Only the port, deliberately.  The bind *address* is 127.0.0.1 and is not
-/// configurable at all — ct has `CT_WEB_BIND`, but scout's payloads carry file
-/// contents from every repo the user works in, so there is no other address
-/// worth supporting and no knob to get wrong.
+/// configurable at all: scout's payloads carry file contents from every repo
+/// the user works in, so there is no other address worth supporting and no
+/// knob to get wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardConfig {
-    /// Alongside ct's 13000.
     pub port: u16,
 }
 
@@ -261,7 +258,7 @@ pub fn parse_cli_overrides(toml_text: &str) -> CliConfig {
         }
     }
     set_usize(&mut cli.max_hits, t, "max_hits");
-    // `max_columns = 0` means "no cap" (SPEC-cli §7), so this one accepts zero
+    // `max_columns = 0` means "no cap" (docs/search-cli.md §7), so this one accepts zero
     // for the same reason `context` does.
     if let Some(v) = t.get("max_columns").and_then(toml::Value::as_integer) {
         if v >= 0 {
@@ -426,12 +423,12 @@ context_lines = 4
         assert_eq!(c.color, "auto");
         assert_eq!(c.context, None, "unset means: fall back to [grep] context_lines");
         assert_eq!(c.max_hits, 20, "terminal default, not grep's wire default of 10");
-        assert_eq!(c.max_columns, 150, "SPEC-cli §9 fixed the per-line cap at 150");
+        assert_eq!(c.max_columns, 150, "docs/search-cli.md §9 fixed the per-line cap at 150");
     }
 
     #[test]
     fn max_columns_accepts_zero_as_unlimited() {
-        // Unlike the budget knobs, 0 is a real setting here (SPEC §7) — it is
+        // Unlike the budget knobs, 0 is a real setting here (docs/search-cli.md §7) — it is
         // how a user turns the cap off for good rather than typing -M 0 daily.
         assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 0\n").max_columns, 0);
         assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 400\n").max_columns, 400);
@@ -530,7 +527,7 @@ context_lines = 4
 
     #[test]
     fn dashboard_defaults_and_overrides() {
-        assert_eq!(DashboardConfig::default().port, 13001, "alongside ct's 13000");
+        assert_eq!(DashboardConfig::default().port, 13001);
         assert_eq!(parse_dashboard_overrides("[dashboard]\nport = 8080\n").port, 8080);
     }
 

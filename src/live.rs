@@ -1,4 +1,4 @@
-//! The ephemeral live channel (SPEC-dashboard §2.5, P3).
+//! The ephemeral live channel (docs/dashboard.md §2, P3).
 //!
 //! Short-lived scout processes send `call.start` / `call.end` over a
 //! non-blocking unix datagram. The dashboard daemon is the only listener.
@@ -196,7 +196,7 @@ pub fn is_listening() -> bool {
 
 // ── call.token (P5) ─────────────────────────────────────────────────────────
 
-/// Coalescing window for `call.token` (SPEC-dashboard §2.5).
+/// Coalescing window for `call.token` (docs/dashboard.md §2).
 ///
 /// ~1 content delta per token was measured (§5.5); one datagram per delta is
 /// 86 syscalls for a short reply where a 50 ms timer is ~40, and a browser
@@ -302,7 +302,7 @@ fn emit_token(id: &str, op: &str, index: u64, text: &str) {
     emit_bytes(&fit_event(ev));
 }
 
-/// `find.*` — one round's internals (SPEC-dashboard §2.5, P4).
+/// `find.*` — one round's internals (docs/dashboard.md §2, P4).
 ///
 /// `kind` is the bare suffix (`patterns`, `hits`, `rerank`, `reflect`) and
 /// `fields` is merged over the envelope, so the shape of a round lives in

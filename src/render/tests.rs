@@ -94,7 +94,7 @@ fn rerank_hit_renders_header_why_and_gutter() {
 
 #[test]
 fn score_is_never_shown() {
-    // SPEC §9: the score orders hits and stays in the payload, but a human
+    // docs/search-cli.md §9: the score orders hits and stays in the payload, but a human
     // reading grep output does not want to see it.  The exact-output test
     // above pins the rest; this pins the intent.
     let mut payload = rerank_payload();
@@ -200,7 +200,7 @@ fn coloured_output_uses_the_ack_palette() {
     assert_eq!(out.matches("\x1b[2m").count(), 5, "{out:?}");
 }
 
-// ── Match highlighting (SPEC-cli §2) ─────────────────────────────────
+// ── Match highlighting (docs/search-cli.md §2) ─────────────────────────────────
 
 /// A one-line hit whose match sits at `[col, col_end)`.
 fn span_payload(text: &str, col: usize, col_end: usize) -> Value {
@@ -292,7 +292,7 @@ fn only_the_matched_line_of_a_block_is_highlighted() {
     assert_eq!(out.matches("\x1b[1;31m").count(), 1, "neighbours are not matches:\n{out:?}");
 }
 
-// ── Column cap: windowing (SPEC-cli §4) ──────────────────────────────
+// ── Column cap: windowing (docs/search-cli.md §4) ──────────────────────────────
 
 fn capped(n: usize) -> RenderOpts {
     RenderOpts { max_columns: n, ..plain() }
@@ -367,7 +367,7 @@ fn max_columns_zero_is_unlimited() {
 #[test]
 fn an_over_long_context_line_is_cut_at_the_cap_rather_than_windowed() {
     // Neighbours have no match to centre on, so they show their head — the
-    // only part whose position a reader can reason about (SPEC §4).
+    // only part whose position a reader can reason about (docs/search-cli.md §4).
     let payload = json!({
         "mode": "full", "hits": [{
             "file": "a.rs", "line": 2, "text": "short",
@@ -524,7 +524,7 @@ fn vimgrep_keeps_a_hit_whose_matched_line_was_cut() {
     assert_eq!(render_vimgrep(&payload), "min.json:1:1: (matched line unavailable)\n");
 }
 
-// ── Numbering (SPEC-cli §6, `scout edit`'s picker) ───────────────────
+// ── Numbering (docs/search-cli.md §6, `scout edit`'s picker) ───────────────────
 
 /// `n` hits in distinct files, enough to exercise the index width.  All on
 /// line 1, so the block arithmetic stays out of the way of what is under test.

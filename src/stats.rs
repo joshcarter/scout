@@ -1,10 +1,9 @@
 // Call log: write path (used by every LLM-calling command) and the `scout
-// stats` report (read path). Merges ct-local-llm's stats.rs (writer) with
-// cmd/ct's local_stats.rs (reader) into one module.
+// stats` report (read path), in one module.
 //
 // One JSONL line per LLM round-trip, appended by every scout process — there
 // is no daemon, so the log is the only thing every entry point shares
-// (SPEC-dashboard §1).  The record is `v: 2` (§3): everything past the
+// (docs/dashboard.md §1).  The record is `v: 2` (§3): everything past the
 // original six fields is optional, so a v1 line still parses, and `ts` is the
 // one non-additive change — it is a float now, and readers must take both.
 
@@ -48,7 +47,7 @@ pub fn log_path() -> Option<PathBuf> {
 /// scout processes to collide.
 ///
 /// Deliberately *not* the grouping key for a user-facing operation — `scout
-/// mcp` is one process for a whole Claude Code session (SPEC-dashboard §1), so
+/// mcp` is one process for a whole agent session (docs/dashboard.md §1), so
 /// a whole session shares one `run`.  That is `op`; see `Ledger`.
 pub fn run_id() -> &'static str {
     static RUN: OnceLock<String> = OnceLock::new();
@@ -214,7 +213,7 @@ pub struct CallRecord {
     pub preset: String,
     /// Minted at construction, not at write time: `call.start` has to carry
     /// the same `id` the log line will, or the daemon cannot reconcile the
-    /// two arrivals (SPEC-dashboard P3).
+    /// two arrivals (docs/dashboard.md P3).
     pub id: String,
     /// The user-facing operation this row belongs to — the grouping key the
     /// dashboard reads.  A record built on its own is its own operation; a
@@ -404,7 +403,7 @@ impl CallRecord {
 /// one `grep`.  So it mints the `op` id every row it parks carries, and the
 /// dashboard groups on ground truth rather than guessing from timestamps.
 /// `run` cannot do this job — `scout mcp` is one process, and one `run`, for a
-/// whole Claude Code session (SPEC-dashboard §1).
+/// whole agent session (docs/dashboard.md §1).
 ///
 /// The log's unit is one LLM call, but two of §3's fields are not: `raw_bytes`
 /// is known before the *first* call of an operation and `returned_bytes` only

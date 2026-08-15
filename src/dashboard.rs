@@ -1,5 +1,5 @@
 // The dashboard: a detached daemon that tails the call log and serves it over
-// loopback HTTP (SPEC-dashboard §4–§5).
+// loopback HTTP (docs/dashboard.md §4–§5).
 //
 // scout has no long-lived process — every entry point is a short-lived
 // invocation — so there is no in-process state to serve.  The one thing every
@@ -689,9 +689,8 @@ fn unix_secs(t: SystemTime) -> u64 {
 /// reclaimed immediately after a restart instead of waiting out `TIME_WAIT`.
 ///
 /// The address is `127.0.0.1` and there is no override — not a flag, not an
-/// env var.  ct has `CT_WEB_BIND`; scout's payloads carry file contents from
-/// every repo the user works in, so there is no other bind address worth
-/// supporting.
+/// env var.  scout's payloads carry file contents from every repo the user
+/// works in, so there is no other bind address worth supporting.
 #[cfg(unix)]
 fn bind_tcp_reuse(port: u16) -> std::io::Result<TcpListener> {
     use std::os::unix::io::FromRawFd;
@@ -1030,8 +1029,8 @@ fn handle_stream(state: &Arc<State>, mut stream: TcpStream) {
 
 /// One connection: request line, discard headers, route, close.
 ///
-/// `HTTP/1.0 Connection: close` throughout, exactly as ct does — everything
-/// here is a GET of a small body, and there is no state to mutate.
+/// `HTTP/1.0 Connection: close` throughout — everything here is a GET of a
+/// small body, and there is no state to mutate.
 fn handle(state: &Arc<State>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut request_line = String::new();

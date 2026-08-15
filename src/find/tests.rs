@@ -530,7 +530,7 @@ fn the_union_is_order_independent() {
 
 #[test]
 fn a_thin_but_nonzero_result_does_not_retry() {
-    // SPEC §9: retry only when *all* patterns whiff.  One surviving hit is
+    // docs/search-cli.md §9: retry only when *all* patterns whiff.  One surviving hit is
     // answerable by the rerank stage, and a second LLM round is expensive.
     let kept = vec![vec![raw("a.rs", 1)]];
     assert!(!union_hits(kept).is_empty(), "a non-empty union goes straight to the rerank");
@@ -683,7 +683,7 @@ fn the_sketch_walk_respects_gitignore_hidden_files_and_the_callers_filters() {
 
 // ── Fail-open contract ───────────────────────────────────────────────
 
-/// Every failure must name an explicit `scout grep` as the way out (SPEC §5).
+/// Every failure must name an explicit `scout grep` as the way out (docs/search-cli.md §5).
 fn assert_fails_open(err: &crate::select::ToolError) -> String {
     let text = err.text();
     assert!(text.contains("scout grep"), "fallback must be named, got: {text}");
@@ -723,7 +723,7 @@ fn a_bad_filter_arg_fails_open() {
     assert!(text.contains("invalid file type"), "text: {text}");
 }
 
-// ── Live-channel payloads (SPEC-dashboard §2.5, P4) ──────────────────
+// ── Live-channel payloads (docs/dashboard.md §2, P4) ──────────────────
 //
 // The events are pure functions of values the round already computed, so they
 // test without a socket or a model.  What matters is that each one says the

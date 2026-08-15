@@ -1,9 +1,8 @@
 //! Tests for `grep`: hit parsing, bypass path, rerank payload shape, and the
 //! fail-open contract.
 //!
-//! Ported from ct's `local_grep/tests.rs`.  `grep_response` (a `ct::Response`
-//! fixture) became a `source::SearchResults` fixture, and the fail-open tests
-//! call `run` directly instead of going through ct's MCP request loop.
+//! Hits come from a `source::SearchResults` fixture, and the fail-open tests
+//! call `run` directly rather than going through the MCP request loop.
 
 use super::*;
 use crate::select::Ctx;
@@ -113,7 +112,7 @@ fn parse_hits_on_an_empty_result_is_empty() {
     assert!(parse_hits(&SearchResults::default(), CTX).is_empty());
 }
 
-// ── Match columns (SPEC-cli §4) ──────────────────────────────────────
+// ── Match columns (docs/search-cli.md §4) ──────────────────────────────────────
 
 #[test]
 fn parse_hits_carries_the_match_column_through() {
@@ -379,7 +378,7 @@ fn no_intent_under_the_cap_reports_no_truncation() {
     assert_eq!(hint, "no intent given — unfiltered search, no filtering applied");
 }
 
-// ── Type/glob filters (SPEC-cli §3) ──────────────────────────────────
+// ── Type/glob filters (docs/search-cli.md §3) ──────────────────────────────────
 
 /// A mixed tree plus an offline ctx rooted at it.
 fn filter_tree() -> tempfile::TempDir {

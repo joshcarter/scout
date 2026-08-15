@@ -45,7 +45,7 @@ matching, so the warning fires only on real substitution. Optionally
 also validate `[llm] model` against `/v1/models` at config load.
 
 Worth carrying the observed model into the call log too, since
-`SPEC-dashboard.md` §3 already records a `model` field per call — it
+`docs/dashboard.md` §3 already records a `model` field per call — it
 should be the model that ran, not the one requested.
 
 # Decide whether the shell-safety hook still earns its place
@@ -82,8 +82,8 @@ hook firing per Bash call, the dashboard's `hook traffic` filter defaults to
 off to keep its volume out of the way, and `src/live.rs` cites it as the
 latency case to protect. All four rationales expire with the hook.
 
-Docs to sweep: `README.md`, `CLAUDE.md`, `SPEC-grok-plugin.md`,
-`SPEC-dashboard.md`, `PLAN.md`, and the contrast comments in
+Docs to sweep: `README.md`, `CLAUDE.md`, `docs/plugin-packaging.md`,
+`docs/dashboard.md`, `docs/command-matching.md`, and the contrast comments in
 `hooks/prefer-local-llm.sh` explaining why that hook is the one that denies.
 
 # Make the GitHub install path work

@@ -88,7 +88,7 @@ description = "Treat the pattern as a regex. Defaults to false."
 type        = "integer"
 description = "Hits to return after filtering. Defaults to 10."
 
-# Search-narrowing filters (SPEC-cli §3). All optional and additive: omitting
+# Search-narrowing filters (docs/search-cli.md §3). All optional and additive: omitting
 # them searches exactly the tree scout has always searched.
 [preset.input_schema.properties.types]
 type        = "array"

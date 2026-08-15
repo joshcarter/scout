@@ -4,7 +4,7 @@
 // `check_output`, `extract`, `grep`.  Short names on purpose: Claude Code
 // prefixes them with the server namespace on its own, so what the model sees is
 // `mcp__plugin_<plugin>_<server>__check_output`.  Nothing on this side should
-// hardcode that qualified form (PLAN §3) — it is derived from names this code
+// hardcode that qualified form (see CLAUDE.md) — it is derived from names this code
 // never reads, and the model resolves it via `ToolSearch` anyway.
 //
 // `ServerHandler` is implemented by hand rather than via `#[tool_router]` /
@@ -105,7 +105,7 @@ impl Scout {
             presets: &self.presets,
             project: project_root(),
             // This is the one entry point Claude reaches on its own, which is
-            // exactly what `via` is for (SPEC-dashboard §3).
+            // exactly what `via` is for (docs/dashboard.md §3).
             via: crate::stats::VIA_MCP,
             tool: tool.to_string(),
             // Silence is mandatory here: stdout is the JSON-RPC transport.
@@ -133,7 +133,7 @@ impl Scout {
 }
 
 /// Presets exposed as MCP tools.  The other three (`shell_safety`,
-/// `quality_review`, `test_review`) are CLI-only by design (PLAN §1).
+/// `quality_review`, `test_review`) are CLI-only by design.
 const MCP_PRESETS: &[&str] = &["check_output", "extract", "grep"];
 
 /// The MCP server's notion of "the project": the directory Claude Code

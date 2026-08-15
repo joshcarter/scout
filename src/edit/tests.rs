@@ -1,4 +1,4 @@
-//! Unit tests for `scout edit`'s pure half (SPEC-cli §6).
+//! Unit tests for `scout edit`'s pure half (docs/search-cli.md §6).
 //!
 //! Everything here is a pure function: the arity rule, the per-editor
 //! invocation table, the picker's input grammar, `$EDITOR` word splitting and
@@ -293,7 +293,7 @@ fn all_opens_each_file_once_in_first_seen_order() {
 
 #[test]
 fn the_quickfix_list_is_exactly_format_vimgrep() {
-    // SPEC §9: `--format vimgrep` exists *because* it is the formatter this
+    // docs/search-cli.md §9: `--format vimgrep` exists *because* it is the formatter this
     // path needs.  Reusing it is what keeps `scout edit`'s list and
     // `scout grep --format vimgrep | vim -q -` navigating identically.
     let payload = json!({"hits": [

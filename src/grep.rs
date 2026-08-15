@@ -17,11 +17,9 @@
 //!   be mistaken for "the pattern had no matches".
 //! * Every failure path returns a `ToolError` naming the raw Grep tool.
 //!
-//! Ported from ct's `local_grep.rs`.  The one rewiring: ct ran the daemon's
-//! grep engine over the socket and `parse_hits` unpacked a `ct::Response`;
-//! scout searches the filesystem and `parse_hits` unpacks the plain
-//! `source::SearchResults` struct.  Everything downstream — batching, id
-//! validation, materialization, the payload shapes — is unchanged.
+//! The search itself is scout's own (`source::search`); `parse_hits` unpacks
+//! the resulting `source::SearchResults` and everything downstream — batching,
+//! id validation, materialization, the payload shapes — works off that.
 
 use serde_json::Value;
 
@@ -48,7 +46,7 @@ pub struct RawHit {
     /// never another line's text mislabeled as the match).
     pub text: Option<String>,
     /// 0-based byte offset of the first match within the matched line **as it
-    /// exists in the file**, and one past its end (SPEC-cli §4).
+    /// exists in the file**, and one past its end (docs/search-cli.md §4).
     ///
     /// Deliberately *not* clamped to `text`.  `text` can be a prefix — the
     /// context block's byte budget is measured from the block's start, so a
@@ -128,7 +126,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
 /// The rerank stage: bypass a short list, cap what the model sees, then ask it
 /// which hits serve the intent, one call per batch.
 ///
-/// Split out of `run` so `find` can reuse it *verbatim* (SPEC-cli §5 step 3:
+/// Split out of `run` so `find` can reuse it *verbatim* (docs/search-cli.md §5 step 3:
 /// "the existing stage, unchanged").  `find`'s union list is noisier than a
 /// single-pattern list, which is precisely what this stage exists for — so it
 /// gets the same bypass threshold, the same `max_considered` / `batch_size`
@@ -149,7 +147,7 @@ pub fn rerank(
     search_truncated: bool,
 ) -> ToolResult {
     let hits_total = hits.len();
-    // The pre-rerank hit list is what scout digested here (SPEC-dashboard §3).
+    // The pre-rerank hit list is what scout digested here (docs/dashboard.md §3).
     ctx.ledger.raw_bytes(hit_list_bytes(hits));
 
     // ── 3. Bypass: nothing for the model to filter ───────────────────
@@ -170,10 +168,10 @@ pub fn rerank(
 
     // ── 5. Rerank, one call per batch ────────────────────────────────
     //
-    // Batches run sequentially, matching ct.  Hit ids are global and 1-based,
+    // Batches run sequentially.  Hit ids are global and 1-based,
     // so merging the score lists is a concatenation.
     // The rerank takes seconds; silence at a terminal looks like a hang.  This
-    // is a no-op unless the caller installed a progress sink (SPEC-cli §2) —
+    // is a no-op unless the caller installed a progress sink (docs/search-cli.md §2) —
     // the MCP server never does, because stdout is its transport.
     ctx.note(&format!(
         "filtering {} hits with {}…",
@@ -313,7 +311,7 @@ fn string_list(args: &Value, key: &str) -> Vec<String> {
 
 /// Serialize raw hits verbatim — the shared body of both `mode: "full"` paths.
 ///
-/// `col`/`col_end` are additive (SPEC-cli §4): every field that was here before
+/// `col`/`col_end` are additive (docs/search-cli.md §4): every field that was here before
 /// is still here, byte for byte, so an MCP caller reading the frozen payload
 /// shape sees exactly what it saw before, plus two keys it can ignore.
 fn raw_hit_values(hits: &[RawHit]) -> Vec<Value> {
@@ -432,7 +430,7 @@ pub fn rerank_payload(
 ///
 /// The header carries a `(code)` / `(comment)` tag for the *matched* line, from
 /// `line_kind` — a cheap lexical hint that lets the selector prompt prefer a
-/// definition over a comment that merely names one (SPEC-cli P6/C).  It lives
+/// definition over a comment that merely names one.  It lives
 /// **only in this string**: the JSON payload and the MCP contract never see it,
 /// so the frozen shapes stay byte-identical.  A hit whose matched line was lost
 /// to the context budget (`text: None`) is rendered untagged rather than
@@ -509,9 +507,9 @@ fn materialize(hit: &RawHit, keep: &SelectedHit) -> Value {
 
 /// Convert the search layer's results into `RawHit`s.
 ///
-/// ct's version took a `ct::Response` and dug through `data.hits`; the plain
-/// struct makes the same journey trivial, but the matched-line recovery below
-/// is unchanged because the context block is rendered the same way.
+/// The mapping is mechanical; the matched-line recovery below is the only part
+/// with any judgement in it, because the context block may have cut the matched
+/// line away.
 pub fn parse_hits(results: &SearchResults, context_lines: usize) -> Vec<RawHit> {
     results
         .hits

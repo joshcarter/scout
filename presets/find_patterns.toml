@@ -1,4 +1,4 @@
-# find_patterns preset — pattern synthesis for `scout find` (SPEC-cli §5)
+# find_patterns preset — pattern synthesis for `scout find` (docs/search-cli.md §5)
 #
 # The model never searches.  It is shown the caller's question plus a paths-only
 # sketch of the project tree, and it replies with 3–8 candidate grep patterns.
@@ -8,11 +8,11 @@
 #
 # Args (scout-injected): question, tree, max_patterns, failed.
 # `failed` is empty on the first round; on a retry it names the patterns that
-# produced nothing, so round 2 does not re-guess round 1 (SPEC §5 step 4).
+# produced nothing, so round 2 does not re-guess round 1 (docs/search-cli.md §5 step 4).
 # No context providers — scout builds the tree sketch itself, respecting
 # .gitignore and the caller's own -t/-g filters.
 #
-# CLI-only: `find` is not exposed over MCP (SPEC §9), so this preset is absent
+# CLI-only: `find` is not exposed over MCP (docs/search-cli.md §9), so this preset is absent
 # from `MCP_PRESETS` in mcp_server.rs and its input_schema is documentation
 # rather than a tool contract.
 #

@@ -399,7 +399,7 @@ if [ -n "$VAR_NAMES" ]; then
 ${RESOLVED}"
 fi
 
-# Identify this traffic as a hook's in scout's call log (SPEC-dashboard §3
+# Identify this traffic as a hook's in scout's call log (docs/dashboard.md §3
 # `via`): `scout run` is reached both from a shell and from here, and only the
 # caller knows which. Exported rather than prefixed onto the command, because
 # _timeout is a shell function and an assignment prefix on one does not

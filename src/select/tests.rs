@@ -3,9 +3,8 @@
 //! These are the tests that keep hallucinated selectors out of the caller's
 //! context: every case here is a reply a local model has plausibly produced.
 //!
-//! Ported from ct's `local_select/tests.rs`.  The two envelope tests changed
-//! shape: ct asserted on a JSON-RPC result object, scout asserts on
-//! `ToolError` (the MCP envelope now belongs to rmcp).
+//! The two envelope tests assert on `ToolError` rather than on a wire object:
+//! the MCP envelope belongs to rmcp, not to this layer.
 
 use super::*;
 use serde_json::json;

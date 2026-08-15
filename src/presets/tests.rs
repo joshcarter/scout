@@ -159,8 +159,8 @@ fn load_builtins_returns_exactly_eight_presets() {
             "shell_safety",
             "test_review"
         ],
-        "the 6 kept presets from PLAN.md §1 plus find_patterns and find_reflect \
-         (SPEC-cli §5) must all be embedded and parse"
+        "the 6 general presets plus find_patterns and find_reflect \
+         (docs/search-cli.md §5) must all be embedded and parse"
     );
 }
 

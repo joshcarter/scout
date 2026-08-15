@@ -4,12 +4,10 @@
 // file and returns the result as a string.  Preset TOML files reference
 // providers by name in their `[context.<key>]` sections.
 //
-// Pruned from ct-local-llm's provider set (PLAN.md §2, §8): scout has no
-// `CodeSource` trait and no ct daemon to call out to, so the `ct_*`
-// allowlisted-subcommand family is gone entirely, along with `dir_listing`
-// (unused by any preset scout keeps). What's left is `file_read` and the
-// `git_*` providers — all of them read-only, ct-free subprocess/filesystem
-// calls.
+// The set is deliberately small: `file_read` and the `git_*` providers, all of
+// them read-only subprocess or filesystem calls with no daemon and no code
+// index behind them. A provider name that is not in the allowlist is an error,
+// not a passthrough.
 //
 // ## Adding a new provider
 //
@@ -192,18 +190,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_known_ct_providers_are_gone() {
-        // scout has no ct daemon to call out to — any ct_* provider name is
-        // unknown, same as a typo.
-        assert!(!provider_known("ct_lookup"));
-        assert!(!provider_known("ct_splice"));
-        assert!(!provider_known("ct_remember"));
-    }
-
-    #[test]
-    fn provider_known_dir_listing_is_gone() {
-        // Pruned along with the ct_* family — unused by any kept preset.
+    fn provider_known_rejects_names_outside_the_allowlist() {
+        // The allowlist is the whole contract: anything not in it is an error,
+        // whether it is a typo or a provider some other tool happens to offer.
         assert!(!provider_known("dir_listing"));
+        assert!(!provider_known("daemon_lookup"));
+        assert!(!provider_known("shell"));
     }
 
     #[test]

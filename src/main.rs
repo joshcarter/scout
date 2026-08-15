@@ -24,7 +24,7 @@ use client::LlmClient;
 use serde_json::json;
 use std::io::IsTerminal;
 
-/// How `scout grep` writes its results (SPEC-cli §1).
+/// How `scout grep` writes its results (docs/search-cli.md §1).
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 enum Format {
     /// ack-style text: `path:line`, the model's note, a gutter-numbered
@@ -77,7 +77,7 @@ impl ColorWhen {
 ///
 /// Its presence is also what switches `run_filter` onto grep's exit-code
 /// convention and installs the stderr progress sink; `extract` and `check`
-/// pass `None` and keep their current JSON-and-exit-1 behavior (SPEC-cli §1
+/// pass `None` and keep their current JSON-and-exit-1 behavior (docs/search-cli.md §1
 /// defers them to a later phase).
 struct GrepOutput {
     format: Format,
@@ -199,9 +199,9 @@ enum Command {
     Dashboard(dashboard::Args),
 }
 
-/// The flags every search verb shares: what to search (SPEC-cli §3) and how to
+/// The flags every search verb shares: what to search (docs/search-cli.md §3) and how to
 /// style it (§1–2).  Flattened into all three so the dialect can never drift
-/// between them — SPEC §5 requires `find`'s filter flags to be *identical* to
+/// between them — docs/search-cli.md §5 requires `find`'s filter flags to be *identical* to
 /// grep's, and one struct is the only way to keep that true.
 ///
 /// `--format` is deliberately *not* here.  `grep` and `find` declare it
@@ -248,7 +248,7 @@ struct SearchFlags {
 }
 
 /// `scout grep`'s flags.  Boxed into its own `Args` struct rather than an
-/// inline variant: the filter set (SPEC-cli §3) makes it far larger than any
+/// inline variant: the filter set (docs/search-cli.md §3) makes it far larger than any
 /// sibling, and `run_grep` wants to pass it around as one value.
 #[derive(clap::Args)]
 struct GrepArgs {
@@ -301,7 +301,7 @@ struct FindArgs {
 }
 
 /// `scout edit`'s flags: the two search verbs' positionals, plus their
-/// verb-specific extras, and no `--format` (SPEC-cli §6).
+/// verb-specific extras, and no `--format` (docs/search-cli.md §6).
 ///
 /// Both positionals are optional at the clap level and the arity rule lives in
 /// `edit::dispatch`; see that function for why.
@@ -370,7 +370,7 @@ fn load_presets() -> Vec<presets::Preset> {
 
 /// Handle the three filter verbs (`grep`, `extract`, `check`).
 ///
-/// Thin wrapper over exactly the code path the MCP tools use (PLAN §3): same
+/// Thin wrapper over exactly the code path the MCP tools use: same
 /// `Ctx`, same handlers, same payloads — only the argument parsing and the
 /// rendering differ.  Config is loaded leniently, so the bypass paths (small
 /// file, short hit list) still work with no `config.toml` at all; when the
@@ -400,7 +400,7 @@ fn run_grep(a: GrepArgs) -> ! {
     args["regex"] = json!(a.regex);
 
     // `--no-filter` needs no argument of its own: an absent intent already
-    // means "no rerank" (SPEC-cli §9), and clap's `conflicts_with` makes
+    // means "no rerank" (docs/search-cli.md §9), and clap's `conflicts_with` makes
     // `--no-filter` with an intent an error rather than a silent no-op — so
     // by the time we get here, `--no-filter` and "no intent" are the same
     // state and the pipeline sees exactly one code path.
@@ -410,7 +410,7 @@ fn run_grep(a: GrepArgs) -> ! {
 /// Resolve `scout find`'s flags and hand off to `run_filter`.
 ///
 /// Everything about the output side is grep's — same renderer, same status
-/// lines, same exit codes (SPEC-cli §5) — so the only find-specific work here
+/// lines, same exit codes (docs/search-cli.md §5) — so the only find-specific work here
 /// is the question and the attempt budget.
 fn run_find(a: FindArgs) -> ! {
     let (mut args, out, project) = resolve_flags(a.flags, a.format);
@@ -420,7 +420,7 @@ fn run_find(a: FindArgs) -> ! {
 }
 
 /// Run whichever pipeline `scout edit`'s positionals selected, then hand the
-/// result to the picker (SPEC-cli §6).
+/// result to the picker (docs/search-cli.md §6).
 ///
 /// The two checks that can fail without searching anything — the arity rule and
 /// `$EDITOR` — run first, deliberately: a rerank takes seconds, and finding out
@@ -508,7 +508,7 @@ fn resolve_flags(
 }
 
 /// Fold `-g`, `--dir` and `--exclude-dir` into the single glob list the search
-/// layer takes.  The directory flags are pure sugar (SPEC-cli §3): `--dir X`
+/// layer takes.  The directory flags are pure sugar (docs/search-cli.md §3): `--dir X`
 /// is `-g 'X/**'`, `--exclude-dir X` is `-g '!X/**'`.  Explicit `-g` globs come
 /// first so the ordering a user typed is preserved among themselves; `ignore`
 /// resolves conflicts by last-match-wins, so a later `--exclude-dir` beats an
@@ -575,7 +575,7 @@ fn run_pipeline(
         _ => check_output::run(&ctx, args),
     };
     // The payload's size is half the context-saved metric, and this is the
-    // first point that has it (SPEC-dashboard §3).
+    // first point that has it (docs/dashboard.md §3).
     match &result {
         Ok(payload) => ctx.ledger.finish(payload),
         Err(e) => ctx.ledger.fail(&e.text()),
@@ -614,7 +614,7 @@ fn pretty_json(payload: &serde_json::Value) -> String {
     serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
 }
 
-/// Write `grep`'s payload out and exit with the grep convention (SPEC-cli §1):
+/// Write `grep`'s payload out and exit with the grep convention (docs/search-cli.md §1):
 /// 0 when at least one hit came back, 1 when none did.
 ///
 /// Results go to stdout, metadata to stderr — always, in every format, so a
@@ -632,7 +632,7 @@ fn finish_grep(payload: &serde_json::Value, out: &GrepOutput) -> ! {
     std::process::exit(if returned > 0 { 0 } else { 1 });
 }
 
-/// The stderr status lines for one grep result (SPEC-cli §2).
+/// The stderr status lines for one grep result (docs/search-cli.md §2).
 ///
 /// Everything here is read back out of the payload rather than threaded
 /// through the pipeline: the payload already carries every counter a human
@@ -648,7 +648,7 @@ fn grep_status(payload: &serde_json::Value, out: &GrepOutput) -> Vec<String> {
     // `find` payloads carry the attempt count; grep's never do.  The two verbs
     // need different advice on an empty result — `find` has no `--no-filter`
     // (the rerank is the whole verb) and no pattern to re-run, so both of its
-    // empty cases point at an explicit `scout grep` instead (SPEC-cli §5).
+    // empty cases point at an explicit `scout grep` instead (docs/search-cli.md §5).
     let find_attempts = payload.get("find_attempts").and_then(serde_json::Value::as_u64);
 
     // Empty is the one case a human can misread, so it says which empty it is.
@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn find_takes_the_same_filter_flags_as_grep() {
-        // SPEC §5: "filter flags are identical to scout grep".  The shared
+        // docs/search-cli.md §5: "filter flags are identical to scout grep".  The shared
         // `SearchFlags` makes that structural, and this pins it.
         let a = find_args(&[
             "where is config parsed?",
@@ -962,7 +962,7 @@ mod tests {
 
     #[test]
     fn edit_has_no_format_flag() {
-        // SPEC §6: the output is a picker.  "Render this as JSON, then ask me
+        // docs/search-cli.md §6: the output is a picker.  "Render this as JSON, then ask me
         // which one to open" is not a thing, so the flag must not exist —
         // and it must not silently parse as something else either.
         match Cli::try_parse_from(["scout", "edit", "a question", "--format", "json"]) {

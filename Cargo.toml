@@ -16,7 +16,7 @@ clap = { version = "4", features = ["derive"] }
 # needs no installed `rg`/`grep` and behaves identically on macOS and Linux.
 # `grep-matcher` is already in the tree under the two below; it is named
 # directly only so the `Matcher` trait can be brought into scope for the
-# per-line `find` that recovers a match's column (SPEC-cli §4).
+# per-line `find` that recovers a match's column (docs/search-cli.md §4).
 grep-matcher = "0.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"

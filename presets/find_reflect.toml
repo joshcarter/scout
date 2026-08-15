@@ -1,4 +1,4 @@
-# find_reflect preset — the self-correction stage of `scout find` (SPEC-cli §5)
+# find_reflect preset — the self-correction stage of `scout find` (docs/search-cli.md §5)
 #
 # The rerank stage answers "which of these hits serve the intent?".  It never
 # answers "did we search for the right thing at all?" — so a round of
@@ -16,7 +16,7 @@
 # blocks byte-bounded, so this call is small by construction.
 # No context providers — scout supplies everything.
 #
-# CLI-only, like find_patterns: `find` is not exposed over MCP (SPEC §9), so
+# CLI-only, like find_patterns: `find` is not exposed over MCP (docs/search-cli.md §9), so
 # this preset is absent from `MCP_PRESETS` in mcp_server.rs.
 #
 # Note: `system` and `user` are top-level TOML keys; they must appear

@@ -4,7 +4,7 @@
 # Verifies:
 #   - Each intercepted verb prefix produces a deny JSON whose
 #     permissionDecisionReason names check_output (unqualified — see below)
-#   - Command-position matching (SPEC-command-matching.md §3): chained
+#   - Command-position matching (docs/command-matching.md §3): chained
 #     commands are intercepted, build verbs that are merely mentioned inside
 #     heredoc bodies or quoted strings are not
 #   - The "# raw-output" escape hatch lets an otherwise-intercepted command
@@ -14,9 +14,8 @@
 #   - Malformed stdin → exit 0 silently (fail-open)
 #   - Reachability fail-open: missing scout binary, an unusable classifier
 #     (version skew), or an unreachable endpoint (ping fails) all let the raw
-#     command through instead of denying into a dead end — the ported fix for
-#     the ct issue where a hard deny with no live redirect target bricked the
-#     Bash tool.
+#     command through instead of denying into a dead end.  A hard deny with no
+#     live redirect target bricks the Bash tool for every build command.
 #   - macOS/Linux portability (no GNU-only constructs)
 #
 # Usage:
@@ -299,7 +298,7 @@ decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // emp
 assert_eq "$decision" "deny" "[leading whitespace] cargo test still intercepted"
 assert_eq "$(last_log_matched)" "true" "[leading whitespace] log matched=true"
 
-# ── Tests: command-position matching (SPEC-command-matching.md §3) ───────────
+# ── Tests: command-position matching (docs/command-matching.md §3) ───────────
 #
 # End-to-end through the hook, so the stage-1 pre-filter, the stage-2
 # `scout classify-command` call and the JSON parsing are all in the loop. The
@@ -374,7 +373,7 @@ assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "true" "[
 run_hook "cargo build" >/dev/null
 assert_eq "$(jq -r '.escaped' "$INTERCEPT_LOG" 2>/dev/null | tail -1)" "false" "[no marker] log escaped=false"
 
-# SPEC §6: the marker only counts in a real comment. Inside a heredoc body or a
+# docs/command-matching.md §6: the marker only counts in a real comment. Inside a heredoc body or a
 # quoted string it is data, and must not silently switch the hook off.
 output=$(run_hook "$(printf 'cargo test <<EOF\n# raw-output\nEOF')")
 decision=$(echo "$output" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
@@ -407,7 +406,7 @@ else
   fail "[deny reason] missing deferred-tool ToolSearch hint" "reason: $reason"
 fi
 
-# ── Tests: reachability fail-open (scout-specific; not present in ct's hook) ─
+# ── Tests: reachability fail-open ────────────────────────────────────────────
 # A deny with no working redirect target bricks the Bash tool for all
 # build/test commands. Both failure modes below must fail OPEN: no deny
 # output, exit 0, raw command allowed through.

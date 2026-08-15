@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>scout Dashboard</title>
 <style>
-  /* Same density and type as ct's dashboard (SPEC-dashboard §4), retinted
-     to a dark-purple scout identity so the two are cousins rather than twins. */
+  /* Density and type follow docs/dashboard.md §4: dark, monospace, three
+     columns, in scout's dark-purple palette. */
   :root {
     --bg: #16121c; --bg2: #1f1a28; --bg3: #2a2336;
     --fg: #cfc6e0; --fg2: #b3a8c6; --dim: #6d627e;
@@ -627,7 +627,7 @@
         r.kind === 'running'
           ? 'waiting for the live channel\u2026'
           : 'not captured \u2014 the dashboard was not listening when this call ran.\n' +
-            'Bodies travel the live channel (SPEC-dashboard \u00a72.5) and are not written to the log.',
+            'Bodies travel the live channel (docs/dashboard.md \u00a72.5) and are not written to the log.',
         true);
     }
     const streamed = streamedByRowId.get(r.id);
@@ -696,7 +696,7 @@
       if (op.tool !== 'find') return '';
       return block('find rounds',
         'not captured — the dashboard was not listening while this search ran.\n' +
-        'Round internals travel the live channel (SPEC-dashboard §2.5) and are not written to the log.',
+        'Round internals travel the live channel (docs/dashboard.md §2) and are not written to the log.',
         true);
     }
     const sel = nums.indexOf(findRound) >= 0 ? findRound : nums[nums.length - 1];

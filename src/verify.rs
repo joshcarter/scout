@@ -1,11 +1,11 @@
 //! Command execution for `check_output`.
 //!
-//! Slimmed from ct's `verify.rs` (792 LOC) per PLAN §1: scout keeps
-//! `run_command_capture`, `truncate_diagnostic` and `detect_language`.  The
-//! place→build→restore→retry repair loop and everything that served it —
-//! `run_build_check`, `run_command_with_timeout`, `BuildResult`,
-//! `BuildCheckOptions`, `repair_context_message`, `has_meaningful_assertions`,
-//! snapshot/restore — went with the `write_tests`/`refactor` presets.
+//! Deliberately small: `run_command_capture`, `truncate_diagnostic` and
+//! `detect_language`, and nothing else.  An earlier design had a
+//! place→build→restore→retry repair loop here, driven by `write_tests` and
+//! `refactor` presets.  Those presets were cut — a local model is not good at
+//! composing net-new code, and the loop and its whole support cast went with
+//! them.
 //!
 //! What is left is one job: run a command the caller named, capture what it
 //! printed, and cap the size of that capture before it reaches the model.

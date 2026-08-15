@@ -10,7 +10,7 @@ pub struct Config {
     pub api_key: Option<String>,
     pub max_tokens: Option<u64>,
     /// Ask the endpoint for `text/event-stream` and read the reply delta by
-    /// delta (SPEC-dashboard §5.5, P5). Observability only — the accumulated
+    /// delta (docs/dashboard.md §6, P5). Observability only — the accumulated
     /// text and the `usage` object are the same either way, and a `false`
     /// here is a fully supported path, not a vestige: §5.5 was measured on
     /// LM Studio, and any host that drops `include_usage` under streaming
@@ -34,7 +34,7 @@ pub enum LlmError {
 /// content.  (A JSON-RPC `to_rpc_error` renderer lived here through step 2,
 /// for an MCP layer scout does not hand-roll — rmcp owns the envelopes.)
 impl LlmError {
-    /// The call log's `outcome.kind` for this failure (SPEC-dashboard §3).
+    /// The call log's `outcome.kind` for this failure (docs/dashboard.md §3).
     ///
     /// It lives here, next to the code that mints the messages, because two of
     /// the four variants are broader than the taxonomy: `RequestFailed` covers

@@ -1,17 +1,14 @@
 // Filesystem backend for the read-side filters.
 //
-// ct reached its indexed copy of the tree through the daemon socket
-// (`ct::Response`); scout owns no index, so this module is the whole of the
-// "where does code come from" layer (PLAN §2):
+// scout owns no code index and talks to no daemon, so this module is the
+// whole of the "where does code come from" layer:
 //
-// * `read_file` — `std::fs::read_to_string` + line splitting, replacing the
-//   daemon `read` call `local_extract.rs:76` used to make.  That call only
-//   ever fetched file content, so this is lossless.
+// * `read_file` — `std::fs::read_to_string` + line splitting.
 // * `search` — gitignore-aware repo walk (`ignore`) plus ripgrep's match
-//   engine (`grep-regex` + `grep-searcher`), replacing the daemon `grep` call.
-//   No dependency on an installed `rg`/`grep`; identical on macOS and Linux.
+//   engine (`grep-regex` + `grep-searcher`).  No dependency on an installed
+//   `rg`/`grep`; identical on macOS and Linux.
 //
-// Search behaviour (PLAN §2 defaults, all tunable via `filter_config`):
+// Search behaviour (all tunable via `filter_config`):
 // respects `.gitignore`/`.ignore` and the global gitignore, skips hidden
 // directories and binary files, renders ±`context_lines` around each match,
 // skips files over `max_file_bytes`, and stops after `max_hits_scanned` hits
@@ -72,7 +69,7 @@ pub fn read_file(project: &Path, file: &str, max_bytes: u64) -> Result<FileConte
 
 /// Split file text into lines, dropping the terminators.  A trailing newline
 /// does not produce a final empty line, so the count matches what an editor
-/// (and `ct read`) reports.
+/// reports.
 pub fn split_lines(text: &str) -> Vec<String> {
     let mut lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
     if lines.last().map(String::is_empty).unwrap_or(false) {
@@ -106,7 +103,7 @@ pub struct SearchHit {
     /// truncated at `context_max_bytes`.
     pub text: String,
     /// **0-based byte** offset of the first match *within the matched line*
-    /// (SPEC-cli §4).  Only the first match is recorded: the renderer windows
+    /// (docs/search-cli.md §4).  Only the first match is recorded: the renderer windows
     /// around one span and quickfix wants one column, so per-match detail
     /// would be carried for nobody.  Editors want 1-based columns — the
     /// conversion belongs at the formatter, not here.
@@ -216,7 +213,7 @@ pub fn type_definitions() -> Vec<(String, Vec<String>)> {
 
 /// Walk `root` and return the project-relative path of every file, in sorted
 /// order — the paths-only tree sketch `find` shows the pattern-synthesis
-/// preset (SPEC-cli §5, §9).
+/// preset (docs/search-cli.md §5, §9).
 ///
 /// Same walk `search` performs (`.gitignore`, `.ignore`, hidden files, and the
 /// caller's `types`/`overrides`), so a `-t rust` run is described the way it
@@ -362,8 +359,8 @@ pub fn search(root: &Path, pattern: &str, opts: &SearchOptions) -> Result<Search
 
 /// Render `lines[i-n ..= i+n]`, newline-joined, capped at `max_bytes`.
 ///
-/// Ported from ct's `handlers::extract::extract_context` — the byte budget is
-/// measured from the block's *start*, which is why `grep::matched_line` has to
+/// The byte budget is measured from the block's *start*, which is why
+/// `grep::matched_line` has to
 /// admit that a long preceding line can cut the block before the matched line.
 pub fn extract_context(lines: &[&str], line_idx: usize, n: usize, max_bytes: usize) -> String {
     let start = line_idx.saturating_sub(n);

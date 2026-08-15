@@ -1,4 +1,4 @@
-//! Terminal rendering for `scout grep` (SPEC-cli §2, §8).
+//! Terminal rendering for `scout grep` (docs/search-cli.md §2, §8).
 //!
 //! A pure function from the grep JSON payload — the *same* payload the MCP
 //! tool returns, which is a frozen contract — to styled text.  Nothing here
@@ -13,14 +13,14 @@
 //! * `mode: "full"` with an `intent` — short-list bypass, no `why`.
 //! * `mode: "full"` with `intent: null` — unfiltered search, no `why`.
 //!
-//! The 1–5 score is deliberately never shown (SPEC §9): it orders the hits
+//! The 1–5 score is deliberately never shown (docs/search-cli.md §9): it orders the hits
 //! and stays in the JSON payload, but it is noise at a terminal.
 //!
 //! Colour is raw ANSI — no dependency.  The palette is ack's: path magenta,
 //! line number green, matched line bold, gutter dim, and — from P3 — the
 //! matched *pattern* within that line bold red, ripgrep-style.
 //!
-//! P3 also adds the per-line column cap (`--max-columns`, SPEC-cli §4): an
+//! P3 also adds the per-line column cap (`--max-columns`, docs/search-cli.md §4): an
 //! over-long *matched* line renders as a window around its match, an over-long
 //! *context* line is simply cut at the cap.  That is a terminal concern only —
 //! `--format json` and `--format vimgrep` are untouched by it.
@@ -34,7 +34,7 @@ const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const GREEN: &str = "\x1b[32m";
 const MAGENTA: &str = "\x1b[35m";
-/// The matched *pattern* inside the matched line (SPEC-cli §2).  Bold red, as
+/// The matched *pattern* inside the matched line (docs/search-cli.md §2).  Bold red, as
 /// ripgrep highlights matches: the whole matched line is already bold, so the
 /// hue — not the weight — is what has to carry the distinction, and re-asserting
 /// bold means the span never reads as *lighter* than its surroundings.
@@ -62,13 +62,13 @@ pub struct RenderOpts {
     /// rendered block but not its starting line number, so the gutter has to
     /// recompute it the way `source::extract_context` laid the block out.
     pub context_lines: usize,
-    /// Per-line render cap, in bytes, ripgrep's `--max-columns` (SPEC-cli §4).
+    /// Per-line render cap, in bytes, ripgrep's `--max-columns` (docs/search-cli.md §4).
     /// `0` disables it.  Purely a terminal concern: `--format json` returns the
     /// payload untouched, and the payload itself is already bounded by the
     /// search layer's `context_max_bytes`.
     pub max_columns: usize,
     /// Prefix each hit's header with its 1-based index (`scout edit`'s picker,
-    /// SPEC-cli §6).  Off for `grep`/`find`, whose output is not something you
+    /// docs/search-cli.md §6).  Off for `grep`/`find`, whose output is not something you
     /// answer a prompt about.
     pub numbered: bool,
 }
@@ -81,7 +81,7 @@ impl Default for RenderOpts {
 
 // ── Human format ─────────────────────────────────────────────────────
 
-/// Render a grep payload as human-readable text (SPEC §2).
+/// Render a grep payload as human-readable text (docs/search-cli.md §2).
 ///
 /// Returns the empty string when there are no hits — the caller puts the
 /// "why there are none" message on stderr, since that is metadata, not output.
@@ -195,7 +195,7 @@ fn render_context(
     }
 }
 
-// ── Per-line column cap (SPEC-cli §4) ────────────────────────────────
+// ── Per-line column cap (docs/search-cli.md §4) ────────────────────────────────
 
 /// Write one line of a context block, applying the column cap and — on the
 /// matched line, when the payload carried a span — the in-line highlight.

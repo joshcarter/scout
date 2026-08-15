@@ -7,10 +7,12 @@ shell commands before they run, and answering targeted questions about
 files and search results without dumping them into the big model's
 context.
 
-**Status: in progress.** Extraction from [ct] is underway — see
-`PLAN.md`. The MCP server exposes `check_output`, `extract` and `grep`
-(plus `ping` for wiring checks), and the PreToolUse hooks that steer
-Claude Code toward them are in place.
+**Status: working, pre-1.0.** The MCP server exposes `check_output`,
+`extract` and `grep` (plus `ping` for wiring checks); the PreToolUse
+hooks that steer Claude Code toward them are in place; the CLI covers
+`grep` / `find` / `edit` / `extract` / `check` / `task`; and `scout
+dashboard` serves a local web view of everything the local model has
+been asked. Design records for each of those live in [`docs/`](docs/).
 
 ## Shape
 
@@ -101,7 +103,7 @@ default `${XDG_CONFIG_HOME:-~/.config}/scout/config.toml` — edit
 One difference worth knowing: **the hooks are Claude-only.** The
 build/test redirect and the shell-safety auto-allow both ride on
 PreToolUse, and Grok Build 1.0.3 does not execute plugin hooks at all
-(see `SPEC-grok-plugin.md` §2.5). Under Grok you get the MCP tools and
+(see `docs/plugin-packaging.md` §2.5). Under Grok you get the MCP tools and
 the `scout` skill; the automatic steering is Claude's.
 
 **The CLI** (use scout from a terminal, like a smarter `ack`):
@@ -138,10 +140,13 @@ normal case.
 
 Two manifests, identical content: Grok reads
 `plugins/scout/plugin.json`, Claude reads
-`plugins/scout/.claude-plugin/plugin.json`. Keep them in step. (Repo-root
-`.mcp.json` is unrelated — it holds a `ct` entry for working on this
-checkout, nothing of scout's; it sits outside the payload so no harness
-mistakes it for scout's own.)
+`plugins/scout/.claude-plugin/plugin.json`. Keep them in step. Both are
+inside `plugins/scout/`, which is also why the payload lives there rather
+than at the repo root: a `.mcp.json` sitting inside a plugin folder gets
+attributed to the plugin, so any project-level MCP config you keep for
+working on this checkout belongs above it. See
+[`docs/plugin-packaging.md`](docs/plugin-packaging.md) for the full
+picture of how each harness loads this.
 
 Verify the MCP handshake without Claude:
 
@@ -152,5 +157,3 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
   | ./target/release/scout mcp
 ```
-
-[ct]: the code-intelligence daemon this feature is being extracted from

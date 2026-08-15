@@ -16,7 +16,7 @@
 // tool: it is not a question the model should be asking, and adding it to the
 // tool surface would just cost context.
 //
-// Why lexing and not a regex (see SPEC-command-matching.md): the property that
+// Why lexing and not a regex (see docs/command-matching.md): the property that
 // separates `cd foo && cargo test` (intercept) from a commit message that
 // merely mentions `cargo test` (don't) is whether the verb sits in *command
 // position* — the head of a simple command the shell will actually execute.

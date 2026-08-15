@@ -1,6 +1,6 @@
 //! Tests for the command-position classifier.
 //!
-//! The table in SPEC-command-matching.md §3 is the spine of this file: every
+//! The table in docs/command-matching.md §3 is the spine of this file: every
 //! row appears below, plus the lexer edge cases (§7) that the old raw-string
 //! regex could not express.
 
@@ -20,7 +20,7 @@ fn miss(cmd: &str) {
     );
 }
 
-// ── SPEC §3: the six observed rows ────────────────────────────────────────────
+// ── docs/command-matching.md §3: the six observed rows ────────────────────────────────────────────
 
 #[test]
 fn row1_plain_build_command_intercepts() {

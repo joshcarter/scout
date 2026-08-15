@@ -1,4 +1,4 @@
-//! `scout edit` — pipeline results straight into `$EDITOR` (SPEC-cli §6).
+//! `scout edit` — pipeline results straight into `$EDITOR` (docs/search-cli.md §6).
 //!
 //! A separate verb rather than a flag on `grep`, because the contract differs:
 //! it must *end* in an editor, and interactivity is acceptable.  It front-ends
@@ -116,7 +116,7 @@ pub fn dispatch(
 
 // ── The editor and its invocation ────────────────────────────────────
 
-/// The editor families scout knows how to position (SPEC-cli §6).
+/// The editor families scout knows how to position (docs/search-cli.md §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorKind {
     /// vi/vim/nvim: `+<line>`, and `-q <file>` for a quickfix list.
@@ -158,7 +158,7 @@ pub fn classify(program: &str) -> EditorKind {
 ///
 /// `line` and `col` are 1-based (see the module note on columns) and describe
 /// the *first* file; any others are opened as plain arguments, which every
-/// editor here reads as "also load these buffers".  That is exactly SPEC §6's
+/// editor here reads as "also load these buffers".  That is exactly docs/search-cli.md §6's
 /// `a` behaviour for the non-vim families: all the files, positioned at the
 /// first hit.
 pub fn open_args(kind: EditorKind, files: &[String], line: usize, col: usize) -> Vec<String> {
@@ -333,7 +333,7 @@ pub fn distinct_files(hits: &[Hit]) -> Vec<String> {
 
 // ── The flow ─────────────────────────────────────────────────────────
 
-/// Print, pick, and hand over to the editor.  Never returns (SPEC §6: when the
+/// Print, pick, and hand over to the editor.  Never returns (docs/search-cli.md §6: when the
 /// editor exits, scout exits — there is no re-prompt loop; rerunning is cheap).
 ///
 /// `status` is the caller's already-computed stderr status lines, so `edit`

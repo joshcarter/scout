@@ -1,10 +1,9 @@
 //! Tests for `extract`: bypass path, numbering/chunking, materialization and
 //! the fail-open contract.
 //!
-//! Ported from ct's `local_extract/tests.rs`.  The daemon-response tests
-//! (`read_response_lines`) became filesystem tests — scout reads files itself,
-//! so the equivalent ground truth is a real file in a tempdir.  The fail-open
-//! tests call `run` directly instead of going through ct's MCP request loop.
+//! Ground truth is a real file in a tempdir, because scout reads files itself.
+//! The fail-open tests call `run` directly rather than going through the MCP
+//! request loop.
 
 use super::*;
 use crate::select::Ctx;

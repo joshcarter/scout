@@ -1,4 +1,4 @@
-//! `find` — intent-only search (SPEC-cli §5).
+//! `find` — intent-only search (docs/search-cli.md §5).
 //!
 //! `grep` makes the caller guess a pattern.  `find` removes that step: the
 //! caller states what they want and the *local model* guesses the patterns.
@@ -40,7 +40,7 @@
 //!   costs one wasted walk; it can never contribute a hit that isn't there.
 //! * A model hint (`types` / `globs`) may only *narrow* — never past the
 //!   caller's own `-t` / `-g` flags.  See `candidate_options`.
-//! * A round is retried when *every* candidate whiffed (SPEC §9: a
+//! * A round is retried when *every* candidate whiffed (docs/search-cli.md §9: a
 //!   thin-but-nonzero result is answerable by the rerank stage) **or** when the
 //!   reflect stage says the kept hits miss the question.  Both kinds share the
 //!   one `max_attempts` budget, so `--attempts 1` disables both.
@@ -654,7 +654,7 @@ fn search_candidates(
     (results, kept, search_truncated)
 }
 
-/// The degenerate-pattern guard (SPEC-cli §5 step 2).
+/// The degenerate-pattern guard (docs/search-cli.md §5 step 2).
 ///
 /// The cap is inclusive — a candidate with exactly `cap` hits is kept, since
 /// the config value reads as "more lines than this is too many".
@@ -701,7 +701,7 @@ pub fn union_hits(per_candidate: Vec<Vec<RawHit>>) -> Vec<RawHit> {
 
 // ── Reporting ────────────────────────────────────────────────────────
 
-/// The stderr line for one round (SPEC-cli §5): what was tried and what fell
+/// The stderr line for one round (docs/search-cli.md §5): what was tried and what fell
 /// away.  `trying: config, toml, load_config, from_str · 2 whiffed`
 pub fn trying_line(results: &[CandidateResult]) -> String {
     let names: Vec<&str> = results.iter().map(|r| r.pattern.as_str()).collect();
@@ -798,8 +798,8 @@ pub fn whiff_payload(question: &str, tried: &[String], attempts: usize) -> Value
 
 /// Render the paths-only project sketch, truncated to `max_bytes`.
 ///
-/// Paths only, never symbols or contents (SPEC §9): symbol names would
-/// reintroduce the parsing dependency PLAN §1 deliberately cut.  Truncation is
+/// Paths only, never symbols or contents (docs/search-cli.md §9): symbol names would
+/// reintroduce a source-parsing dependency scout deliberately does not have.  Truncation is
 /// on a line boundary — half a path is worse than one path fewer — and it is
 /// announced, so the model is told the list is partial rather than concluding
 /// that an unlisted file does not exist.
@@ -835,7 +835,7 @@ pub fn sketch(paths: &[String], max_bytes: usize) -> String {
     out
 }
 
-// ── Live channel (SPEC-dashboard §2.5, P4) ───────────────────────────
+// ── Live channel (docs/dashboard.md §2, P4) ───────────────────────────
 //
 // Observability only.  Every value below is one the round already computed —
 // nothing here searches, calls, or decides anything, and a `find` behaves

@@ -1,13 +1,12 @@
 // scout config loader.
 //
 // Single file, single format: `$XDG_CONFIG_HOME/scout/config.toml` (default
-// `~/.config/scout/config.toml`), `[llm]` section. Clean break from ct — no
-// fallback to `~/.claude/ct/config.toml`, no `$CT_LLM_CONFIG`. Override the
-// whole file path with `$SCOUT_CONFIG`.
+// `~/.config/scout/config.toml`), `[llm]` section. Override the whole file
+// path with `$SCOUT_CONFIG`.
 //
-// This is the sole config parser in scout (ct-local-llm carried two, with
-// different timeout clamping — collapsed here to one, keeping the saner
-// 1s..3600s clamp).
+// This is the sole config parser in scout, and deliberately so: two parsers
+// with independently drifting timeout clamps is a bug waiting to happen. The
+// clamp lives here, once, at 1s..3600s.
 
 use crate::client::Config;
 use std::path::{Path, PathBuf};
@@ -54,7 +53,7 @@ pub fn config_path() -> PathBuf {
 /// Embedded rather than read from the plugin payload because the two surfaces
 /// that need it most cannot see a payload: `make install` puts the binary on
 /// `$PATH` with no plugin anywhere, and under Grok Build the SessionStart hook
-/// that used to seed this file never runs at all (SPEC-grok-plugin.md §2.5).
+/// that used to seed this file never runs at all (docs/plugin-packaging.md §2.5).
 const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
 /// Write the bundled default config to `path`, creating parent directories.
@@ -144,7 +143,7 @@ pub fn load_config(path: &Path) -> Result<Config, String> {
 
     // Defaults on, and an unusable value keeps the default rather than
     // erroring — this is a diagnostic knob, not a load-bearing one, and no
-    // caller's result changes with it (SPEC-dashboard §5.5).
+    // caller's result changes with it (docs/dashboard.md §6).
     let stream = section
         .get("stream")
         .and_then(|v| v.as_bool())

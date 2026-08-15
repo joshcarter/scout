@@ -18,10 +18,8 @@
 //! * Every failure path returns a `ToolError` naming the Read tool — a broken
 //!   filter must never trap the caller.
 //!
-//! Ported from ct's `local_extract.rs`.  The one rewiring: ct resolved the
-//! file through the daemon (`query_daemon_socket_with_project(sock, "read",
-//! ...)`, line 76), which only ever fetched file content; scout calls
-//! `source::read_file` instead.
+//! File content comes from `source::read_file` — plain filesystem reads, no
+//! index and no daemon.
 
 use serde_json::Value;
 
@@ -63,7 +61,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     let (resolved, lines) = (content.path, content.lines);
     let file_lines = lines.len();
     // What scout digested on the caller's behalf, for the context-saved metric
-    // (SPEC-dashboard §3).  +1 per line for the terminator `split_lines` drops.
+    // (docs/dashboard.md §3).  +1 per line for the terminator `split_lines` drops.
     ctx.ledger.raw_bytes(lines.iter().map(|l| l.len() as u64 + 1).sum());
 
     // ── 2. Bypass: the LLM adds nothing to a small file ──────────────
@@ -87,7 +85,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
 
     // ── 4. One preset call per chunk ─────────────────────────────────
     //
-    // Chunks run sequentially, matching ct: with chunk_bytes at 384 KiB
+    // Chunks run sequentially: with chunk_bytes at 384 KiB
     // chunking is already the rare case, and a local model serves one request
     // at a time anyway.
     let mut selections: Vec<RangeSelection> = Vec::with_capacity(chunk_total);

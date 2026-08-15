@@ -5,12 +5,9 @@
 //! `check_output` preset.  The raw output never enters the caller's context;
 //! only the compact JSON verdict the model returns does.
 //!
-//! Written fresh for scout (PLAN §8: ct's `mcp.rs` may carry upstream
-//! ancestry, so only the *logic* of its `forward_check_output` was carried
-//! over, never the file).  The shape of that logic survives: pluck `command`,
-//! resolve `cwd` against the project root, clamp the timeout, capture with
-//! `verify::run_command_capture`, inject the output into the preset args, call
-//! the model.
+//! The shape is the obvious one: pluck `command`, resolve `cwd` against the
+//! project root, clamp the timeout, capture with `verify::run_command_capture`,
+//! inject the output into the preset args, call the model.
 //!
 //! Invariants:
 //!
@@ -66,7 +63,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     );
 
     // The captured output is the whole point of this tool: it is what would
-    // otherwise have landed in the caller's context (SPEC-dashboard §3).
+    // otherwise have landed in the caller's context (docs/dashboard.md §3).
     ctx.ledger.raw_bytes(output.len() as u64);
 
     // Augment the args with the captured output before calling the model.

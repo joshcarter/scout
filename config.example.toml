@@ -115,7 +115,7 @@ model = "qwen3:27b"
 # `scout dashboard` (idempotent, detaches), stop it with `--stop`.
 
 # [dashboard]
-# Port for the dashboard, alongside ct's 13000. The bind *address* is
+# Port for the dashboard. The bind *address* is
 # 127.0.0.1 and is deliberately not configurable: the payloads carry file
 # contents from every repo you work in, so loopback is the only address
 # worth serving them on.

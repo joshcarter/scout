@@ -1,3 +1,6 @@
 /target
 .claude/
 /plugins/scout/bin/scout
+
+# Project-level MCP config for working on this checkout — local, not payload.
+.mcp.json

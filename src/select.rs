@@ -20,11 +20,9 @@
 //!   the fail-open error carrying the raw tool to fall back to.
 //! * `non_empty_arg` — required-arg plucking.
 //!
-//! Ported from ct's `local_select.rs`.  The plugin round-trip
-//! (`call_plugin_preset`) became a direct `LlmClient` call, and the MCP
-//! envelope builders (`ok_result`/`err_result`) moved out to the callers —
-//! `mcp_server.rs` renders `ToolError` into an rmcp `CallToolResult`, the CLI
-//! renders it onto stderr.  Everything else moves verbatim.
+//! The MCP envelope belongs to the callers, not here: `mcp_server.rs` renders
+//! a `ToolError` into an rmcp `CallToolResult`, and the CLI renders the same
+//! error onto stderr.
 
 use serde_json::Value;
 
@@ -44,8 +42,7 @@ const MAX_WHY_LEN: usize = 120;
 
 /// Everything a filter needs besides its own arguments.
 ///
-/// `client` is optional on purpose, mirroring ct's `Option<&mut Plugin>`: the
-/// bypass paths (small file, short hit list) do real work with no model at
+/// `client` is optional on purpose: the bypass paths (small file, short hit list) do real work with no model at
 /// all, so a missing or broken config must not turn those into errors.
 pub struct Ctx<'a> {
     pub client: Option<&'a LlmClient>,
@@ -55,7 +52,7 @@ pub struct Ctx<'a> {
     pub presets: &'a [Preset],
     /// Project root: the base for relative paths and the search walk.
     pub project: String,
-    /// How this invocation was reached: `mcp` | `cli` (SPEC-dashboard §3).
+    /// How this invocation was reached: `mcp` | `cli` (docs/dashboard.md §3).
     ///
     /// Set by whoever built the `Ctx` — the MCP server or the CLI dispatcher —
     /// because only they know, and a value derived any later could drift.
@@ -70,7 +67,7 @@ pub struct Ctx<'a> {
     pub attempt: std::cell::Cell<u64>,
     /// Byte accounting for the operation in flight — see `stats::Ledger`.
     pub ledger: crate::stats::Ledger,
-    /// Optional sink for human-facing progress notes (SPEC-cli §2).
+    /// Optional sink for human-facing progress notes (docs/search-cli.md §2).
     ///
     /// The filters are shared verbatim with the MCP server, which speaks
     /// JSON-RPC over stdio and must stay silent — so a filter can *never*
@@ -153,8 +150,7 @@ impl Ctx<'_> {
 ///
 /// Every failure path in every filter goes through this: a broken filter must
 /// never trap the caller with "no result", it must name the tool that always
-/// works.  This is ct's `err_result(reason, fallback)` contract, minus the
-/// JSON-RPC envelope.
+/// works — a `(reason, fallback)` pair the caller can always act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     pub message: String,
@@ -468,10 +464,9 @@ fn truncate_why(why: &str) -> String {
 
 /// Run one preset round-trip against the local LLM and return the reply text.
 ///
-/// This is ct's `call_plugin_preset` with the plugin hop removed: scout owns
-/// the preset table and the HTTP client, so resolving the templates and
-/// calling the model happen in-process.  Every round-trip through here writes
-/// one call-log row (SPEC-dashboard §3) via the context's ledger, which is
+/// scout owns the preset table and the HTTP client, so resolving the templates
+/// and calling the model both happen in-process.  Every round-trip writes
+/// one call-log row (docs/dashboard.md §3) via the context's ledger, which is
 /// what makes a `find`'s internal rounds visible as themselves.
 pub fn call_preset(ctx: &Ctx, preset_name: &str, args: &Value) -> Result<String, String> {
     let client = ctx.require_client()?;

@@ -191,7 +191,7 @@ fn search_rejects_an_invalid_regex_rather_than_returning_nothing() {
     assert!(e.contains("invalid pattern"), "{e}");
 }
 
-// ── search: match columns (SPEC-cli §4) ──────────────────────────────
+// ── search: match columns (docs/search-cli.md §4) ──────────────────────────────
 
 #[test]
 fn search_records_the_match_column_as_a_byte_offset() {
@@ -211,7 +211,7 @@ fn a_match_at_the_start_of_a_line_has_column_zero() {
 
 #[test]
 fn only_the_first_match_on_a_line_is_recorded() {
-    // SPEC §4 wants one column per hit: a window centres on one span and
+    // docs/search-cli.md §4 wants one column per hit: a window centres on one span and
     // quickfix carries one column, so later matches have no consumer.
     let dir = tempfile::tempdir().unwrap();
     write(&dir, "a.rs", "xx needle yy needle\n");
@@ -317,7 +317,7 @@ fn search_of_an_empty_tree_is_an_empty_result_not_an_error() {
     assert!(!r.truncated);
 }
 
-// ── search: type and glob filters (SPEC-cli §3) ──────────────────────
+// ── search: type and glob filters (docs/search-cli.md §3) ──────────────────────
 
 #[test]
 fn no_filters_is_an_exact_no_op() {

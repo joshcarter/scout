@@ -2,7 +2,7 @@
 #
 # Routes the Quality Pedant reviewer through the local LLM.
 # Falls back to Claude in claude-review's lib-launch.sh if the endpoint is
-# unreachable (PLAN.md §1: consumed only via `scout run --preset quality_review`).
+# unreachable (consumed only via `scout run --preset quality_review`).
 #
 # Required args:
 #   git_diff_range — git revision range passed directly to `git diff`
