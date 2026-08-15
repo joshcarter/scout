@@ -628,7 +628,19 @@ fn append_line(path: &Path, line: &str) {
         let Ok(reopened) = opts.open(path) else { return };
         f = reopened;
     }
-    let _ = writeln!(f, "{line}");
+    // One write_all, not writeln!.  `writeln!` reaches the fd twice — once for
+    // the record, once for the newline — and O_APPEND only makes each of those
+    // atomic on its own, not the pair.  Two writers interleaving between them
+    // produce `{a}{b}\n\n`: one line serde_json rejects outright and one blank,
+    // so a collision destroys both records rather than neither.
+    //
+    // This is not a rare race.  shell-safety.sh runs `scout run` on every Bash
+    // command containing an expansion, while `scout mcp` dispatches tool calls
+    // on spawn_blocking, so two parallel calls are two threads here on their
+    // own fds.  It was invisible by construction: the wreckage lands in the
+    // parse_errors counter, reported as a parenthetical nobody reads, which
+    // means the context-saved numbers under-report by an unknowable amount.
+    let _ = f.write_all(format!("{line}\n").as_bytes());
 }
 
 // ── `scout stats` report ────────────────────────────────────────────────────
