@@ -67,4 +67,4 @@ description = "Optional working directory for the command. Defaults to the proje
 
 [preset.input_schema.properties.timeout_seconds]
 type        = "integer"
-description = "Optional timeout in seconds. Defaults to 60."
+description = "Optional wall-clock ceiling in seconds. Defaults to 900, max 3600. This is a circuit breaker, not the stuck-command check: a command that stops producing output for 120s is killed as wedged well before this, so raising it helps a slow build and does nothing for a hung one."

@@ -117,8 +117,17 @@ pub enum Outcome {
     EmptyResponse,
     ParseFailure,
     EndpointUnreachable,
+    /// The *model* did not answer in time.  Strictly an LLM round-trip failure
+    /// (`client.rs`); see `SubprocessTimeout` for the other kind.
     Timeout,
     HttpError,
+    /// `check_output`'s command was killed for exceeding a deadline — either it
+    /// went silent long enough to look wedged or it blew the outer wall-clock
+    /// cap.  No model was called, so this is not `Timeout`: nothing failed on
+    /// the LLM side, and rolling the two together hid the one failure mode the
+    /// tool most needs to make visible ("the build hung") inside a bucket that
+    /// means "the endpoint was slow".
+    SubprocessTimeout,
 }
 
 impl Outcome {
@@ -132,6 +141,7 @@ impl Outcome {
             Outcome::EndpointUnreachable => "endpoint_unreachable",
             Outcome::Timeout => "timeout",
             Outcome::HttpError => "http_error",
+            Outcome::SubprocessTimeout => "subprocess_timeout",
         }
     }
 
@@ -477,6 +487,17 @@ impl Ledger {
 
     pub(crate) fn is_silent(&self) -> bool {
         self.silent
+    }
+
+    /// The outcome of the row currently parked.
+    ///
+    /// Test-only, for the same reason `silent` is: production code has no
+    /// business reading a row back out of the ledger, but a test that claims a
+    /// path logs `subprocess_timeout` has to be able to prove it — and a silent
+    /// ledger writes no file to inspect instead.
+    #[cfg(test)]
+    pub fn pending_outcome(&self) -> Option<Outcome> {
+        self.pending.borrow().as_ref().map(|r| r.outcome)
     }
 
     /// Milliseconds since the operation began.  This is what a bypassed row
@@ -1012,6 +1033,30 @@ mod tests {
         assert_eq!(v["outcome"]["kind"], "endpoint_unreachable");
         assert_eq!(v["ok"], false);
         assert!(v["outcome"]["summary"].as_str().unwrap().contains("not responding"));
+    }
+
+    #[test]
+    fn a_subprocess_timeout_is_its_own_kind_and_is_not_a_success() {
+        // The taxonomy's whole job here: "the build hung" must not land in the
+        // same bucket as "the model was slow", and must never read as ok.
+        assert_eq!(Outcome::SubprocessTimeout.as_str(), "subprocess_timeout");
+        assert_ne!(Outcome::SubprocessTimeout.as_str(), Outcome::Timeout.as_str());
+        assert!(!Outcome::SubprocessTimeout.is_ok());
+
+        let tmp = NamedTempFile::new().unwrap();
+        write(
+            &tmp,
+            CallRecord::new("check_output", "check_output")
+                .outcome(Outcome::SubprocessTimeout)
+                .summary("the command printed nothing for 120s and was killed after 121s"),
+        );
+        let v = &lines_of(&tmp)[0];
+        assert_eq!(v["outcome"]["kind"], "subprocess_timeout");
+        assert_eq!(v["ok"], false);
+
+        // ...and it reaches the report as a failure of its own kind.
+        let r = parse_log(tmp.path()).unwrap();
+        assert_eq!(r.failures, vec![("subprocess_timeout".to_string(), 1)]);
     }
 
     #[test]
