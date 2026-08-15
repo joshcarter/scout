@@ -217,7 +217,7 @@ fn resolve() -> Option<Sock> {
 /// the next event. Nothing here waits.
 fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     use std::os::unix::io::FromRawFd;
-    let addr = sockaddr_un(path)?;
+    let (addr, addr_len) = sockaddr_un(path)?;
     // SAFETY: a plain `socket(2)`; the fd is adopted below before any other
     // fallible step, so no early return can leak it.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
@@ -227,15 +227,9 @@ fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     // SAFETY: `fd` is a fresh socket owned by nobody else.
     let sock = unsafe { UnixStream::from_raw_fd(fd) };
     sock.set_nonblocking(true)?;
-    // SAFETY: `addr` is a zeroed `sockaddr_un` this process filled in, and the
-    // length passed is its own size.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&raw const addr).cast::<libc::sockaddr>(),
-            std::mem::size_of_val(&addr) as libc::socklen_t,
-        )
-    };
+    // SAFETY: `addr` is a zeroed `sockaddr_un` this process filled in, and
+    // `addr_len` is within it.
+    let rc = unsafe { libc::connect(fd, (&raw const addr).cast::<libc::sockaddr>(), addr_len) };
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -243,13 +237,18 @@ fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     Ok(sock)
 }
 
-/// A zeroed `sockaddr_un` naming `path`.
+/// A zeroed `sockaddr_un` naming `path`, and the length to pass with it.
+///
+/// The length is the prefix actually in use — everything up to `sun_path`,
+/// plus the path, plus its NUL — rather than the whole struct. Both kernels
+/// accept either for a pathname socket, but this is the form the platforms
+/// agree on most narrowly, and it is what `std` itself sends.
 ///
 /// `sun_path` is 108 bytes on Linux and 104 on macOS, and a path that does not
 /// fit is a configuration error rather than a transport one — reported as
 /// `InvalidInput` so `resolve` files it under "no daemon" like every other
 /// failure.
-fn sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
+fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     use std::os::unix::ffi::OsStrExt;
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: `sockaddr_un` is plain data; all-zero is a valid value for it,
@@ -262,7 +261,8 @@ fn sockaddr_un(path: &Path) -> io::Result<libc::sockaddr_un> {
     for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
         *dst = *src as libc::c_char;
     }
-    Ok(addr)
+    let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    Ok((addr, len as libc::socklen_t))
 }
 
 /// One event, framed: a 4-byte little-endian length, then the JSON.
