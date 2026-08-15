@@ -168,6 +168,47 @@ fn the_quickfix_invocation_is_dash_q() {
     assert_eq!(quickfix_args("/tmp/scout-quickfix-1.txt"), ["-q", "/tmp/scout-quickfix-1.txt"]);
 }
 
+// ── The quickfix temp file itself ──────────────────────────────────────
+//
+// `write_quickfix_file` is the fallible half of `quickfix` — split out so it
+// can be called directly instead of through the effectful path, which ends
+// in a real `std::process::exit` and can't run inside `cargo test`.
+
+#[test]
+fn the_quickfix_file_is_created_safely_and_still_readable_afterwards() {
+    let payload = json!({"hits": [{"file": "src/a.rs", "line": 3, "col": 1}]});
+    let path = write_quickfix_file(&payload).expect("temp file creation should succeed");
+
+    // Still on disk (not deleted by NamedTempFile's own Drop) — `quickfix`
+    // hands this path to `-q` and the editor must be able to open it.
+    let content = std::fs::read_to_string(&path).expect("the launched editor must be able to read it");
+    assert_eq!(content, render::render_vimgrep(&payload), "same formatter the module doc promises");
+
+    // Not a predictable name: the whole point of moving off
+    // `scout-quickfix-<pid>.txt` was that another local user can't guess it
+    // ahead of time and pre-plant a symlink there.
+    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("scout-quickfix-") && name.ends_with(".txt"), "{name}");
+    assert_ne!(
+        name,
+        format!("scout-quickfix-{}.txt", std::process::id()),
+        "must not be the old pid-based, guessable name"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_quickfix_file_is_created_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let payload = json!({"hits": []});
+    let path = write_quickfix_file(&payload).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "NamedTempFile's default mode — no one else on the box should read it");
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── $EDITOR word splitting ───────────────────────────────────────────
 
 #[test]

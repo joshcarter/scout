@@ -56,23 +56,61 @@ pub fn config_path() -> PathBuf {
 /// that used to seed this file never runs at all (docs/plugin-packaging.md §2.5).
 const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 
+/// Create `dir` with mode `0700` if it does not already exist. Only `dir`
+/// itself is tightened — missing ancestors (`~/.config`, say) are created at
+/// the process umask, since they are shared system directories scout has no
+/// business narrowing. Pre-existing directories are left alone: a mode the
+/// user set on purpose is not ours to override after the fact.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
 /// Write the bundled default config to `path`, creating parent directories.
 ///
 /// Never overwrites: an existing file — even an unparseable one — is left
 /// alone, because clobbering a config someone hand-edited is far worse than
 /// surfacing a parse error. Returns `Ok(false)` when a file was already there.
+///
+/// The file is created `0600`: `[llm] api_key` can live in here, so a config
+/// seeded at the process umask (typically `0644`) would leave a secret
+/// world-readable from the moment it exists. Only creation sets the mode —
+/// an already-existing config, however it got its permissions, is untouched.
 pub fn seed_default_config(path: &Path) -> Result<bool, String> {
     if path.exists() {
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        ensure_private_dir(parent)
             .map_err(|e| format!("cannot create config dir {:?}: {e}", parent))?;
     }
     // create_new: two scout processes starting at once (an MCP server and a
     // CLI call, say) must not race into a half-written file. Losing the race
     // is success — the other process wrote the same bytes.
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
         Ok(mut f) => {
             use std::io::Write;
             f.write_all(DEFAULT_CONFIG.as_bytes())
@@ -457,6 +495,54 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "hand edited, do not clobber"
         );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    // `[llm] api_key` can live in this file, so a freshly-seeded config must
+    // not land at the process umask (typically 0644, world-readable).
+    #[cfg(unix)]
+    #[test]
+    fn seed_creates_the_config_file_0600_and_its_dir_0700() {
+        let dir = TempDir::new().unwrap();
+        // Nested, so the seed also has to create the config dir itself,
+        // exercising both halves of the fix in one call.
+        let p = dir.path().join("scout").join("config.toml");
+        assert!(seed_default_config(&p).unwrap());
+        assert_eq!(mode_of(&p), 0o600, "config.toml can hold an api_key");
+        assert_eq!(mode_of(p.parent().unwrap()), 0o700, "the config dir must not be group/other readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_never_widens_a_pre_existing_configs_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("config.toml");
+        // A config that predates this fix, or that the user deliberately
+        // loosened — seeding must never run for it (it already exists), and
+        // if it somehow did, must not be the thing that changes its mode.
+        std::fs::write(&p, "hand edited").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!seed_default_config(&p).unwrap());
+        assert_eq!(mode_of(&p), 0o644, "an existing file's mode is not ours to change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_never_widens_a_pre_existing_config_dirs_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let config_dir = dir.path().join("scout");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let p = config_dir.join("config.toml");
+        assert!(seed_default_config(&p).unwrap());
+        assert_eq!(mode_of(&config_dir), 0o775, "a pre-existing dir's mode is not ours to change");
     }
 
     #[test]

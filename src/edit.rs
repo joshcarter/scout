@@ -441,13 +441,38 @@ fn launch(editor: &[String], hits: &[Hit], sel: Selection, payload: &Value, proj
     exec_editor(editor, open_args(kind, &files, target.line, target.col), project, None)
 }
 
+/// Write the hit list as `--format vimgrep` to a private temp file and return
+/// its path.
+///
+/// `NamedTempFile` rather than a `scout-quickfix-<pid>.txt` path of our own:
+/// a pid-based name in shared `/tmp` is predictable, and `std::fs::write`
+/// follows symlinks — another local user can pre-create or race a symlink at
+/// that path and get `scout edit -a` to overwrite whatever the invoking user
+/// can write. `NamedTempFile` opens with `O_EXCL` and mode `0600`, closing
+/// both holes. `.keep()` disarms its own delete-on-drop so the file's
+/// lifetime keeps matching what `exec_editor` already does for the vim
+/// quickfix path: it must still exist when the editor opens it, and
+/// `exec_editor`'s `cleanup` unlinks it once the editor exits.
+///
+/// Split out from `quickfix` (which never returns) so this fallible half —
+/// the part worth unit-testing — is a plain function a test can call and get
+/// a `Result` back from, instead of a process exit.
+fn write_quickfix_file(payload: &Value) -> std::io::Result<PathBuf> {
+    let mut tmp = tempfile::Builder::new().prefix("scout-quickfix-").suffix(".txt").tempfile()?;
+    tmp.write_all(render::render_vimgrep(payload).as_bytes())?;
+    let (_file, path) = tmp.keep().map_err(|e| e.error)?;
+    Ok(path)
+}
+
 /// Write the hit list as `--format vimgrep` and open it with `-q`.
 fn quickfix(editor: &[String], payload: &Value, project: &str) -> ! {
-    let path = std::env::temp_dir().join(format!("scout-quickfix-{}.txt", std::process::id()));
-    if let Err(e) = std::fs::write(&path, render::render_vimgrep(payload)) {
-        eprintln!("scout edit: cannot write the quickfix list to {}: {e}", path.display());
-        std::process::exit(2);
-    }
+    let path = match write_quickfix_file(payload) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("scout edit: cannot create the quickfix temp file: {e}");
+            std::process::exit(2);
+        }
+    };
     let args = quickfix_args(&path.to_string_lossy());
     exec_editor(editor, args, project, Some(path))
 }

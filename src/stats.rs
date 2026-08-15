@@ -592,6 +592,55 @@ fn rotated_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Create `dir` with mode `0700` if it does not already exist. Only `dir`
+/// itself is tightened — any missing ancestors (`~/.local/state`, say) are
+/// created at the process umask, because they are shared system directories
+/// scout has no business narrowing. A `dir` that already exists is left
+/// alone: `calls.jsonl` can carry full command strings and project paths
+/// (§ security note in the module doc), so a freshly-created state dir
+/// should not be world-readable, but a mode the user set on purpose —
+/// deliberately or not — is not ours to override after the fact.
+#[cfg(unix)]
+fn ensure_private_dir(dir: &Path) {
+    if dir.exists() {
+        return;
+    }
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::os::unix::fs::DirBuilderExt;
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+}
+
+#[cfg(not(unix))]
+fn ensure_private_dir(dir: &Path) {
+    let _ = std::fs::create_dir_all(dir);
+}
+
+/// Open `path` for appending, creating it with mode `0600` if it does not
+/// already exist. `calls.jsonl` persists full command strings and project
+/// paths, so a freshly-created log must not land at the process umask
+/// (typically `0644`). `create_new` is what makes this creation-time-only —
+/// on the common "already there" path it falls back to a plain append-open
+/// that touches no permission bit, matching `ensure_private_dir`'s rule that
+/// an existing file's mode is never ours to change.
+#[cfg(unix)]
+fn open_for_append(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::OpenOptions::new().append(true).open(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_for_append(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
 /// Append one line, rotating first if the file is over the cap.
 ///
 /// Fail-open is the whole contract here: every step is best-effort and any
@@ -614,18 +663,17 @@ fn rotated_path(path: &Path) -> PathBuf {
 /// machinery than this earns.
 fn append_line(path: &Path, line: &str) {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        ensure_private_dir(parent);
     }
-    let opts = {
-        let mut o = std::fs::OpenOptions::new();
-        o.create(true).append(true);
-        o
-    };
-    let Ok(mut f) = opts.open(path) else { return };
+    let Ok(mut f) = open_for_append(path) else { return };
     if f.metadata().map(|m| m.len() >= MAX_LOG_BYTES).unwrap_or(false) {
         drop(f);
         let _ = std::fs::rename(path, rotated_path(path));
-        let Ok(reopened) = opts.open(path) else { return };
+        // The rotated-away name is gone from `path`, so this is a fresh
+        // creation too — `open_for_append` gives the reopened file the same
+        // `0600` the original got, rather than whatever the rotation's
+        // `rename`+reopen would land at under the umask.
+        let Ok(reopened) = open_for_append(path) else { return };
         f = reopened;
     }
     // One write_all, not writeln!.  `writeln!` reaches the fd twice — once for
@@ -1200,6 +1248,73 @@ mod tests {
         let r = parse_log(&path).unwrap();
         let presets: Vec<&str> = r.rows.iter().map(|(n, _)| n.as_str()).collect();
         assert!(presets.contains(&"grep") && presets.contains(&"extract"), "{presets:?}");
+    }
+
+    // ── file/dir permissions (security cleanup ahead of going public) ─────
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_freshly_created_log_file_is_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        // A nested path so the parent state dir also has to be created —
+        // exercising both halves of the fix in one call.
+        let path = dir.path().join("scout").join("calls.jsonl");
+        append_line(&path, &json!({"preset": "grep", "ok": true}).to_string());
+        assert_eq!(mode_of(&path), 0o600, "calls.jsonl can carry full command strings");
+        assert_eq!(mode_of(path.parent().unwrap()), 0o700, "the state dir must not be group/other readable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_log_files_mode_is_never_widened_by_a_later_append() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        std::fs::write(&path, "").unwrap();
+        // Simulate a file that predates this fix, or that the user
+        // deliberately loosened — append must not touch its mode either way.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        append_line(&path, &json!({"preset": "grep", "ok": true}).to_string());
+        assert_eq!(mode_of(&path), 0o644, "an existing file's mode is not ours to change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_state_dirs_mode_is_never_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("scout");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = state_dir.join("calls.jsonl");
+        append_line(&path, &json!({"preset": "grep", "ok": true}).to_string());
+        assert_eq!(mode_of(&state_dir), 0o775, "a pre-existing dir's mode is not ours to change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_reopened_file_after_rotation_is_still_0600() {
+        // The case flagged as most likely to regress: a rotation that
+        // renames-and-reopens must not land the new generation back at the
+        // process umask.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("calls.jsonl");
+        let fat = json!({"ts": 1_770_000_000u64, "preset": "grep", "ok": true, "pad": "x".repeat(4096)});
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) < MAX_LOG_BYTES {
+            append_line(&path, &fat.to_string());
+        }
+        assert_eq!(mode_of(&path), 0o600, "pre-rotation generation is 0600");
+
+        append_line(&path, &json!({"preset": "extract", "ok": true}).to_string());
+        assert!(rotated_path(&path).exists());
+        assert_eq!(mode_of(&path), 0o600, "the reopened post-rotation file must also be 0600");
+        assert_eq!(mode_of(&rotated_path(&path)), 0o600, "and the renamed-away generation keeps its mode");
     }
 
     // ── parse_log / report aggregation ───────────────────────────────────
