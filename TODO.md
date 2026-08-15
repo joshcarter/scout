@@ -47,3 +47,41 @@ also validate `[llm] model` against `/v1/models` at config load.
 Worth carrying the observed model into the call log too, since
 `SPEC-dashboard.md` §3 already records a `model` field per call — it
 should be the model that ran, not the one requested.
+
+# Decide whether the shell-safety hook still earns its place
+
+It predates Claude Code's auto-approve mode and may now be redundant. The
+removal is scoped and mechanical; what is not settled is whether auto mode
+covers the case the hook exists for — commands whose effect depends on
+`$(...)` or `$VAR`, which a static allowlist cannot decide. There is no way to
+ask the harness offline, so shadow mode (committed) is the instrument: it
+classifies and logs as usual but withholds the allow.
+
+To run the experiment: `touch ~/.claude/scout-shell-safety.shadow`, work
+normally for a week, then count `allow-shadow` in
+`~/.claude/scout-shell-safety.jsonl`. Each of those is a command the hook would
+have approved, so a prompt seen on one is a case auto mode did not cover. Give
+it a full week — the log has multi-day gaps, and daily volume swings with what
+is being worked on (421 allows over one 8-day window, but 232 of them on a
+single day).
+
+If it goes: delete `hooks/shell-safety.sh`, its `hooks.json` block,
+`tests/test-shell-safety.sh`, and the auto-allow paragraph in
+`scripts/session-context.sh`. Then `presets/shell_safety.toml` has no caller —
+drop it, its `include_str!` in `src/presets/mod.rs` (the "8 built-in presets"
+comment becomes 7), its two tests in `src/presets/tests.rs`, the
+`"check_output" | "shell_safety"` arm in `src/stats.rs`, and the
+`[shell_safety] deny` block in `config.example.toml`, which only this hook
+reads.
+
+The telemetry coupling is the part worth thinking about rather than deleting on
+sight: `shell-safety.sh` is the only writer of `SCOUT_VIA=hook`, so `via:hook`
+becomes a category nothing produces (`VIA_HOOK`/`KNOWN_VIA` in `src/stats.rs`,
+used nowhere else). The 8 MB rotation cap in `src/stats.rs` is sized on this
+hook firing per Bash call, the dashboard's `hook traffic` filter defaults to
+off to keep its volume out of the way, and `src/live.rs` cites it as the
+latency case to protect. All four rationales expire with the hook.
+
+Docs to sweep: `README.md`, `CLAUDE.md`, `SPEC-grok-plugin.md`,
+`SPEC-dashboard.md`, `PLAN.md`, and the contrast comments in
+`hooks/prefer-local-llm.sh` explaining why that hook is the one that denies.
