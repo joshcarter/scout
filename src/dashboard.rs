@@ -645,6 +645,10 @@ struct State {
     reach: Mutex<Reach>,
     started: SystemTime,
     port: u16,
+    /// The live socket's path — `None` when the bind failed, or when this is
+    /// not a real daemon.  Re-checked on the reachability timer; see
+    /// `socket_still_bound`.
+    live_socket: Option<PathBuf>,
 }
 
 impl State {
@@ -685,8 +689,38 @@ impl State {
                 "bodies": bodies,
                 "finds": finds,
                 "streams": streams,
+                // Should equal `streams`. A gap means a handler is holding a
+                // `MAX_STREAMS` slot for a stream the fan-out has stopped
+                // feeding, which used to be the fate of any tab that fell one
+                // window behind — see `LiveStore::apply_json`.
+                "subscribers": self.live.subscriber_count(),
             },
         })
+    }
+}
+
+/// Is there still a socket at `path` for writers to find?
+///
+/// `bound` used to be a startup snapshot — stamped once and never revisited —
+/// so a daemon whose socket name had been taken away went on reporting
+/// `"bound": true` while receiving nothing.  The fd stays open and valid
+/// whatever happens on disk; what a writer has is the *name*, so the name is
+/// what `/api/status` should be reporting on.
+///
+/// Deliberately "a socket is there", not "*our* socket is there".  A path stat
+/// cannot answer the stronger question: `fstat` on an `AF_UNIX` socket reports
+/// its sockfs inode rather than the directory entry `bind(2)` created, so
+/// there is nothing to compare the fd against, and `(dev, ino)` taken from the
+/// path at bind time is no good either — an unlink-and-rebind reuses the inode
+/// often enough that the check would silently pass.  Port-qualifying the
+/// socket path (see `live::socket_path_for`) is what makes the stronger
+/// question moot: no other daemon binds this name any more.  What is left, and
+/// what this catches, is the name going away.
+fn socket_still_bound(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::metadata(path).map(|m| m.file_type().is_socket()).unwrap_or(false)
     }
 }
 
@@ -994,6 +1028,7 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8])
     let text = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         431 => "Request Header Fields Too Large",
@@ -1127,7 +1162,72 @@ fn read_header_line(stream: &mut TcpStream, max_bytes: usize, deadline: std::tim
     }
 }
 
-/// One connection: request line, discard headers, route, close.
+/// The authorities this daemon answers to: its own loopback address, or
+/// `localhost`, on its own port.
+///
+/// The bind is 127.0.0.1 and both `bind_tcp_reuse` and `filter_config` explain
+/// at length why — scout's payloads carry file contents from every repo the
+/// user works in, so there is no other bind address worth supporting.  That
+/// reasoning is right and the bind is right, but loopback binding does not
+/// stop a page the user merely *visits*.  DNS rebinding was invented for
+/// exactly this: `attacker.example` resolves to its own IP, serves a page,
+/// re-resolves to 127.0.0.1, and from then on the page's `fetch` and
+/// `EventSource` calls are same-origin as far as the browser is concerned —
+/// at which point `/api/history` and `/api/call/<id>` hand over the full
+/// `system` / `user` / `response` text of every call the daemon holds.
+///
+/// The one field that still carries the attacker's name through all of that is
+/// `Host:`, which this server was reading off the wire and dropping with the
+/// rest of the headers.  Now it is the gate.
+///
+/// A missing `Host` is rejected too: HTTP/1.1 requires one, and a client that
+/// omits it is not a browser that could have been rebound — but it is also not
+/// something this daemon needs to serve.
+///
+/// `[::1]` is deliberately absent: the listener is bound to the IPv4 loopback
+/// only, so nothing can reach it over v6 to send that authority in the first
+/// place.
+fn authority_is_ours(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else { return false };
+    let host = host.trim().to_ascii_lowercase();
+    // Split from the right, then check: an IPv6 literal has colons of its own,
+    // and a trailing group that is not all digits is not a port.
+    let (name, given) = match host.rsplit_once(':') {
+        Some((n, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (n, Some(p)),
+        _ => (host.as_str(), None),
+    };
+    let port_ok = match given {
+        Some(p) => p.parse::<u16>() == Ok(port),
+        // A browser omits the port when it is the scheme's default, so a
+        // daemon on 80 legitimately sees a bare authority.  Every other port
+        // must be spelled out, which is what makes this check worth anything.
+        None => port == 80,
+    };
+    port_ok && matches!(name, "127.0.0.1" | "localhost")
+}
+
+/// Reject an `Origin` that is present and foreign.
+///
+/// Belt and braces rather than the load-bearing check: a genuinely
+/// cross-origin `fetch` is already useless to an attacker, because this server
+/// has never sent CORS response headers and the browser will not let the page
+/// read the body.  And the rebinding case sends no `Origin` at all — the page
+/// believes it *is* same-origin.  So an `Origin` that is present and not ours
+/// can only be a cross-origin attempt, and refusing it costs one comparison.
+/// Absent is accepted: that is what every same-origin GET, every `EventSource`
+/// and every `curl` looks like.
+fn origin_is_ours(origin: &str, port: u16) -> bool {
+    let origin = origin.trim();
+    // `Origin: null` is what a sandboxed iframe or a `file://` page sends.
+    match origin.split_once("://") {
+        Some((scheme, authority)) if scheme.eq_ignore_ascii_case("http") => {
+            authority_is_ours(Some(authority), port)
+        }
+        _ => false,
+    }
+}
+
+/// One connection: request line, headers, route, close.
 ///
 /// `HTTP/1.0 Connection: close` throughout — everything here is a GET of a
 /// small body, and there is no state to mutate.
@@ -1147,17 +1247,34 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
         LineOutcome::Eof | LineOutcome::TimedOut => return,
     };
 
-    // Headers are read and dropped: no route takes a body. Bounded the same
-    // way as the request line, plus a count cap of its own.
+    // Headers are read for `Host` and `Origin` and otherwise dropped: no route
+    // takes a body. Bounded the same way as the request line, plus a count cap
+    // of its own.
     let mut header_count = 0usize;
+    let mut host: Option<String> = None;
+    let mut origin: Option<String> = None;
     loop {
         match read_header_line(&mut stream, MAX_HEADER_LINE_BYTES, deadline) {
             LineOutcome::Line(l) if l.trim().is_empty() => break, // end of headers
-            LineOutcome::Line(_) => {
+            LineOutcome::Line(l) => {
                 header_count += 1;
                 if header_count > MAX_HEADER_COUNT {
                     respond(&mut stream, 431, "text/plain", b"too many headers");
                     return;
+                }
+                let Some((name, value)) = l.split_once(':') else { continue };
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "host" => {
+                        // Two `Host`s is ambiguous by construction, and picking
+                        // either one is how a check like this gets walked past.
+                        if host.is_some() {
+                            respond(&mut stream, 403, "text/plain", b"ambiguous Host header\n");
+                            return;
+                        }
+                        host = Some(value.trim().to_string());
+                    }
+                    "origin" => origin = Some(value.trim().to_string()),
+                    _ => {}
                 }
             }
             LineOutcome::TooLong => {
@@ -1166,6 +1283,17 @@ fn handle(state: &Arc<State>, mut stream: TcpStream) {
             }
             LineOutcome::Eof | LineOutcome::TimedOut => return,
         }
+    }
+
+    // Before the route, before the method: a rebound page must not reach any
+    // of them. See `authority_is_ours`.
+    if !authority_is_ours(host.as_deref(), state.port) {
+        respond(&mut stream, 403, "text/plain", b"forbidden: Host is not this dashboard\n");
+        return;
+    }
+    if origin.as_deref().is_some_and(|o| !origin_is_ours(o, state.port)) {
+        respond(&mut stream, 403, "text/plain", b"forbidden: cross-origin request\n");
+        return;
     }
 
     let mut parts = request_line.split_whitespace();
@@ -1265,12 +1393,16 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
     tail.reload();
 
     let live = Arc::new(crate::live::LiveStore::new());
-    let live_sock = match crate::live::bind_socket() {
+    let mut live_socket = None;
+    let live_sock = match crate::live::bind_socket(port) {
         Ok(sock) => {
             live.set_bound(true);
-            if let Some(c) = crate::live::socket_cstring() {
+            if let Some(c) = crate::live::socket_cstring(port) {
                 let _ = SOCKET_C.set(c);
             }
+            // Remember the name, so `bound` can stay a fact rather than a
+            // startup snapshot.  See `socket_still_bound`.
+            live_socket = crate::live::socket_path_for(port);
             Some(sock)
         }
         Err(e) => {
@@ -1285,6 +1417,7 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
         reach: Mutex::new(Reach::default()),
         started: SystemTime::now(),
         port,
+        live_socket,
     });
 
     if let Some(sock) = live_sock {
@@ -1317,6 +1450,11 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
                     .set_abandon_after_secs(fresh.timeout_secs + crate::live::ABANDON_GRACE_SECS);
             }
             *state.reach.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+            // `bound` is re-derived here rather than left as the startup
+            // snapshot it used to be; see `socket_still_bound`.
+            if let Some(path) = &state.live_socket {
+                state.live.set_bound(socket_still_bound(path));
+            }
             // Same cadence, and it wants the bound this cycle just read: an
             // in-flight row whose process was killed reports nothing and lands
             // in no log, so nothing but elapsed time can retire it.
@@ -2239,15 +2377,21 @@ mod tests {
         assert_eq!(p["since"], "%€");
     }
 
-    #[test]
-    fn the_status_marker_is_what_a_probe_looks_for() {
-        let state = State {
+    /// A `State` with nothing behind it: no log, no live socket, no daemon.
+    fn test_state(port: u16, live: Arc<crate::live::LiveStore>) -> State {
+        State {
             tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
-            live: Arc::new(crate::live::LiveStore::new()),
+            live,
             reach: Mutex::new(Reach::default()),
             started: SystemTime::now(),
-            port: 13001,
-        };
+            port,
+            live_socket: None,
+        }
+    }
+
+    #[test]
+    fn the_status_marker_is_what_a_probe_looks_for() {
+        let state = test_state(13001, Arc::new(crate::live::LiveStore::new()));
         let v = state.status_json();
         assert_eq!(v["service"], SERVICE, "liveness is decided by this field, not the pid");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
@@ -2257,63 +2401,70 @@ mod tests {
         assert_eq!(v["live"]["streams"], 0);
     }
 
-    #[test]
-    fn stream_is_sse_not_501() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let state = Arc::new(State {
-            tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
-            live: Arc::new(crate::live::LiveStore::new()),
-            reach: Mutex::new(Reach::default()),
-            started: SystemTime::now(),
-            port: addr.port(),
-        });
-        std::thread::spawn(move || {
-            let (s, _) = listener.accept().unwrap();
-            handle(&state, s);
-        });
-        let mut c = TcpStream::connect(addr).unwrap();
-        c.write_all(b"GET /api/stream HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut buf = [0u8; 256];
-        let n = c.read(&mut buf).unwrap_or(0);
-        let text = String::from_utf8_lossy(&buf[..n]);
-        assert!(text.contains("text/event-stream"), "{text}");
-        assert!(!text.contains("501"), "{text}");
-        // The handler thread is released by the 15s keepalive write failing
-        // after we drop the client; that bound is the leak test. Asserting it
-        // here would stall the suite for a quarter of a minute.
-        drop(c);
-    }
-
-    /// Spin up a real listener on `handle`, send `request` over a real
-    /// socket, and return whatever comes back before the peer closes.
+    /// Serve exactly one connection on an ephemeral port and hand the caller
+    /// the client end, so a test can drive `handle` the way a browser does.
     ///
-    /// Exercises the bounded header reader (`read_header_line`) exactly as a
-    /// real client would drive it — through `TcpStream`, not by calling
-    /// internal parsing functions directly — since the bug this guards
-    /// against (unbounded growth reading the request line and headers off
-    /// the wire) only shows up at that layer.
-    fn send_raw(request: &[u8]) -> String {
+    /// The port is only known after the bind, and `Host:` has to carry it —
+    /// hence the closure rather than a literal request.
+    fn serve_one(
+        live: Arc<crate::live::LiveStore>,
+        build: impl FnOnce(u16) -> Vec<u8>,
+    ) -> (TcpStream, u16) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = Arc::new(State {
-            tail: Mutex::new(Tail::new(PathBuf::from("/nonexistent"))),
-            live: Arc::new(crate::live::LiveStore::new()),
-            reach: Mutex::new(Reach::default()),
-            started: SystemTime::now(),
-            port: addr.port(),
-        });
+        let state = Arc::new(test_state(addr.port(), live));
         std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             handle(&state, s);
         });
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        c.write_all(request).unwrap();
+        c.write_all(&build(addr.port())).unwrap();
+        (c, addr.port())
+    }
+
+    #[test]
+    fn stream_is_sse_not_501() {
+        let (mut c, _) = serve_one(Arc::new(crate::live::LiveStore::new()), |port| {
+            format!("GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()
+        });
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 256];
+        let n = c.read(&mut buf).unwrap_or(0);
+        let text = String::from_utf8_lossy(&buf[..n]);
+        assert!(text.contains("text/event-stream"), "{text}");
+        assert!(!text.contains("501"), "{text}");
+        drop(c);
+    }
+
+    /// Spin up a real listener on `handle`, send a request over a real socket,
+    /// and return whatever comes back before the peer closes.
+    ///
+    /// Exercises the bounded header reader (`read_header_line`) exactly as a
+    /// real client would drive it — through `TcpStream`, not by calling
+    /// internal parsing functions directly — since the bug this guards
+    /// against (unbounded growth reading the request line and headers off
+    /// the wire) only shows up at that layer.  The `Host` gate lives at the
+    /// same layer, and is driven the same way.
+    fn send_built(build: impl FnOnce(u16) -> Vec<u8>) -> String {
+        let (mut c, _) = serve_one(Arc::new(crate::live::LiveStore::new()), build);
         let mut buf = Vec::new();
         c.read_to_end(&mut buf).unwrap_or(0);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn send_raw(request: &[u8]) -> String {
+        let owned = request.to_vec();
+        send_built(move |_| owned)
+    }
+
+    /// `GET <target>` with one extra header line (already `\r\n`-terminated,
+    /// or empty), carrying whatever `Host` the caller wants.
+    fn get_with_host(target: &str, host: &str, extra: &str) -> String {
+        send_built(|port| {
+            let host = host.replace("{port}", &port.to_string());
+            format!("GET {target} HTTP/1.1\r\n{host}{extra}\r\n").into_bytes()
+        })
     }
 
     #[test]
@@ -2321,7 +2472,8 @@ mod tests {
         // Comfortably past `MAX_HEADER_LINE_BYTES` (8 KiB), but small enough
         // to fit in one write without needing a concurrent reader — this is
         // about proving the *server* stops growing its buffer at the cap,
-        // not about proving TCP flow control.
+        // not about proving TCP flow control.  The request line is rejected
+        // before any header is read, so `Host` never comes into it.
         let path = "/".to_string() + &"a".repeat(MAX_HEADER_LINE_BYTES + 1000);
         let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
         let resp = send_raw(request.as_bytes());
@@ -2343,11 +2495,161 @@ mod tests {
 
     #[test]
     fn a_well_formed_request_still_routes_normally_through_the_bounded_reader() {
-        let resp = send_raw(b"GET /api/status HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n");
+        let resp = get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Accept: */*\r\n");
         assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
         let body = resp.split("\r\n\r\n").nth(1).expect("a body after the headers");
         let v: Value = serde_json::from_str(body).expect("a JSON status body");
         assert_eq!(v["service"], SERVICE);
+    }
+
+    // ── DNS rebinding (`authority_is_ours`) ──────────────────────────────
+
+    /// The attack, end to end: a page served from `attacker.example`, whose
+    /// name re-resolves to 127.0.0.1, asking for every prompt body the daemon
+    /// holds.  Before the gate this answered 200 with the lot.
+    #[test]
+    fn a_rebound_page_cannot_read_the_history() {
+        for target in ["/", "/api/status", "/api/history", "/api/stats", "/api/call/x-1"] {
+            let resp = get_with_host(target, "Host: attacker.example\r\n", "");
+            assert!(resp.starts_with("HTTP/1.0 403"), "{target}: {resp}");
+            assert!(resp.contains("not this dashboard"), "{target}: {resp}");
+        }
+        // Right name, wrong port: an attacker who guessed 13001 while this
+        // daemon is elsewhere is still an attacker.
+        let resp = get_with_host("/api/history", "Host: 127.0.0.1:1\r\n", "");
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+        // …and a name that merely ends in ours.
+        let resp = get_with_host("/api/history", "Host: not-localhost:{port}\r\n", "");
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+    }
+
+    /// HTTP/1.1 requires `Host`; a request without one has nothing to check.
+    #[test]
+    fn a_request_with_no_host_is_rejected() {
+        let resp = get_with_host("/api/status", "", "");
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+        // Two of them is ambiguous, which is how such a gate gets walked past.
+        let resp =
+            get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Host: attacker.example\r\n");
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+        assert!(resp.contains("ambiguous"), "{resp}");
+    }
+
+    /// Both authorities a browser can actually produce for this daemon.
+    /// `dashboard.html` fetches its own origin, so breaking either breaks the
+    /// page — `url_for` hands out `localhost`, and `probe` uses `127.0.0.1`.
+    #[test]
+    fn the_dashboards_own_origins_are_accepted() {
+        for host in ["Host: 127.0.0.1:{port}\r\n", "Host: localhost:{port}\r\n", "Host: LocalHost:{port}\r\n"] {
+            let resp = get_with_host("/api/status", host, "");
+            assert!(resp.starts_with("HTTP/1.0 200"), "{host}: {resp}");
+        }
+        // The page itself, which is the one route a browser asks for by hand.
+        let resp = get_with_host("/", "Host: localhost:{port}\r\n", "");
+        assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
+        assert!(resp.contains("text/html"), "{resp}");
+    }
+
+    /// A same-origin `fetch`/`EventSource` sends no `Origin` at all — and so
+    /// does a rebound one, which is why `Host` is the load-bearing check. A
+    /// present-and-foreign `Origin` can only be a real cross-origin attempt.
+    #[test]
+    fn a_foreign_origin_is_refused_and_our_own_is_not() {
+        let resp = get_with_host(
+            "/api/history",
+            "Host: 127.0.0.1:{port}\r\n",
+            "Origin: https://attacker.example\r\n",
+        );
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+        assert!(resp.contains("cross-origin"), "{resp}");
+
+        let resp =
+            get_with_host("/api/status", "Host: 127.0.0.1:{port}\r\n", "Origin: null\r\n");
+        assert!(resp.starts_with("HTTP/1.0 403"), "{resp}");
+
+        let resp = send_built(|port| {
+            format!(
+                "GET /api/status HTTP/1.1\r\nHost: localhost:{port}\r\n\
+                 Origin: http://localhost:{port}\r\n\r\n"
+            )
+            .into_bytes()
+        });
+        assert!(resp.starts_with("HTTP/1.0 200"), "{resp}");
+    }
+
+    #[test]
+    fn the_authority_gate_reads_the_way_a_browser_writes_it() {
+        assert!(authority_is_ours(Some("127.0.0.1:13001"), 13001));
+        assert!(authority_is_ours(Some("localhost:13001"), 13001));
+        assert!(authority_is_ours(Some(" LOCALHOST:13001 "), 13001));
+        assert!(!authority_is_ours(None, 13001), "HTTP/1.1 requires a Host");
+        assert!(!authority_is_ours(Some(""), 13001));
+        assert!(!authority_is_ours(Some("localhost"), 13001), "the port is half the check");
+        assert!(!authority_is_ours(Some("localhost:13002"), 13001));
+        assert!(!authority_is_ours(Some("attacker.example"), 13001));
+        assert!(!authority_is_ours(Some("localhost.attacker.example:13001"), 13001));
+        assert!(!authority_is_ours(Some("127.0.0.2:13001"), 13001), "not the bound address");
+        assert!(!authority_is_ours(Some("[::1]:13001"), 13001), "the listener is v4-only");
+        // Only on 80 may a browser leave the port off.
+        assert!(authority_is_ours(Some("localhost"), 80));
+        assert!(!authority_is_ours(Some("attacker.example"), 80));
+    }
+
+    /// `bound` was stamped once at startup and never revisited, so a daemon
+    /// whose socket had been unlinked went on claiming `"bound": true` while
+    /// receiving nothing — the one fact `/api/status` most needs to get right.
+    #[test]
+    fn bound_stops_being_true_once_the_socket_name_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sock");
+        assert!(!socket_still_bound(&path), "nothing bound yet");
+
+        let sock = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        assert!(socket_still_bound(&path));
+
+        // What `on_terminate` and `bind_socket` both do, unconditionally.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!socket_still_bound(&path), "the fd is fine; the name is what writers have");
+        drop(sock);
+
+        // A plain file at the name is not a socket either.
+        std::fs::write(&path, b"").unwrap();
+        assert!(!socket_still_bound(&path));
+    }
+
+    /// A stream slot is held for as long as the handler thread runs, so the
+    /// handler has to notice the client leaving.  Eight of these is the whole
+    /// `MAX_STREAMS` budget, and nobody closes dashboard tabs.
+    #[test]
+    fn a_stream_releases_its_slot_when_the_client_goes_away() {
+        let live = Arc::new(crate::live::LiveStore::new());
+        let (mut c, _) = serve_one(Arc::clone(&live), |port| {
+            format!("GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").into_bytes()
+        });
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 256];
+        assert!(c.read(&mut buf).unwrap_or(0) > 0, "SSE headers");
+        assert_eq!(live.stream_count(), 1);
+        assert_eq!(live.subscriber_count(), 1, "a slot and a subscription, in step");
+
+        drop(c);
+        // Writes to a closed peer succeed once (they are buffered) and fail on
+        // the RST that comes back, so push until the handler notices.
+        let mut released = false;
+        for n in 0..200 {
+            let ev = json!({
+                "v": 1, "id": format!("s-{n}"), "run": "r", "op": format!("o-{n}"),
+                "kind": "call.start", "ts": 1.0, "tool": "t", "preset": "t",
+            });
+            live.apply_json(&ev.to_string());
+            if live.stream_count() == 0 {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(released, "the handler thread kept a MAX_STREAMS slot forever");
+        assert_eq!(live.subscriber_count(), 0, "and the fan-out stopped feeding it");
     }
 
     #[test]

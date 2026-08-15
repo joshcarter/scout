@@ -59,13 +59,47 @@ const RCVBUF: libc::c_int = 4 * 1024 * 1024;
 
 // ── Path ────────────────────────────────────────────────────────────────────
 
-/// Where the daemon binds and writers connect.
-///
-/// 1. `$SCOUT_LIVE_SOCK` — tests and custom layouts, same idea as
-///    `$SCOUT_CALLS_LOG`.
-/// 2. `$XDG_RUNTIME_DIR/scout/live.sock`
-/// 3. the state dir (`$XDG_STATE_HOME/scout` or `~/.local/state/scout`)
+/// Where a *writer* connects: the socket of the daemon on the configured
+/// default port, which is the only one a short-lived scout process knows how
+/// to look for.
 pub fn socket_path() -> Option<PathBuf> {
+    resolve_socket_path(DEFAULT_SOCKET_NAME)
+}
+
+/// Where the daemon on `port` binds.
+///
+/// Port-qualified for every port but the configured default, for precisely the
+/// reason `dashboard::pid_path_for` already writes down about the *pidfile*:
+/// the SIGTERM handler unlinks this path unconditionally — it may only make
+/// async-signal-safe calls, so it cannot read the file back to check whose it
+/// is — and `bind_socket` unlinks it a second time before binding.  With one
+/// shared path a one-off `scout dashboard --port N` alongside the real one
+/// steals the primary's socket on the way up (the primary's fd stays open and
+/// valid, but nothing on disk points at it any more, so every writer's
+/// `connect(2)` reaches the interloper) and deletes it on the way down,
+/// leaving neither daemon reachable.  The reasoning was already correct one
+/// field over; it simply had not been applied here.
+///
+/// The default port keeps §5's unqualified `live.sock` so `socket_path` —
+/// which knows nothing about ports — still finds the real daemon.
+pub fn socket_path_for(port: u16) -> Option<PathBuf> {
+    let default = crate::filter_config::load_dashboard().port;
+    let name = if port == default {
+        DEFAULT_SOCKET_NAME.to_string()
+    } else {
+        format!("live-{port}.sock")
+    };
+    resolve_socket_path(&name)
+}
+
+const DEFAULT_SOCKET_NAME: &str = "live.sock";
+
+/// 1. `$SCOUT_LIVE_SOCK` — tests and custom layouts, same idea as
+///    `$SCOUT_CALLS_LOG`.  An explicit path is an explicit choice, so it is
+///    taken verbatim and is *not* port-qualified.
+/// 2. `$XDG_RUNTIME_DIR/scout/<name>`
+/// 3. the state dir (`$XDG_STATE_HOME/scout` or `~/.local/state/scout`)
+fn resolve_socket_path(name: &str) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SCOUT_LIVE_SOCK") {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
@@ -73,10 +107,10 @@ pub fn socket_path() -> Option<PathBuf> {
     }
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime.is_empty() {
-            return Some(PathBuf::from(runtime).join("scout").join("live.sock"));
+            return Some(PathBuf::from(runtime).join("scout").join(name));
         }
     }
-    state_dir().map(|d| d.join("live.sock"))
+    state_dir().map(|d| d.join(name))
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -481,14 +515,39 @@ fn ceil_char(s: &str, mut start: usize) -> &str {
 
 // ── Bind / unlink (daemon side) ─────────────────────────────────────────────
 
-/// Bind the live socket. Not fatal for the daemon if this fails.
-pub fn bind_socket() -> io::Result<std::os::unix::net::UnixDatagram> {
-    let path = socket_path().ok_or_else(|| io::Error::other("no live socket path"))?;
+/// Bind the live socket for the daemon on `port`. Not fatal for the daemon if
+/// this fails.
+///
+/// Owner-only, both the socket and any directory created for it.  A datagram
+/// socket at the process umask is world-writable enough for any other local
+/// process to send it forged `call.start`/`call.end` events and spoof rows in
+/// somebody else's dashboard — integrity rather than confidentiality, and low
+/// stakes on a single-user box, but it costs two lines.
+///
+/// The directory mode is set only when we create it (`DirBuilder::mode`), not
+/// stamped onto one that already exists: `$XDG_RUNTIME_DIR` is already 0700 by
+/// construction, and silently tightening a state directory the user made is
+/// not this function's business.  The socket's own mode is set right after
+/// `bind(2)` rather than by juggling the umask, which is process-global and
+/// would race any other thread creating a file.
+pub fn bind_socket(port: u16) -> io::Result<std::os::unix::net::UnixDatagram> {
+    let path = socket_path_for(port).ok_or_else(|| io::Error::other("no live socket path"))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
     }
     let _ = std::fs::remove_file(&path);
     let sock = std::os::unix::net::UnixDatagram::bind(&path)?;
+    // The window between `bind` and this chmod is a few microseconds wide and,
+    // for the `$XDG_RUNTIME_DIR` layout, sits behind a 0700 directory nothing
+    // else can traverse. Binding elsewhere and `rename`ing into place would
+    // close it outright, at the cost of a second path the SIGTERM handler
+    // would also have to know about — not worth it for a forged-telemetry
+    // window that short.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     let _ = sock.set_nonblocking(true);
     raise_rcvbuf(&sock);
     Ok(sock)
@@ -510,8 +569,12 @@ fn raise_rcvbuf(sock: &std::os::unix::net::UnixDatagram) {
 }
 
 /// Async-signal-safe path for the SIGTERM handler.
-pub fn socket_cstring() -> Option<std::ffi::CString> {
-    let path = socket_path()?;
+///
+/// Takes the port for the same reason `bind_socket` does: the handler unlinks
+/// whatever this returns, unconditionally, so it had better be this daemon's
+/// own socket and not the one next door.
+pub fn socket_cstring(port: u16) -> Option<std::ffi::CString> {
+    let path = socket_path_for(port)?;
     std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()
 }
 
@@ -612,6 +675,14 @@ impl LiveStore {
         self.streams.load(Ordering::Relaxed)
     }
 
+    /// Attached SSE subscribers. Should track `stream_count` exactly — the two
+    /// diverging means a handler is holding a slot for a stream the fan-out
+    /// has stopped feeding, which is the shape of the bug the `Full`/
+    /// `Disconnected` split in `apply_json` fixes.
+    pub fn subscriber_count(&self) -> usize {
+        self.lock().subs.len()
+    }
+
     /// Reserve a stream slot. False if the cap is already hit.
     pub fn try_acquire_stream(&self) -> bool {
         let mut current = self.streams.load(Ordering::Relaxed);
@@ -700,14 +771,32 @@ impl LiveStore {
                 }
                 _ => return false,
             }
-            let dead: Vec<usize> = inner
-                .subs
-                .iter()
-                .enumerate()
-                .filter_map(|(i, tx)| tx.try_send(raw.to_string()).err().map(|_| i))
-                .collect();
-            for i in dead.into_iter().rev() {
-                inner.subs.swap_remove(i);
+            // `Full` is not `Disconnected`, and treating them alike cost a
+            // subscriber its whole stream for one stutter. The channel holds
+            // `SUB_CAP` events and `call.token` coalesces at 50 ms, so a
+            // streaming reply is ~20 events a second — 32 slots is under two
+            // seconds of backlog, and a backgrounded tab or a briefly-closed
+            // TCP window reaches it easily. This is telemetry (see the module
+            // header): the *event* is what gets dropped, never the reader.
+            //
+            // `Disconnected` is the one fatal error, and it can only mean the
+            // handler thread has already gone — `handle_stream` returning is
+            // what drops the `Receiver`. Removing the `SyncSender` here is
+            // also what makes the converse hold: a subscriber the store lets
+            // go has its `recv_timeout` return `Disconnected` at once rather
+            // than at the next keepalive, so the handler exits and gives back
+            // its `MAX_STREAMS` slot instead of looping forever on a stream
+            // nothing will ever feed again.
+            let mut i = 0;
+            while i < inner.subs.len() {
+                match inner.subs[i].try_send(raw.to_string()) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => i += 1,
+                    // `swap_remove` moved the last element into `i`, so do not
+                    // advance past it.
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        inner.subs.swap_remove(i);
+                    }
+                }
             }
         }
         true
@@ -963,8 +1052,114 @@ mod tests {
         out
     }
 
+    /// Run `f` with the whole runtime layout redirected into `dir`, and with
+    /// `$SCOUT_LIVE_SOCK` out of the way so the port-qualified name is what
+    /// actually gets exercised.
+    fn with_runtime_dir<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        let saved_explicit = std::env::var("SCOUT_LIVE_SOCK").ok();
+        std::env::remove_var("SCOUT_LIVE_SOCK");
+        std::env::set_var("XDG_RUNTIME_DIR", dir);
+        reset_sender();
+        let out = f();
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        if let Some(v) = saved_explicit {
+            std::env::set_var("SCOUT_LIVE_SOCK", v);
+        }
+        reset_sender();
+        out
+    }
+
+    /// The configured default port, and some other port that is not it.
+    fn two_ports() -> (u16, u16) {
+        let default = crate::filter_config::load_dashboard().port;
+        (default, if default == u16::MAX { default - 1 } else { default + 1 })
+    }
+
     fn rec(tool: &str) -> CallRecord {
         CallRecord::new(tool, tool)
+    }
+
+    /// Two daemons, two sockets. With one shared path the interloper's
+    /// `bind_socket` unlinked the primary's socket and rebound the name, so
+    /// every writer's `connect(2)` reached the wrong daemon — and stopping the
+    /// interloper then unlinked the name for good, leaving neither reachable.
+    #[test]
+    fn a_second_daemon_on_another_port_does_not_steal_the_first_socket() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        with_runtime_dir(dir.path(), || {
+            let (default, other) = two_ports();
+
+            let primary = bind_socket(default).expect("primary binds");
+            let primary_path = socket_path_for(default).unwrap();
+            assert_eq!(
+                primary_path,
+                socket_path().unwrap(),
+                "the default port keeps the name writers look for"
+            );
+
+            // `scout dashboard --port <other>` alongside the real one.
+            let interloper = bind_socket(other).expect("interloper binds");
+            let interloper_path = socket_path_for(other).unwrap();
+            assert!(primary_path.exists(), "the primary's socket was unlinked under it");
+
+            // A writer knows only the default port; it must still land on the
+            // primary, and the interloper must hear nothing.
+            let w = connect_nonblocking(&socket_path().unwrap()).unwrap();
+            w.send(start_ev(1).as_bytes()).unwrap();
+
+            let mut buf = vec![0u8; 4096];
+            primary.set_nonblocking(false).unwrap();
+            primary.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let n = primary.recv(&mut buf).expect("the primary, not the interloper");
+            assert!(String::from_utf8_lossy(&buf[..n]).contains("call.start"));
+            match interloper.recv(&mut buf) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                other => panic!("the interloper intercepted the primary's traffic: {other:?}"),
+            }
+
+            // And stopping it — `on_terminate` unlinks its socket path
+            // unconditionally — takes only its own name with it.
+            assert_ne!(interloper_path, primary_path, "one name, two daemons");
+            let _ = std::fs::remove_file(&interloper_path);
+            drop(interloper);
+            assert!(primary_path.exists(), "the primary outlives its neighbour");
+        });
+    }
+
+    #[test]
+    fn the_live_socket_and_the_directory_it_makes_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        with_runtime_dir(dir.path(), || {
+            let (default, _) = two_ports();
+            let sock = bind_socket(default).unwrap();
+            let path = socket_path_for(default).unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "0{mode:o}: any local process could forge events at us");
+            let parent = std::fs::metadata(path.parent().unwrap()).unwrap();
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+            drop(sock);
+        });
+    }
+
+    /// An explicit `$SCOUT_LIVE_SOCK` is an explicit choice and stays verbatim
+    /// — the port qualification is for the paths scout picks for itself.
+    #[test]
+    fn an_explicit_socket_path_is_not_port_qualified() {
+        let _g = lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chosen.sock");
+        with_sock_env(&path, || {
+            assert_eq!(socket_path_for(13001).unwrap(), path);
+            assert_eq!(socket_path_for(13002).unwrap(), path);
+            assert_eq!(socket_path().unwrap(), path);
+        });
     }
 
     #[test]
@@ -1278,6 +1473,59 @@ mod tests {
         let ev = json!({"v":1,"id":"x","run":"r","op":"o","kind":"call.start","ts":1.0,"tool":"t","preset":"t"});
         store.apply_json(&ev.to_string());
         assert!(store.lock().subs.is_empty(), "a closed subscriber is pruned");
+    }
+
+    fn start_ev(n: usize) -> String {
+        json!({
+            "v": 1, "id": format!("id-{n}"), "run": "r", "op": format!("op-{n}"),
+            "kind": "call.start", "ts": 1.0, "tool": "t", "preset": "t",
+        })
+        .to_string()
+    }
+
+    /// The core regression: a reader that falls behind for a moment is *not* a
+    /// reader that has gone away. 32 slots is under two seconds of a streaming
+    /// reply, so this is the ordinary fate of a backgrounded tab.
+    #[test]
+    fn a_subscriber_that_stutters_once_survives_and_keeps_receiving() {
+        let store = LiveStore::new();
+        let rx = store.subscribe();
+
+        // Nobody draining: the channel fills, and every event past `SUB_CAP`
+        // comes back `Full`.
+        for n in 0..(SUB_CAP + 16) {
+            assert!(store.apply_json(&start_ev(n)));
+        }
+        assert_eq!(store.subscriber_count(), 1, "a full channel is backpressure, not death");
+
+        // The overflow is dropped — this is telemetry, and there is no replay
+        // buffer — but the buffered prefix is intact and in order.
+        let drained: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(drained.len(), SUB_CAP, "the channel held exactly its capacity");
+        let first: Value = serde_json::from_str(&drained[0]).unwrap();
+        assert_eq!(first["id"], "id-0");
+
+        // And the tab is still wired up once it has caught up, which is the
+        // whole point: it used to be gone for good.
+        assert!(store.apply_json(&start_ev(9_000)));
+        let got: Value = serde_json::from_str(&rx.try_recv().expect("still subscribed")).unwrap();
+        assert_eq!(got["id"], "id-9000");
+    }
+
+    /// The other half of the split: removing a subscriber must close its
+    /// channel *now*, so `handle_stream` breaks out and releases its
+    /// `MAX_STREAMS` slot instead of sitting on a 15 s keepalive.
+    #[test]
+    fn a_removed_subscriber_sees_its_channel_close_at_once() {
+        let store = LiveStore::new();
+        let rx = store.subscribe();
+        store.lock().subs.clear(); // what the `Disconnected` arm does
+        let t = std::time::Instant::now();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(15)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert!(t.elapsed() < Duration::from_secs(1), "the handler would have blocked");
     }
 
     #[test]
