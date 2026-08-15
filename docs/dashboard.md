@@ -150,6 +150,37 @@ over the socket, then again when its log line lands — and the daemon
 must merge, not duplicate. The store keys on `id` and upserts; the log is
 authoritative for summary fields, live events are enrichment.
 
+**And some calls only arrive once.** Reconciliation assumes every
+`call.start` is eventually answered — by a `call.end`, or by the log line
+that lets `reap` drop the in-flight row. A killed process answers with
+neither: `scout` has no SIGTERM handler, so when the shell-safety hook's
+`timeout` wrapper fires, the process dies between `emit_start` and the
+`emit_end`/`log()` pair. Nothing about that id is ever written again, so
+`reap` — which only knows ids the log contains — can never clear it. The
+row sits at `running` forever and the dashboard reads as busy with
+nothing running.
+
+So there is a second cleanup, `LiveStore::sweep`, on the reachability
+thread's 15s timer rather than on the read path: it is driven by elapsed
+time, and a read path that mutated rows on the wall clock would make
+every history response depend on when it was asked. A row still
+`running` past `[llm] timeout_seconds` + 30s is downgraded to the
+synthesized outcome `abandoned` — no scout process writes that one,
+because a process able to write it would have written its real outcome
+instead. The bound is derived from the config rather than fixed so it can
+never accuse a merely-slow call: scout itself would have given up first
+and said so.
+
+Abandoning is a downgrade, not a delete, and it is reversible — a late
+`call.end` or a log line still wins on `id`. Enough of them are kept to
+see a pattern, because they are the only trace these calls leave
+anywhere: killed processes write no log line, and the hook's own audit
+log records them only as an unparseable reply. They then leave on
+whichever bound comes first — age (`ABANDONED_RETAIN_SECS`, so the count
+in the header means *lately*, and a fixed problem stops being reported)
+or count (`MAX_ABANDONED`, so a bad afternoon cannot grow the store
+without limit).
+
 Best-effort everywhere, and **no replay buffer**: a dashboard started
 mid-call sees `call.end` with no `call.start`, and one started mid-`find`
 sees round 3 but not rounds 1–2. Both render as ordinary rows — the log
@@ -248,6 +279,11 @@ this required logging the fast paths in `extract.rs` and `grep.rs` that
 previously returned before any LLM call and so recorded nothing at all.
 Those rows carry a real `ms` and zero tokens.
 
+`running` and `abandoned` are not in that list because they never appear
+in the log: the first is an in-flight row, the second the daemon's verdict
+on one that stopped being in flight without saying so (§2). Both exist
+only in the live store.
+
 **`raw_bytes` / `returned_bytes`** are the context-saved metric.
 `raw_bytes` is the input scout digested — captured build output, file
 bytes read, total bytes of the pre-rerank hit list. `returned_bytes` is
@@ -320,6 +356,12 @@ Five panes: dark, monospace, three columns, poll-based.
 (`client.check_endpoint`, polled every 15 s — the one thing the log
 cannot tell you, and "is the model host even up" is the question asked
 most). Binary version. Connection status.
+
+Beside it, one line of bad news at a time, most-causal first: a config
+error, then `endpoint not responding`, then a count of calls killed
+before reporting (§2). The endpoint outranks the kills because when the
+endpoint is down it is *why* they were killed, and saying both would be
+saying it twice.
 
 **Overview** (left column):
 

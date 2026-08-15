@@ -31,6 +31,29 @@ pub const MAX_FINDS: usize = 200;
 /// Concurrent `/api/stream` connections. Each is a thread that lives as
 /// long as the browser tab.
 pub const MAX_STREAMS: usize = 8;
+/// How long past scout's own HTTP timeout an in-flight row waits for a
+/// `call.end` before the daemon gives up on it.
+///
+/// A live call cannot outrun `[llm] timeout_seconds` by more than the cost of
+/// getting the request out and the outcome back, so a row still "running"
+/// beyond that never reported and never will.
+pub const ABANDON_GRACE_SECS: u64 = 30;
+/// Fallback until the reachability thread has read a config: the shipped
+/// default `timeout_seconds` plus the grace.
+pub const ABANDON_AFTER_DEFAULT_SECS: u64 = 120 + ABANDON_GRACE_SECS;
+/// Abandoned rows are evidence the log will never hold — a process that died
+/// before reporting wrote no line — so enough of them are kept to see a
+/// pattern. Bounded by count, newest first.
+pub const MAX_ABANDONED: usize = 50;
+/// …and by age, so the count the header reports means "lately" rather than
+/// "since this daemon started". Without it a burst of kills would leave the
+/// warning lit for as long as the daemon ran, including long after whatever
+/// caused it was fixed.
+pub const ABANDONED_RETAIN_SECS: f64 = 3600.0;
+/// The synthesized outcome for a row the daemon gave up on. Not a
+/// `stats::Outcome`: no scout process ever writes it, because a process that
+/// could write it would have written its real outcome instead.
+pub const ABANDONED: &str = "abandoned";
 const SUB_CAP: usize = 32;
 const RCVBUF: libc::c_int = 4 * 1024 * 1024;
 
@@ -338,7 +361,7 @@ fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-fn now_ts() -> f64 {
+pub(crate) fn now_ts() -> f64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -533,6 +556,10 @@ pub struct LiveStore {
     inner: Mutex<Inner>,
     streams: AtomicUsize,
     bound: AtomicBool,
+    /// Seconds a row may sit at `running` before `sweep` abandons it. Kept
+    /// here rather than passed per call so the reachability thread — which
+    /// already re-reads `config.toml` every cycle — is the only writer.
+    abandon_after: AtomicU64,
 }
 
 struct Inner {
@@ -569,6 +596,7 @@ impl LiveStore {
             }),
             streams: AtomicUsize::new(0),
             bound: AtomicBool::new(false),
+            abandon_after: AtomicU64::new(ABANDON_AFTER_DEFAULT_SECS),
         }
     }
 
@@ -691,6 +719,71 @@ impl LiveStore {
         for id in log_ids {
             inner.inflight.remove(id.as_ref());
         }
+    }
+
+    pub fn set_abandon_after_secs(&self, secs: u64) {
+        self.abandon_after.store(secs.max(1), Ordering::Relaxed);
+    }
+
+    pub fn abandon_after_secs(&self) -> u64 {
+        self.abandon_after.load(Ordering::Relaxed)
+    }
+
+    /// Give up on in-flight rows that will never report, and bound how many
+    /// of the corpses we keep. Returns the number newly abandoned.
+    ///
+    /// `reap` alone cannot clear these. It drops ids the log has absorbed, and
+    /// a process killed mid-call writes no log line: the shell-safety hook
+    /// wraps scout in `timeout`, so SIGTERM lands between `emit_start` and the
+    /// `emit_end`/`log()` pair and the id never appears anywhere again. Without
+    /// a sweep the row sits at `running` forever and the dashboard reads as
+    /// busy when nothing is running at all.
+    ///
+    /// Abandoning is a downgrade, not a delete, and it is reversible: a late
+    /// `call.end` still matches on `id` and `apply_end` overwrites the kind
+    /// with the real outcome, as does the log line if one ever lands.
+    ///
+    /// Abandoned rows then leave on either bound, whichever comes first: age
+    /// (so the count means "lately") or count (so a bad afternoon cannot grow
+    /// the store without limit).
+    pub fn sweep(&self, now: f64) -> usize {
+        let cutoff = self.abandon_after_secs() as f64;
+        let mut inner = self.lock();
+        let mut newly = 0;
+        for row in inner.inflight.values_mut() {
+            if row.kind == "running" && now - row.ts > cutoff {
+                row.kind = ABANDONED.into();
+                row.ok = false;
+                row.ms = ((now - row.ts) * 1000.0).max(0.0) as u64;
+                row.summary = Some(format!(
+                    "no completion after {}s — the scout process was killed or died before reporting",
+                    cutoff as u64
+                ));
+                newly += 1;
+            }
+        }
+        inner.inflight.retain(|_, r| r.kind != ABANDONED || now - r.ts <= ABANDONED_RETAIN_SECS);
+        let mut dead: Vec<(f64, String)> = inner
+            .inflight
+            .values()
+            .filter(|r| r.kind == ABANDONED)
+            .map(|r| (r.ts, r.id.clone()))
+            .collect();
+        if dead.len() > MAX_ABANDONED {
+            let excess = dead.len() - MAX_ABANDONED;
+            dead.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, id) in dead.into_iter().take(excess) {
+                inner.inflight.remove(&id);
+            }
+        }
+        newly
+    }
+
+    /// How many inflight rows are still genuinely running vs. abandoned.
+    pub fn inflight_split(&self) -> (usize, usize) {
+        let inner = self.lock();
+        let abandoned = inner.inflight.values().filter(|r| r.kind == ABANDONED).count();
+        (inner.inflight.len() - abandoned, abandoned)
     }
 
     pub fn inflight_rows(&self) -> Vec<LiveRow> {
@@ -1007,6 +1100,128 @@ mod tests {
         store.reap(["r-1"]);
         assert!(store.inflight_rows().is_empty(), "log id wins");
         assert!(store.bodies_of("r-1").is_some(), "bodies survive reap");
+    }
+
+    /// A `call.start` with no id in `starts` and no `call.end` — a process
+    /// killed mid-call.
+    fn started(store: &LiveStore, id: &str, ts: f64) {
+        let ev = json!({
+            "v": 1, "id": id, "run": "r", "op": format!("{id}-op"),
+            "kind": "call.start", "ts": ts, "tool": "shell_safety",
+            "preset": "shell_safety", "via": "hook",
+        });
+        assert!(store.apply_json(&ev.to_string()));
+    }
+
+    #[test]
+    fn a_call_that_never_reports_is_abandoned_not_left_running_forever() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "k-1", 1000.0);
+
+        // Still inside the window: a slow call is not a dead one.
+        assert_eq!(store.sweep(1100.0), 0);
+        assert_eq!(store.inflight_rows()[0].kind, "running");
+
+        assert_eq!(store.sweep(1200.0), 1, "past the bound, give up on it");
+        let row = &store.inflight_rows()[0];
+        assert_eq!(row.kind, ABANDONED);
+        assert!(!row.ok, "an abandoned call is not a success");
+        assert_eq!(row.ms, 200_000, "elapsed stands in for the ms it never sent");
+        assert!(row.summary.as_deref().unwrap().contains("150s"), "{:?}", row.summary);
+
+        // Idempotent: sweeping again abandons nothing new.
+        assert_eq!(store.sweep(1300.0), 0);
+        assert_eq!(store.inflight_rows().len(), 1, "abandoning is a downgrade, not a delete");
+    }
+
+    /// The whole point of the two-threshold design: `reap` cannot clear a row
+    /// the log will never mention, which is exactly the killed-process case.
+    #[test]
+    fn reap_alone_cannot_clear_a_row_the_log_never_receives() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "k-1", 1000.0);
+        store.reap(["some-other-id", "and-another"]);
+        assert_eq!(store.inflight_rows().len(), 1, "reap only knows ids the log has");
+        store.sweep(1200.0);
+        assert_eq!(store.inflight_rows()[0].kind, ABANDONED);
+    }
+
+    #[test]
+    fn a_late_call_end_overrides_an_abandoned_row() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "k-1", 1000.0);
+        store.sweep(1200.0);
+        assert_eq!(store.inflight_rows()[0].kind, ABANDONED);
+
+        let end = json!({
+            "v": 1, "id": "k-1", "run": "r", "op": "k-1-op",
+            "kind": "call.end", "ts": 1201.0, "ms": 900,
+            "outcome": {"kind": "ok", "summary": "done"},
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+        });
+        assert!(store.apply_json(&end.to_string()));
+        let row = &store.inflight_rows()[0];
+        assert_eq!(row.kind, "ok", "the real outcome wins over the guess");
+        assert!(row.ok);
+        assert_eq!(row.ms, 900);
+    }
+
+    #[test]
+    fn a_log_line_still_reaps_an_abandoned_row() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "k-1", 1000.0);
+        store.sweep(1200.0);
+        store.reap(["k-1"]);
+        assert!(store.inflight_rows().is_empty(), "the log is still authoritative");
+    }
+
+    #[test]
+    fn abandoned_rows_are_capped_and_the_newest_survive() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(10);
+        for i in 0..(MAX_ABANDONED + 5) {
+            started(&store, &format!("k-{i}"), 1000.0 + i as f64);
+        }
+        // Past every row's abandon bound, but well inside the retention
+        // window — this is the count cap under test, not the age cap.
+        store.sweep(1100.0);
+        let rows = store.inflight_rows();
+        assert_eq!(rows.len(), MAX_ABANDONED, "unbounded growth is the bug being fixed");
+        assert!(rows.iter().any(|r| r.id == format!("k-{}", MAX_ABANDONED + 4)), "newest kept");
+        assert!(!rows.iter().any(|r| r.id == "k-0"), "oldest evicted");
+    }
+
+    /// The header warning counts these, so "since the daemon started" would
+    /// leave it lit long after the cause was fixed.
+    #[test]
+    fn abandoned_rows_stop_being_counted_once_they_are_stale() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "k-1", 1000.0);
+        store.sweep(1200.0);
+        assert_eq!(store.inflight_split(), (0, 1));
+
+        // Retention runs from when the call started, not from when we gave up
+        // on it — the row's `ts` is the only timestamp it ever had.
+        store.sweep(1000.0 + ABANDONED_RETAIN_SECS);
+        assert_eq!(store.inflight_split(), (0, 1), "still inside the retention window");
+
+        store.sweep(1000.0 + ABANDONED_RETAIN_SECS + 1.0);
+        assert_eq!(store.inflight_split(), (0, 0), "aged out");
+    }
+
+    #[test]
+    fn inflight_split_separates_the_live_from_the_lost() {
+        let store = LiveStore::new();
+        store.set_abandon_after_secs(150);
+        started(&store, "dead", 1000.0);
+        started(&store, "live", 1190.0);
+        store.sweep(1200.0);
+        assert_eq!(store.inflight_split(), (1, 1));
     }
 
     #[test]

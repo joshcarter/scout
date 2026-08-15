@@ -370,7 +370,18 @@
   const GLYPHS = {
     ok: ['\u2713', 'ok'], bypassed: ['\u2298', 'muted'], none_relevant: ['\u2205', 'muted'],
     running: ['\u25CF', 'running'],
+    // Hollow against running's filled dot: the call started and never closed.
+    // Distinct from a plain error: the model did not fail, we lost the call.
+    abandoned: ['\u25CC', 'err'],
   };
+  // Shown wherever an abandoned call would otherwise read as "not captured".
+  // The distinction matters: nothing was lost in transit, the call never
+  // finished. A killed process writes no log line either, so this row is the
+  // only trace that the call ever happened.
+  const ABANDONED_NOTE =
+    'no completion arrived \u2014 scout was killed or died before it could report.\n' +
+    'Most often a hook timeout: hooks wrap scout in `timeout`, and SIGTERM lands\n' +
+    'between the call starting and its outcome being written.';
   function glyph(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[0]; }
   function glyphClass(kind) { return (GLYPHS[kind] || ['\u2717', 'err'])[1]; }
   function viaClass(via) {
@@ -637,6 +648,8 @@
       html += streamBlock(r.id, streamed, r.kind === 'running');
     } else if (r.kind === 'running') {
       html += block('model response', 'waiting for the model\u2026', true);
+    } else if (r.kind === 'abandoned') {
+      html += block('model response', ABANDONED_NOTE, true);
     } else {
       html += block('model response',
         'not captured \u2014 the dashboard was not listening when this call finished.',
@@ -1131,9 +1144,14 @@
       $('llm-model').textContent = llm.model || 'no model configured';
       $('llm-endpoint').textContent = llm.endpoint || '';
       $('llm-dot').className = 'dot ' + (llm.reachable ? 'ok' : 'err');
+      // Abandoned calls rank below a dead endpoint: if the endpoint is down
+      // that is the cause, and saying both would be saying it twice.
+      const gone = (d.live || {}).abandoned || 0;
       $('llm-note').textContent = llm.error ? llm.error
-        : (llm.reachable ? '' : 'endpoint not responding');
-      $('llm-note').className = llm.error || !llm.reachable ? 'err' : 'muted';
+        : !llm.reachable ? 'endpoint not responding'
+        : gone ? gone + (gone === 1 ? ' call' : ' calls') + ' killed before reporting'
+        : '';
+      $('llm-note').className = llm.error || !llm.reachable || gone ? 'err' : 'muted';
       $('version').textContent = 'v' + (d.version || '?');
       $('uptime').textContent = 'up ' + fmtDur(d.uptime_secs || 0);
 

@@ -608,6 +608,9 @@ struct Reach {
     ms: u64,
     error: Option<String>,
     checked: f64,
+    /// `[llm] timeout_seconds`, carried out of the same config load so the
+    /// in-flight sweep can be bounded by what scout itself would wait.
+    timeout_secs: u64,
 }
 
 fn check_reachability() -> Reach {
@@ -617,6 +620,7 @@ fn check_reachability() -> Reach {
         .unwrap_or(0.0);
     match crate::config::load_config(&crate::config::config_path()) {
         Ok(cfg) => {
+            let timeout_secs = cfg.timeout.as_secs();
             let client = crate::client::LlmClient::new(cfg);
             let (reachable, ms) = client.check_endpoint();
             Reach {
@@ -626,6 +630,7 @@ fn check_reachability() -> Reach {
                 ms,
                 error: None,
                 checked: now,
+                timeout_secs,
             }
         }
         Err(e) => Reach { error: Some(e), checked: now, ..Default::default() },
@@ -650,6 +655,7 @@ impl State {
         drop(tail);
         let reach = self.reach.lock().unwrap_or_else(|e| e.into_inner());
         let (inflight, bodies, finds, streams) = self.live.snapshot();
+        let (running, abandoned) = self.live.inflight_split();
         json!({
             // The marker a liveness probe looks for (§5): a pidfile surviving
             // `kill -9` is common, so the port answering *as scout* is what
@@ -673,6 +679,9 @@ impl State {
             "live": {
                 "bound": self.live.bound(),
                 "inflight": inflight,
+                "running": running,
+                "abandoned": abandoned,
+                "abandon_after_secs": self.live.abandon_after_secs(),
                 "bodies": bodies,
                 "finds": finds,
                 "streams": streams,
@@ -823,6 +832,12 @@ fn row_from_live(r: &crate::live::LiveRow) -> Row {
 }
 
 /// Log rows plus any inflight rows the log has not yet absorbed.
+///
+/// Reaping happens here because it is driven by what the log now contains.
+/// The other cleanup — `LiveStore::sweep`, for rows the log will *never*
+/// contain — is on the daemon's timer instead: it is driven by elapsed time,
+/// and a read path that mutated rows on the wall clock would make every
+/// history response depend on when it was asked.
 fn merged_rows(tail: &Tail, live: &crate::live::LiveStore) -> Vec<Row> {
     live.reap(tail.rows.iter().map(|r| r.id.as_str()));
     let mut rows = tail.rows.clone();
@@ -1191,7 +1206,19 @@ fn run_foreground(port: u16) -> anyhow::Result<()> {
         let state = Arc::clone(&state);
         std::thread::spawn(move || loop {
             let fresh = check_reachability();
+            // A config read that failed leaves `timeout_secs` at 0; keep the
+            // store's existing bound rather than collapsing it to the grace
+            // period and abandoning calls that are merely slow.
+            if fresh.timeout_secs > 0 {
+                state
+                    .live
+                    .set_abandon_after_secs(fresh.timeout_secs + crate::live::ABANDON_GRACE_SECS);
+            }
             *state.reach.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
+            // Same cadence, and it wants the bound this cycle just read: an
+            // in-flight row whose process was killed reports nothing and lands
+            // in no log, so nothing but elapsed time can retire it.
+            state.live.sweep(crate::live::now_ts());
             std::thread::sleep(Duration::from_secs(15));
         });
     }
