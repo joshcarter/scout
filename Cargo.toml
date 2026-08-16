@@ -41,6 +41,7 @@ name = "scout-llm"
 version = "0.1.0"
 edition = "2021"
 description = "Local-LLM scout for coding agents: classifies build/test output, screens shell commands, and answers targeted code questions so the cloud model doesn't have to."
+license = "MIT"
 repository = "https://github.com/joshcarter/scout"
 
 # Everything lives in the library; the binary is argv parsing and dispatch.

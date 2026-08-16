@@ -213,18 +213,11 @@ can switch to [trusted publishing](https://crates.io/docs/trusted-publishing)
 
 ### 3.2 Manifest prerequisites
 
-`cargo package --list` already works. crates.io will not take the
-crate yet: there is no `LICENSE` file and no `license` /
-`license-file` in `Cargo.toml`. Cargo warns; the registry rejects.
-
-A license has to be a real decision — yank does not delete the
-uploaded source. For a CLI like this, `MIT` or `MIT OR Apache-2.0` is
-the usual Rust choice. Once picked, set `license` and add the file.
-
-Recommended metadata (description and repository are already there):
+`cargo package --list` already works. The crate is MIT: `LICENSE` is
+in the tree and `license = "MIT"` is in `Cargo.toml`. Description and
+repository are already there too. Remaining recommended metadata:
 
 ```toml
-license = "MIT"                          # or whatever is picked
 homepage = "https://github.com/joshcarter/scout"
 readme = "README.md"
 keywords = ["llm", "cli", "mcp", "coding-agents"]
@@ -249,7 +242,7 @@ compile:
 - `presets/*.toml` (`include_str!`)
 - `config.example.toml` (`include_str!`)
 - `dashboard.html` (`include_str!`)
-- `README.md`, `Cargo.toml`, `Cargo.lock`, the license file
+- `README.md`, `Cargo.toml`, `Cargo.lock`, `LICENSE`
 
 Leave `plugins/` out. The hook scripts, skill, and manifests live in
 the git repo that already is the marketplace — that is the channel
@@ -379,10 +372,8 @@ Publishing the crate does not close that gap.
 
 ## 5. Still open
 
-- **License.** Required before `cargo publish`. Not yet chosen.
 - **`exclude` / `include` in `Cargo.toml`.** Needed so the crate is
-  the CLI crate and not a snapshot of the whole repo. Follows the
-  license.
+  the CLI crate and not a snapshot of the whole repo.
 - **How the plugin finds a binary on a GitHub install** (§2.5). PATH,
   wrapper, or Claude-only archive. Not decided. This is what makes
   the plugin installable by someone who is not building from a

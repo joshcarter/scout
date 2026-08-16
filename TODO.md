@@ -1,7 +1,3 @@
-# License
-
-Decide on and add license.
-
 # Shell Script Madness
 
 There's a bunch of complicated shell scripts with a bunch of regexps.
