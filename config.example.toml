@@ -209,6 +209,12 @@ model = "qwen/qwen3.6-35b-a3b"
 # model saw — the elision is a prompt-budget decision, the spool is ground
 # truth, and `raw_path` is what makes filtering recoverable.
 # model_input_bytes = 16384
+#
+# Same shape as [check_output]: idle is the wedged check, the wall clock
+# is the circuit breaker. Zero is rejected. A mistyped value is an
+# error and the shipped defaults are used.
+# idle_timeout_seconds = 120
+# default_timeout_seconds = 900
 
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by

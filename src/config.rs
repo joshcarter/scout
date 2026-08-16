@@ -280,6 +280,18 @@ pub fn load_wrap_config(path: &Path) -> Result<WrapConfig, String> {
             defaults.passthrough_max_bytes,
         )?,
         model_input_bytes: bound(section, "wrap", "model_input_bytes", defaults.model_input_bytes)?,
+        idle_timeout_seconds: positive(
+            section,
+            "wrap",
+            "idle_timeout_seconds",
+            defaults.idle_timeout_seconds,
+        )?,
+        default_timeout_seconds: positive(
+            section,
+            "wrap",
+            "default_timeout_seconds",
+            defaults.default_timeout_seconds,
+        )?,
     })
 }
 
@@ -515,6 +527,8 @@ mod tests {
         assert_eq!(WrapConfig::default().passthrough_max_lines, 200, "docs/wrap-watch.md §3.2");
         assert_eq!(WrapConfig::default().passthrough_max_bytes, 16 * 1024);
         assert_eq!(WrapConfig::default().model_input_bytes, 16 * 1024);
+        assert_eq!(WrapConfig::default().idle_timeout_seconds, 120);
+        assert_eq!(WrapConfig::default().default_timeout_seconds, 900);
     }
 
     #[test]
@@ -525,6 +539,8 @@ mod tests {
         assert_eq!(cfg.passthrough_max_lines, 40);
         assert_eq!(cfg.passthrough_max_bytes, WrapConfig::default().passthrough_max_bytes);
         assert_eq!(cfg.model_input_bytes, WrapConfig::default().model_input_bytes);
+        assert_eq!(cfg.idle_timeout_seconds, 120);
+        assert_eq!(cfg.default_timeout_seconds, 900);
 
         let cfg = load_wrap_config(&write_config(
             &dir,
@@ -534,6 +550,12 @@ mod tests {
         assert_eq!(cfg.passthrough_max_lines, 0, "zero is a valid bound: filter everything");
         assert_eq!(cfg.passthrough_max_bytes, 1);
         assert_eq!(cfg.model_input_bytes, 4096);
+
+        let cfg =
+            load_wrap_config(&write_config(&dir, "[wrap]\nidle_timeout_seconds = 240\n")).unwrap();
+        assert_eq!(cfg.idle_timeout_seconds, 240);
+        assert_eq!(cfg.default_timeout_seconds, 900);
+        assert_eq!(cfg.passthrough_max_lines, 200);
     }
 
     #[test]
@@ -545,6 +567,8 @@ mod tests {
             "passthrough_max_lines = -1",
             "model_input_bytes = \"16k\"",
             "passthrough_max_bytes = 1.5",
+            "idle_timeout_seconds = 0",
+            "default_timeout_seconds = \"15m\"",
         ] {
             let err = load_wrap_config(&write_config(&dir, &format!("[wrap]\n{bad}\n")))
                 .expect_err("an unusable bound must be reported");
@@ -558,6 +582,8 @@ mod tests {
         assert!(DEFAULT_CONFIG.contains("# passthrough_max_lines = 200"));
         assert!(DEFAULT_CONFIG.contains("# passthrough_max_bytes = 16384"));
         assert!(DEFAULT_CONFIG.contains("# model_input_bytes = 16384"));
+        assert!(DEFAULT_CONFIG.contains("# idle_timeout_seconds = 120"));
+        assert!(DEFAULT_CONFIG.contains("# default_timeout_seconds = 900"));
         // ...and its commented-out values must be the defaults they claim.
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(

@@ -178,14 +178,6 @@ failure path, and the right tradeoff probably is not one number for all
 presets. Note the dashboard's TTL sweep already removes the *accounting*
 consequence of a kill, so this is no longer urgent — only wrong.
 
-# `wrap` still ships compiled command-timeout defaults
-
-`[check_output]` now has `idle_timeout_seconds` and
-`default_timeout_seconds`. `wrap` still uses the compiled 900 / 3600 /
-`verify::IDLE_TIMEOUT` (120s). Same keys belong on `[wrap]` when that
-section is next touched (docs/wrap-watch.md §3.4). The 3600s ceiling
-stays compiled in — it is the MCP dispatch backstop, not a user knob.
-
 # `handle_stream` can park a thread on a client that stops reading
 
 `dashboard.rs`'s SSE handler writes with a blocking `write_all`. A browser tab

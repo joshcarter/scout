@@ -35,14 +35,8 @@ use crate::{config, spool, verify};
 /// Raw tool to name whenever this filter cannot deliver.
 const FALLBACK: &str = "running the command yourself with the Bash tool";
 
-/// Default wall-clock deadline for the command, and the hard cap on it.
-///
-/// `check_output`'s shipped numbers, and its convention: the wall clock is
-/// a circuit breaker, not the stuck-command check — a command that goes
-/// quiet for `verify::IDLE_TIMEOUT` is killed as wedged long before either
-/// of these matters.  `[check_output]` now has its own config keys;
-/// `[wrap]` still uses these compiled defaults (docs/wrap-watch.md §3.4).
-const DEFAULT_TIMEOUT_SECS: u64 = 900;
+/// Hard cap on the wall clock — same ceiling as `[check_output]`, and the
+/// MCP dispatch backstop sits above it.
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// How much of a command's output scout keeps at all.
@@ -68,6 +62,10 @@ pub struct WrapConfig {
     pub passthrough_max_bytes: u64,
     /// How much of the capture the model is shown, head+tail elided.
     pub model_input_bytes: u64,
+    /// How long the command may print nothing before it is treated as stuck.
+    pub idle_timeout_seconds: u64,
+    /// Wall-clock ceiling when the caller omits `timeout_seconds`.
+    pub default_timeout_seconds: u64,
 }
 
 impl Default for WrapConfig {
@@ -76,6 +74,8 @@ impl Default for WrapConfig {
             passthrough_max_lines: 200,
             passthrough_max_bytes: 16 * 1024,
             model_input_bytes: 16 * 1024,
+            idle_timeout_seconds: 120,
+            default_timeout_seconds: 900,
         }
     }
 }
@@ -116,21 +116,22 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         return Err(fail(&format!("cwd {} is not a directory", cwd.display())));
     }
 
-    let timeout_secs = args
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
-        .clamp(1, MAX_TIMEOUT_SECS);
-
     // A `[wrap]` scout cannot parse is reported by no one and costs nothing:
     // the same rule the spool bounds take on the write path (§3.5), because a
     // mistyped tunable must not be why a command's result is lost.
     let cfg = config::load_wrap_config(&config::config_path()).unwrap_or_default();
 
-    let capture = verify::run_command_capture(
+    let timeout_secs = args
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(cfg.default_timeout_seconds)
+        .clamp(1, MAX_TIMEOUT_SECS);
+
+    let capture = verify::capture_with_deadlines(
         &command,
         &cwd,
         Duration::from_secs(timeout_secs),
+        Duration::from_secs(cfg.idle_timeout_seconds),
         CAPTURE_MAX_BYTES,
     );
 
@@ -238,7 +239,7 @@ fn timeout_payload(
         verify::TimeoutKind::Idle => format!(
             "scout killed the command: it printed nothing for {}s (after running {ran:.0}s), \
              so it is wedged rather than slow",
-            verify::IDLE_TIMEOUT.as_secs()
+            cfg.idle_timeout_seconds
         ),
         verify::TimeoutKind::WallClock => format!(
             "scout killed the command: it hit its {wall_secs}s wall-clock timeout \
@@ -444,6 +445,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_idle_verdict_names_the_configured_deadline_not_the_compiled_one() {
+        let ctx = offline_ctx(".");
+        let capture = verify::Capture {
+            exit_ok: false,
+            exit_code: None,
+            output: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: Some(verify::TimeoutKind::Idle),
+            elapsed: Duration::from_secs(300),
+        };
+        let cfg = WrapConfig { idle_timeout_seconds: 240, ..WrapConfig::default() };
+        let p = timeout_payload(
+            &ctx,
+            &serde_json::json!({"command": "make"}),
+            &capture,
+            verify::TimeoutKind::Idle,
+            900,
+            cfg,
+        );
+        let degraded = p["degraded"].as_str().unwrap();
+        assert!(degraded.contains("240s"), "degraded: {degraded}");
+        assert!(!degraded.contains("120s"), "the compiled default must not leak: {degraded}");
+    }
+
     // ── The filtered path ─────────────────────────────────────────────
 
     #[test]
@@ -555,6 +582,8 @@ mod tests {
         // which is why the byte cap sits alongside the line count.
         assert_eq!(cfg.passthrough_max_bytes, 16 * 1024);
         assert_eq!(cfg.model_input_bytes, 16 * 1024);
+        assert_eq!(cfg.idle_timeout_seconds, 120);
+        assert_eq!(cfg.default_timeout_seconds, 900);
         assert!(
             CAPTURE_MAX_BYTES as u64 > cfg.model_input_bytes,
             "a capture bound at the prompt budget would leave raw_path holding \

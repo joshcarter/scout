@@ -182,9 +182,8 @@ Reuse `verify.rs` wholesale: `run_command_capture` /
 `capture_with_deadlines`, the process-group kill, `BoundedBuffer`, the
 idle deadline, and `check_output`'s wall-clock arg convention
 (`timeout_seconds`, same shipped 900/3600 as `[check_output]`).
-`[check_output]` now has `idle_timeout_seconds` and
-`default_timeout_seconds`; `[wrap]` still uses the compiled defaults
-and should grow the same keys. A timed-out command is answered without
+Both `[check_output]` and `[wrap]` expose `idle_timeout_seconds` and
+`default_timeout_seconds`. A timed-out command is answered without
 a model call, the same way `check_output::timeout_verdict` does it.
 
 The model is shown at most `[wrap] model_input_bytes` (default 16 KB,
