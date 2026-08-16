@@ -635,8 +635,8 @@ fn run_pipeline(
 ///
 /// Thin wrapper over exactly the code path the MCP tools use: same
 /// `Ctx`, same handlers, same payloads — only the argument parsing and the
-/// rendering differ.  Config is loaded leniently, so the bypass paths (small
-/// file, short hit list) still work with no `config.toml` at all; when the
+/// rendering differ.  An absent `config.toml` still works — the bypass
+/// paths (small file, short hit list) need no endpoint; when the
 /// model really is needed, the failure names both the reason and the raw tool
 /// to fall back to.  Diverges via `std::process::exit`, like `run`/`task`.
 fn run_filter(

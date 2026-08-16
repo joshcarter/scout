@@ -1,12 +1,18 @@
 // scout config loader.
 //
 // Single file, single format: `$XDG_CONFIG_HOME/scout/config.toml` (default
-// `~/.config/scout/config.toml`), `[llm]`, `[spool]` and `[wrap]` sections.
-// Override the whole file path with `$SCOUT_CONFIG`.
+// `~/.config/scout/config.toml`). Override the whole file path with
+// `$SCOUT_CONFIG`.
 //
-// This is the sole config parser in scout, and deliberately so: two parsers
-// with independently drifting timeout clamps is a bug waiting to happen. The
-// clamp lives here, once, at 1s..3600s.
+// Every section goes through `read_toml` here. Absent is `None`; unreadable
+// or unparseable is `Err`. Section loaders then apply one rule: a missing
+// section is the defaults, a key that is present and unusable is an error.
+// `[llm]` is the exception — it has required keys, so a missing section is
+// also an error.
+//
+// `[llm]`, `[spool]`, `[wrap]` load in this file. `[extract]`, `[grep]`,
+// `[cli]`, `[find]`, `[dashboard]` load in `filter_config.rs`, through the
+// same reader and the same integer helpers.
 
 use crate::client::Config;
 use crate::spool::SpoolConfig;
@@ -244,10 +250,9 @@ pub fn load_spool_config(path: &Path) -> Result<SpoolConfig, String> {
 /// Strict, on the `[spool]` rule and for the `[spool]` reasons: every key has a
 /// default, so an absent file or section is simply the defaults, while a key
 /// that is present and unusable is a typo worth reporting rather than a
-/// silently-restored default. It rides this parser rather than
-/// `filter_config.rs` per docs/wrap-watch.md §7 and TODO.md's "Do the parser
-/// unification first" — a new section must not pick the lenient semantics by
-/// accident.
+/// silently-restored default. It rides this parser rather than growing a
+/// third reader: a new section must not pick a private `read_to_string`
+/// by accident.
 ///
 /// `wrap::run` swallows the error and takes the defaults anyway: a mistyped
 /// bound must never cost the caller the command's result (§3.5).
@@ -280,15 +285,18 @@ pub fn load_wrap_config(path: &Path) -> Result<WrapConfig, String> {
 /// The parsed config file, or `None` when there is no file at all.
 ///
 /// Absent is not the same as unreadable, and only one of them is normal.
-/// `filter_config`'s `read_to_string(...).ok()` conflates the two, which is how
-/// a permission error there becomes an invisible reset to defaults (TODO.md,
-/// "Do the parser unification first").
-fn read_toml(path: &Path) -> Result<Option<toml::Value>, String> {
+/// Callers that used to `read_to_string(...).ok()` conflated the two, which
+/// made a permission error an invisible reset to defaults.
+pub(crate) fn read_toml(path: &Path) -> Result<Option<toml::Value>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
     };
+    // An empty file is "no sections", not a parse error — same as absent.
+    if content.trim().is_empty() {
+        return Ok(Some(toml::Value::Table(toml::Table::new())));
+    }
     toml::from_str(&content).map(Some).map_err(|e| format!("config parse error: {e}"))
 }
 
@@ -298,12 +306,34 @@ fn read_toml(path: &Path) -> Result<Option<toml::Value>, String> {
 /// `[llm]`'s timeouts, which have a defensible floor, "minus one day of
 /// retention" has no reading at all — and `v as u64` on a negative would wrap
 /// to a bound that never fires.
-fn bound(section: &toml::Value, table: &str, key: &str, default: u64) -> Result<u64, String> {
+pub(crate) fn bound(
+    section: &toml::Value,
+    table: &str,
+    key: &str,
+    default: u64,
+) -> Result<u64, String> {
     match section.get(key) {
         None => Ok(default),
         Some(v) => match v.as_integer() {
             Some(n) if n >= 0 => Ok(n.unsigned_abs()),
             _ => Err(format!("config: [{table}] {key} must be a non-negative integer")),
+        },
+    }
+}
+
+/// Like [`bound`], but zero is also unusable — a zero chunk, batch, or
+/// attempt count would livelock or search nothing.
+pub(crate) fn positive(
+    section: &toml::Value,
+    table: &str,
+    key: &str,
+    default: u64,
+) -> Result<u64, String> {
+    match section.get(key) {
+        None => Ok(default),
+        Some(v) => match v.as_integer() {
+            Some(n) if n > 0 => Ok(n.unsigned_abs()),
+            _ => Err(format!("config: [{table}] {key} must be a positive integer")),
         },
     }
 }
@@ -645,6 +675,15 @@ mod tests {
         assert!(DEFAULT_CONFIG.contains("[prefer_local]"));
         assert!(DEFAULT_CONFIG.contains("# timeout_seconds = 5"));
         assert!(DEFAULT_CONFIG.contains("# timeout_seconds = 6"));
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_dashboard() {
+        assert!(
+            DEFAULT_CONFIG.contains("[dashboard]"),
+            "config.example.toml is the only place a user learns the knob exists"
+        );
+        assert!(DEFAULT_CONFIG.contains("# port = 13001"));
     }
 
     // The process environment is global and cargo runs tests on parallel

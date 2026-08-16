@@ -293,9 +293,11 @@ needs exactly the same one.
 
 ## 7. Config
 
-`[cli]` and `[find]` in `config.toml`, both parsed leniently like
-`[grep]` and `[extract]` — an unusable value keeps the default rather
-than erroring. See `config.example.toml` for the annotated versions.
+`[cli]` and `[find]` in `config.toml`, parsed like `[grep]` and
+`[extract]`: a missing file or section is the defaults; a key that is
+present and unusable is an error (reported on stderr) and the defaults
+are used so a typo never costs the search. See `config.example.toml`
+for the annotated versions.
 
 ```toml
 [cli]

@@ -200,6 +200,12 @@ Wanted: a `[check_output]` section with `idle_timeout_seconds` and
 `default_timeout_seconds`, following the existing per-subsystem convention
 (`[llm] [extract] [grep] [cli] [find] [dashboard]`).
 
+The two parsers now share one reader (`config::read_toml`) and one rule:
+a missing file or section is the defaults; a key that is present and
+unusable is an error. Filter loaders swallow the error (one stderr line)
+so a typo never costs the caller the command — same as `[wrap]`.
+`[check_output]` can ride that without picking a semantics by accident.
+
 **Rejected: a dedicated `[timeouts]` section.** Timeouts are not a group
 anyone tunes together — they are properties of subsystems. Hoisting them
 would separate `[llm] idle_timeout_seconds` from the `stream` and `endpoint`
@@ -209,20 +215,6 @@ hook budgets belong there, and they emphatically do not: a hook blocks a
 human staring at a terminal, so its ceiling is patience, not model health.
 Deriving those from config is the shadowing bug described above, not the fix
 for it.
-
-**Do the parser unification first.** Adding a section means picking one of
-scout's two config parsers, and they disagree: `config.rs` is strict (a
-malformed `[llm]` errors loudly) while `filter_config.rs` is lenient (a
-mistyped `[grep]` silently discards every tunable under it, and
-`read_to_string(...).ok()` makes a permission error indistinguishable from an
-absent file). Today the failure mode a user gets for a typo depends on which
-section they typed it in. Adding `[check_output]` before unifying just picks
-one of those semantics by accident. `config.rs:7-9` also still claims to be
-"the sole config parser in scout, and deliberately so", which is false and
-should go either way.
-
-Small related gap: `[dashboard]` is parsed by `filter_config.rs` but appears
-nowhere in `config.example.toml`.
 
 # `handle_stream` can park a thread on a client that stops reading
 

@@ -61,9 +61,10 @@ model = "qwen/qwen3.6-35b-a3b"
 # under streaming (ollama is untested here) — `scout stats` reads them.
 # stream = true
 
-# Filter tunables. Both tables are parsed leniently: an absent or
-# unusable value silently keeps the default rather than erroring, unlike
-# [llm] above.
+# Filter tunables. Same rule as [spool] and [wrap]: a missing file or
+# section is the defaults; a key that is present and unusable is an
+# error, reported once on stderr, and the defaults are used so a typo
+# never costs the caller the filter.
 
 [extract]
 # Files at or under this many lines skip the local model and are
@@ -85,7 +86,7 @@ model = "qwen/qwen3.6-35b-a3b"
 
 # Terminal rendering for `scout grep`. Read only by the CLI — the MCP
 # server never consults this table, so nothing here changes what Claude
-# sees. Parsed leniently, like the two tables above.
+# sees. Parsed like the two tables above.
 
 [cli]
 # auto | always | never. `auto` colors only when stdout is a terminal and
@@ -110,7 +111,7 @@ model = "qwen/qwen3.6-35b-a3b"
 
 # `scout find` — intent-only search: you ask a question, the local model
 # guesses the patterns, scout runs them and reranks the union. CLI-only
-# (find is not an MCP tool), and parsed leniently like the tables above.
+# (find is not an MCP tool), and parsed like the tables above.
 
 [find]
 # Search rounds before giving up. A round is retried when *every* guessed
@@ -145,7 +146,7 @@ model = "qwen/qwen3.6-35b-a3b"
 # `scout dashboard` — the local web view of the call log. Start it with
 # `scout dashboard` (idempotent, detaches), stop it with `--stop`.
 
-# [dashboard]
+[dashboard]
 # Port for the dashboard. The bind *address* is
 # 127.0.0.1 and is deliberately not configurable: the payloads carry file
 # contents from every repo you work in, so loopback is the only address
@@ -169,9 +170,8 @@ model = "qwen/qwen3.6-35b-a3b"
 # window only has to comfortably outlive a working session.
 # `scout gc --all` empties the spool outright.
 #
-# Parsed strictly, like [llm] and unlike the filter tables above: a bound
-# that is present but not a non-negative integer is an error, not a
-# silently-restored default.
+# Parsed like the other optional sections: a bound that is present but
+# not a non-negative integer is an error, not a silently-restored default.
 
 [spool]
 # max_age_days = 7

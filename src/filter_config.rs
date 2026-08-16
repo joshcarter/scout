@@ -45,9 +45,10 @@
 // ```
 //
 // scout owns its config file outright, so the tables sit at the top level
-// rather than nested under a plugin namespace.  Unknown keys are ignored,
-// and a missing or malformed file silently yields the defaults — a broken
-// config must not break a read-side filter.
+// rather than nested under a plugin namespace.  Unknown keys are ignored.
+// A missing file or section is the defaults; a key that is present and
+// unusable is an error, same as `[spool]` / `[wrap]`.  Callers that must
+// not fail a read-side filter swallow the error and take the defaults.
 
 /// Tunables for `extract`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,163 +196,201 @@ impl Default for DashboardConfig {
 }
 
 /// Load both filter configs, applying any overrides found in scout's config
-/// file.  Any read/parse problem silently yields defaults.
+/// file.  A missing file is the defaults.  A present-but-unusable key is
+/// reported once on stderr and then ignored, so a typo never costs the
+/// caller the filter — the same swallow `[wrap]` uses on the write path.
 pub fn load() -> (ExtractConfig, GrepConfig) {
-    match read_config() {
-        Some(text) => parse_overrides(&text),
-        None => (ExtractConfig::default(), GrepConfig::default()),
+    match crate::config::read_toml(&crate::config::config_path()) {
+        Ok(None) => (ExtractConfig::default(), GrepConfig::default()),
+        Ok(Some(root)) => parse_overrides_value(&root).unwrap_or_else(|e| {
+            warn_config(&e);
+            (ExtractConfig::default(), GrepConfig::default())
+        }),
+        Err(e) => {
+            warn_config(&e);
+            (ExtractConfig::default(), GrepConfig::default())
+        }
     }
 }
 
 /// Load the `[cli]` table.  Separate from `load` so the two MCP-facing
 /// configs keep their existing arity and call sites.
 pub fn load_cli() -> CliConfig {
-    match read_config() {
-        Some(text) => parse_cli_overrides(&text),
-        None => CliConfig::default(),
-    }
+    load_section(parse_cli_overrides_value, CliConfig::default)
 }
 
 /// Load the `[find]` table.  Separate from `load` for the same reason
 /// `load_cli` is: the MCP-facing configs keep their existing arity.
 pub fn load_find() -> FindConfig {
-    match read_config() {
-        Some(text) => parse_find_overrides(&text),
-        None => FindConfig::default(),
-    }
+    load_section(parse_find_overrides_value, FindConfig::default)
 }
 
 /// Load the `[dashboard]` table.  Separate from `load` for the same reason
 /// `load_cli` is.
 pub fn load_dashboard() -> DashboardConfig {
-    match read_config() {
-        Some(text) => parse_dashboard_overrides(&text),
-        None => DashboardConfig::default(),
+    load_section(parse_dashboard_overrides_value, DashboardConfig::default)
+}
+
+fn load_section<T>(parse: fn(&toml::Value) -> Result<T, String>, default: fn() -> T) -> T {
+    match crate::config::read_toml(&crate::config::config_path()) {
+        Ok(None) => default(),
+        Ok(Some(root)) => parse(&root).unwrap_or_else(|e| {
+            warn_config(&e);
+            default()
+        }),
+        Err(e) => {
+            warn_config(&e);
+            default()
+        }
     }
 }
 
-fn read_config() -> Option<String> {
-    std::fs::read_to_string(crate::config::config_path()).ok()
+fn warn_config(err: &str) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!("scout: {err}; using defaults");
+    });
 }
 
-/// Parse `[cli]` overrides out of a scout config file body.  As lenient as
-/// `parse_overrides`: unknown keys, wrong types and a malformed file all
-/// silently keep the defaults.
-pub fn parse_cli_overrides(toml_text: &str) -> CliConfig {
+fn parse_root(toml_text: &str) -> Result<toml::Value, String> {
+    // An empty body is "no sections", not a parse error.
+    if toml_text.trim().is_empty() {
+        return Ok(toml::Value::Table(toml::Table::new()));
+    }
+    toml::from_str(toml_text).map_err(|e| format!("config parse error: {e}"))
+}
+
+/// Parse `[cli]` overrides out of a scout config file body.
+pub fn parse_cli_overrides(toml_text: &str) -> Result<CliConfig, String> {
+    parse_cli_overrides_value(&parse_root(toml_text)?)
+}
+
+fn parse_cli_overrides_value(root: &toml::Value) -> Result<CliConfig, String> {
     let mut cli = CliConfig::default();
-    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
-        return cli;
-    };
-    let Some(t) = root.get("cli") else { return cli };
+    let Some(t) = root.get("cli") else { return Ok(cli) };
 
-    if let Some(v) = t.get("color").and_then(toml::Value::as_str) {
-        let v = v.trim().to_ascii_lowercase();
-        if matches!(v.as_str(), "auto" | "always" | "never") {
-            cli.color = v;
+    if let Some(v) = t.get("color") {
+        let Some(s) = v.as_str() else {
+            return Err("config: [cli] color must be a string".into());
+        };
+        let s = s.trim().to_ascii_lowercase();
+        if !matches!(s.as_str(), "auto" | "always" | "never") {
+            return Err("config: [cli] color must be auto, always, or never".into());
         }
+        cli.color = s;
     }
-    // `context = 0` is meaningful here (show the matched line only), so this
-    // one accepts zero — unlike the budget knobs above, where zero livelocks.
-    if let Some(v) = t.get("context").and_then(toml::Value::as_integer) {
-        if v >= 0 {
-            cli.context = Some(v as usize);
-        }
+    // `context = 0` is meaningful (show the matched line only).
+    if t.get("context").is_some() {
+        cli.context = Some(crate::config::bound(t, "cli", "context", 0)? as usize);
     }
-    set_usize(&mut cli.max_hits, t, "max_hits");
-    // `max_columns = 0` means "no cap" (docs/search-cli.md §7), so this one accepts zero
-    // for the same reason `context` does.
-    if let Some(v) = t.get("max_columns").and_then(toml::Value::as_integer) {
-        if v >= 0 {
-            cli.max_columns = v as usize;
-        }
-    }
-    cli
+    cli.max_hits = crate::config::positive(t, "cli", "max_hits", cli.max_hits as u64)? as usize;
+    // `max_columns = 0` means "no cap" (docs/search-cli.md §7).
+    cli.max_columns =
+        crate::config::bound(t, "cli", "max_columns", cli.max_columns as u64)? as usize;
+    Ok(cli)
 }
 
-/// Parse `[find]` overrides out of a scout config file body.  Every knob here
-/// has no meaningful zero — a zero attempt count, pattern budget, hit cap or
-/// tree budget all mean "never search" — so `set_usize`'s positive-only rule
-/// is exactly right, and junk keeps the default.
-pub fn parse_find_overrides(toml_text: &str) -> FindConfig {
+/// Parse `[find]` overrides out of a scout config file body.
+pub fn parse_find_overrides(toml_text: &str) -> Result<FindConfig, String> {
+    parse_find_overrides_value(&parse_root(toml_text)?)
+}
+
+fn parse_find_overrides_value(root: &toml::Value) -> Result<FindConfig, String> {
     let mut find = FindConfig::default();
-    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
-        return find;
-    };
-    let Some(t) = root.get("find") else { return find };
-    set_usize(&mut find.max_attempts, t, "max_attempts");
-    set_usize(&mut find.max_patterns, t, "max_patterns");
-    set_usize(&mut find.degenerate_hit_cap, t, "degenerate_hit_cap");
-    set_usize(&mut find.tree_max_bytes, t, "tree_max_bytes");
-    // The one non-numeric knob here: a bool, so anything else keeps the default.
-    if let Some(v) = t.get("reflect").and_then(toml::Value::as_bool) {
-        find.reflect = v;
+    let Some(t) = root.get("find") else { return Ok(find) };
+    find.max_attempts =
+        crate::config::positive(t, "find", "max_attempts", find.max_attempts as u64)? as usize;
+    find.max_patterns =
+        crate::config::positive(t, "find", "max_patterns", find.max_patterns as u64)? as usize;
+    find.degenerate_hit_cap =
+        crate::config::positive(t, "find", "degenerate_hit_cap", find.degenerate_hit_cap as u64)?
+            as usize;
+    find.tree_max_bytes =
+        crate::config::positive(t, "find", "tree_max_bytes", find.tree_max_bytes as u64)? as usize;
+    if let Some(v) = t.get("reflect") {
+        let Some(b) = v.as_bool() else {
+            return Err("config: [find] reflect must be a boolean".into());
+        };
+        find.reflect = b;
     }
-    find
+    Ok(find)
 }
 
 /// Parse `[dashboard]` overrides out of a scout config file body.
 ///
-/// A port outside 1..=65535 keeps the default rather than wrapping: `port = 0`
-/// would ask the OS for a random one, which a daemon on a well-known port that
-/// clients probe by number cannot use.
-pub fn parse_dashboard_overrides(toml_text: &str) -> DashboardConfig {
+/// A port outside 1..=65535 is an error rather than wrapping: `port = 0`
+/// would ask the OS for a random one, which a daemon on a well-known port
+/// that clients probe by number cannot use.
+pub fn parse_dashboard_overrides(toml_text: &str) -> Result<DashboardConfig, String> {
+    parse_dashboard_overrides_value(&parse_root(toml_text)?)
+}
+
+fn parse_dashboard_overrides_value(root: &toml::Value) -> Result<DashboardConfig, String> {
     let mut dash = DashboardConfig::default();
-    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
-        return dash;
-    };
-    let Some(t) = root.get("dashboard") else { return dash };
-    if let Some(v) = t.get("port").and_then(toml::Value::as_integer) {
-        if (1..=65535).contains(&v) {
-            dash.port = v as u16;
+    let Some(t) = root.get("dashboard") else { return Ok(dash) };
+    if let Some(v) = t.get("port") {
+        let Some(n) = v.as_integer() else {
+            return Err("config: [dashboard] port must be an integer 1..=65535".into());
+        };
+        if !(1..=65535).contains(&n) {
+            return Err("config: [dashboard] port must be an integer 1..=65535".into());
         }
+        dash.port = n as u16;
     }
-    dash
+    Ok(dash)
 }
 
 /// Parse `[extract]` / `[grep]` overrides out of a scout config file body.
-pub fn parse_overrides(toml_text: &str) -> (ExtractConfig, GrepConfig) {
+pub fn parse_overrides(toml_text: &str) -> Result<(ExtractConfig, GrepConfig), String> {
+    parse_overrides_value(&parse_root(toml_text)?)
+}
+
+fn parse_overrides_value(root: &toml::Value) -> Result<(ExtractConfig, GrepConfig), String> {
     let mut extract = ExtractConfig::default();
     let mut grep = GrepConfig::default();
-    // toml 1.0: `Value: FromStr` parses a bare *value*, not a document —
-    // deserialize into a Table so the whole config file parses.
-    let Ok(root) = toml::from_str::<toml::Table>(toml_text) else {
-        return (extract, grep);
-    };
 
     if let Some(t) = root.get("extract") {
-        set_usize(&mut extract.bypass_max_lines, t, "bypass_max_lines");
-        set_usize(&mut extract.chunk_bytes, t, "chunk_bytes");
-        set_usize(&mut extract.default_max_lines, t, "default_max_lines");
-        set_u64(&mut extract.max_file_bytes, t, "max_file_bytes");
+        extract.bypass_max_lines = crate::config::positive(
+            t,
+            "extract",
+            "bypass_max_lines",
+            extract.bypass_max_lines as u64,
+        )? as usize;
+        extract.chunk_bytes =
+            crate::config::positive(t, "extract", "chunk_bytes", extract.chunk_bytes as u64)?
+                as usize;
+        extract.default_max_lines = crate::config::positive(
+            t,
+            "extract",
+            "default_max_lines",
+            extract.default_max_lines as u64,
+        )? as usize;
+        extract.max_file_bytes =
+            crate::config::positive(t, "extract", "max_file_bytes", extract.max_file_bytes)?;
     }
     if let Some(t) = root.get("grep") {
-        set_usize(&mut grep.bypass_max_hits, t, "bypass_max_hits");
-        set_usize(&mut grep.max_considered, t, "max_considered");
-        set_usize(&mut grep.batch_size, t, "batch_size");
-        set_usize(&mut grep.context_lines, t, "context_lines");
-        set_usize(&mut grep.context_max_bytes, t, "context_max_bytes");
-        set_u64(&mut grep.max_file_bytes, t, "max_file_bytes");
-        set_usize(&mut grep.max_hits_scanned, t, "max_hits_scanned");
+        grep.bypass_max_hits =
+            crate::config::positive(t, "grep", "bypass_max_hits", grep.bypass_max_hits as u64)?
+                as usize;
+        grep.max_considered =
+            crate::config::positive(t, "grep", "max_considered", grep.max_considered as u64)?
+                as usize;
+        grep.batch_size =
+            crate::config::positive(t, "grep", "batch_size", grep.batch_size as u64)? as usize;
+        // `context_lines = 0` is meaningful (matched line only), same as `[cli] context`.
+        grep.context_lines =
+            crate::config::bound(t, "grep", "context_lines", grep.context_lines as u64)? as usize;
+        grep.context_max_bytes =
+            crate::config::positive(t, "grep", "context_max_bytes", grep.context_max_bytes as u64)?
+                as usize;
+        grep.max_file_bytes =
+            crate::config::positive(t, "grep", "max_file_bytes", grep.max_file_bytes)?;
+        grep.max_hits_scanned =
+            crate::config::positive(t, "grep", "max_hits_scanned", grep.max_hits_scanned as u64)?
+                as usize;
     }
-    (extract, grep)
-}
-
-/// Apply a positive integer override; zero and negatives keep the default
-/// (a zero chunk size or batch size would livelock the chunker).
-fn set_usize(slot: &mut usize, table: &toml::Value, key: &str) {
-    if let Some(v) = table.get(key).and_then(toml::Value::as_integer) {
-        if v > 0 {
-            *slot = v as usize;
-        }
-    }
-}
-
-fn set_u64(slot: &mut u64, table: &toml::Value, key: &str) {
-    if let Some(v) = table.get(key).and_then(toml::Value::as_integer) {
-        if v > 0 {
-            *slot = v as u64;
-        }
-    }
+    Ok((extract, grep))
 }
 
 #[cfg(test)]
@@ -387,7 +426,8 @@ bypass_max_hits = 3
 batch_size = 100
 context_lines = 4
 "#,
-        );
+        )
+        .unwrap();
         assert_eq!(e.bypass_max_lines, 50);
         assert_eq!(e.default_max_lines, 40);
         assert_eq!(e.chunk_bytes, 393_216, "unset key keeps the default");
@@ -401,7 +441,8 @@ context_lines = 4
     fn search_knobs_are_tunable() {
         let (e, g) = parse_overrides(
             "[extract]\nmax_file_bytes = 123\n\n[grep]\nmax_file_bytes = 456\nmax_hits_scanned = 7\ncontext_max_bytes = 89\n",
-        );
+        )
+        .unwrap();
         assert_eq!(e.max_file_bytes, 123);
         assert_eq!(g.max_file_bytes, 456);
         assert_eq!(g.max_hits_scanned, 7);
@@ -409,12 +450,22 @@ context_lines = 4
     }
 
     #[test]
-    fn malformed_or_absent_config_yields_defaults() {
-        assert_eq!(parse_overrides("not = = toml").0, ExtractConfig::default());
-        assert_eq!(parse_overrides("").1, GrepConfig::default());
-        // Non-positive values are ignored rather than creating a zero budget.
-        let (e, _) = parse_overrides("[extract]\nchunk_bytes = 0\nbypass_max_lines = -5\n");
-        assert_eq!(e, ExtractConfig::default());
+    fn absent_section_or_empty_file_yields_defaults() {
+        assert_eq!(parse_overrides("").unwrap().1, GrepConfig::default());
+        assert_eq!(
+            parse_overrides("[llm]\nendpoint = \"http://h/v1\"\n").unwrap().0,
+            ExtractConfig::default()
+        );
+    }
+
+    #[test]
+    fn malformed_or_unusable_values_are_errors() {
+        assert!(parse_overrides("not = = toml").is_err());
+        let err = parse_overrides("[extract]\nchunk_bytes = 0\n").unwrap_err();
+        assert!(err.contains("[extract]"), "{err}");
+        assert!(err.contains("chunk_bytes"), "{err}");
+        let err = parse_overrides("[extract]\nbypass_max_lines = -5\n").unwrap_err();
+        assert!(err.contains("bypass_max_lines"), "{err}");
     }
 
     #[test]
@@ -430,41 +481,42 @@ context_lines = 4
     fn max_columns_accepts_zero_as_unlimited() {
         // Unlike the budget knobs, 0 is a real setting here (docs/search-cli.md §7) — it is
         // how a user turns the cap off for good rather than typing -M 0 daily.
-        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 0\n").max_columns, 0);
-        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 400\n").max_columns, 400);
-        // ...but a negative is still junk, and junk keeps the default.
-        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = -1\n").max_columns, 150);
-        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = \"wide\"\n").max_columns, 150);
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 0\n").unwrap().max_columns, 0);
+        assert_eq!(parse_cli_overrides("[cli]\nmax_columns = 400\n").unwrap().max_columns, 400);
+        assert!(parse_cli_overrides("[cli]\nmax_columns = -1\n").is_err());
+        assert!(parse_cli_overrides("[cli]\nmax_columns = \"wide\"\n").is_err());
     }
 
     #[test]
     fn cli_overrides_are_applied() {
         let c = parse_cli_overrides(
             "[cli]\ncolor = \"never\"\ncontext = 4\nmax_hits = 50\nmax_columns = 80\n",
-        );
+        )
+        .unwrap();
         assert_eq!(c.color, "never");
         assert_eq!(c.context, Some(4));
         assert_eq!(c.max_hits, 50);
         assert_eq!(c.max_columns, 80);
         // context = 0 is a real choice (matched line only), unlike the budgets.
-        assert_eq!(parse_cli_overrides("[cli]\ncontext = 0\n").context, Some(0));
+        assert_eq!(parse_cli_overrides("[cli]\ncontext = 0\n").unwrap().context, Some(0));
     }
 
     #[test]
-    fn cli_junk_values_keep_defaults() {
-        assert_eq!(parse_cli_overrides("[cli]\ncolor = \"chartreuse\"\n"), CliConfig::default());
-        assert_eq!(parse_cli_overrides("[cli]\ncolor = 3\nmax_hits = -1\n"), CliConfig::default());
-        assert_eq!(parse_cli_overrides("[cli]\ncontext = -2\n").context, None);
-        assert_eq!(parse_cli_overrides("not = = toml"), CliConfig::default());
-        assert_eq!(parse_cli_overrides(""), CliConfig::default());
+    fn cli_junk_values_are_errors() {
+        assert!(parse_cli_overrides("[cli]\ncolor = \"chartreuse\"\n").is_err());
+        assert!(parse_cli_overrides("[cli]\ncolor = 3\n").is_err());
+        assert!(parse_cli_overrides("[cli]\nmax_hits = -1\n").is_err());
+        assert!(parse_cli_overrides("[cli]\ncontext = -2\n").is_err());
+        assert!(parse_cli_overrides("not = = toml").is_err());
+        assert_eq!(parse_cli_overrides("").unwrap(), CliConfig::default());
         // Case and padding are forgiven; the value is normalized.
-        assert_eq!(parse_cli_overrides("[cli]\ncolor = \" Always \"\n").color, "always");
+        assert_eq!(parse_cli_overrides("[cli]\ncolor = \" Always \"\n").unwrap().color, "always");
     }
 
     #[test]
     fn cli_table_does_not_disturb_the_filter_tables() {
         let text = "[cli]\nmax_hits = 50\ncontext = 9\n";
-        let (e, g) = parse_overrides(text);
+        let (e, g) = parse_overrides(text).unwrap();
         assert_eq!(e, ExtractConfig::default());
         assert_eq!(g, GrepConfig::default());
     }
@@ -483,60 +535,55 @@ context_lines = 4
     fn find_overrides_are_applied() {
         let f = parse_find_overrides(
             "[find]\nmax_attempts = 4\nmax_patterns = 5\ndegenerate_hit_cap = 50\ntree_max_bytes = 1024\n",
-        );
+        )
+        .unwrap();
         assert_eq!(f.max_attempts, 4);
         assert_eq!(f.max_patterns, 5);
         assert_eq!(f.degenerate_hit_cap, 50);
         assert_eq!(f.tree_max_bytes, 1024);
         // An unset key keeps its default rather than zeroing out.
-        let partial = parse_find_overrides("[find]\nmax_attempts = 1\n");
+        let partial = parse_find_overrides("[find]\nmax_attempts = 1\n").unwrap();
         assert_eq!(partial.max_attempts, 1);
         assert_eq!(partial.max_patterns, 8);
     }
 
     #[test]
-    fn reflect_is_a_bool_and_junk_keeps_it_on() {
-        assert!(!parse_find_overrides("[find]\nreflect = false\n").reflect);
-        assert!(parse_find_overrides("[find]\nreflect = true\n").reflect);
-        // Not a bool — the stage stays on rather than silently disappearing.
-        assert!(parse_find_overrides("[find]\nreflect = 0\n").reflect);
-        assert!(parse_find_overrides("[find]\nreflect = \"no\"\n").reflect);
+    fn reflect_is_a_bool_and_junk_is_an_error() {
+        assert!(!parse_find_overrides("[find]\nreflect = false\n").unwrap().reflect);
+        assert!(parse_find_overrides("[find]\nreflect = true\n").unwrap().reflect);
+        assert!(parse_find_overrides("[find]\nreflect = 0\n").is_err());
+        assert!(parse_find_overrides("[find]\nreflect = \"no\"\n").is_err());
     }
 
     #[test]
-    fn find_junk_values_keep_defaults() {
-        // Zero is junk for every knob in this table: no attempts, no patterns,
-        // a zero hit cap and a zero tree budget all mean "never find anything".
-        assert_eq!(
-            parse_find_overrides("[find]\nmax_attempts = 0\ndegenerate_hit_cap = 0\n"),
-            FindConfig::default()
-        );
-        assert_eq!(parse_find_overrides("[find]\nmax_patterns = -3\n"), FindConfig::default());
-        assert_eq!(
-            parse_find_overrides("[find]\ntree_max_bytes = \"lots\"\n"),
-            FindConfig::default()
-        );
-        assert_eq!(parse_find_overrides("not = = toml"), FindConfig::default());
-        assert_eq!(parse_find_overrides(""), FindConfig::default());
+    fn find_junk_values_are_errors() {
+        // Zero is unusable for every knob in this table: no attempts, no
+        // patterns, a zero hit cap and a zero tree budget all mean "never
+        // find anything".
+        assert!(parse_find_overrides("[find]\nmax_attempts = 0\n").is_err());
+        assert!(parse_find_overrides("[find]\nmax_patterns = -3\n").is_err());
+        assert!(parse_find_overrides("[find]\ntree_max_bytes = \"lots\"\n").is_err());
+        assert!(parse_find_overrides("not = = toml").is_err());
+        assert_eq!(parse_find_overrides("").unwrap(), FindConfig::default());
     }
 
     #[test]
     fn find_table_does_not_disturb_the_other_tables() {
         let text = "[find]\nmax_attempts = 3\ntree_max_bytes = 99\n";
-        let (e, g) = parse_overrides(text);
+        let (e, g) = parse_overrides(text).unwrap();
         assert_eq!(e, ExtractConfig::default());
         assert_eq!(g, GrepConfig::default());
-        assert_eq!(parse_cli_overrides(text), CliConfig::default());
+        assert_eq!(parse_cli_overrides(text).unwrap(), CliConfig::default());
     }
 
     #[test]
     fn dashboard_defaults_and_overrides() {
         assert_eq!(DashboardConfig::default().port, 13001);
-        assert_eq!(parse_dashboard_overrides("[dashboard]\nport = 8080\n").port, 8080);
+        assert_eq!(parse_dashboard_overrides("[dashboard]\nport = 8080\n").unwrap().port, 8080);
     }
 
     #[test]
-    fn dashboard_junk_ports_keep_the_default() {
+    fn dashboard_junk_ports_are_errors() {
         // 0 would mean "any free port", which nothing could then probe for.
         for text in [
             "[dashboard]\nport = 0\n",
@@ -544,10 +591,10 @@ context_lines = 4
             "[dashboard]\nport = 70000\n",
             "[dashboard]\nport = \"13001\"\n",
             "not = = toml",
-            "",
         ] {
-            assert_eq!(parse_dashboard_overrides(text), DashboardConfig::default(), "{text:?}");
+            assert!(parse_dashboard_overrides(text).is_err(), "{text:?}");
         }
+        assert_eq!(parse_dashboard_overrides("").unwrap(), DashboardConfig::default());
     }
 
     #[test]
@@ -555,11 +602,11 @@ context_lines = 4
         // The common case: a config file that configures the endpoint and
         // nothing else must not disturb the filter tunables.
         let text = "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n";
-        let (e, g) = parse_overrides(text);
+        let (e, g) = parse_overrides(text).unwrap();
         assert_eq!(e, ExtractConfig::default());
         assert_eq!(g, GrepConfig::default());
-        assert_eq!(parse_cli_overrides(text), CliConfig::default());
-        assert_eq!(parse_find_overrides(text), FindConfig::default());
-        assert_eq!(parse_dashboard_overrides(text), DashboardConfig::default());
+        assert_eq!(parse_cli_overrides(text).unwrap(), CliConfig::default());
+        assert_eq!(parse_find_overrides(text).unwrap(), FindConfig::default());
+        assert_eq!(parse_dashboard_overrides(text).unwrap(), DashboardConfig::default());
     }
 }
