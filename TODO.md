@@ -178,43 +178,13 @@ failure path, and the right tradeoff probably is not one number for all
 presets. Note the dashboard's TTL sweep already removes the *accounting*
 consequence of a kill, so this is no longer urgent — only wrong.
 
-# `check_output`'s timeouts are compiled in
+# `wrap` still ships compiled command-timeout defaults
 
-Three values decide whether a build is killed, and none of them can be
-changed without a rebuild:
-
-- `verify::IDLE_TIMEOUT` (120s) — no output while the process is still alive.
-  This is the one that actually decides "wedged", and it is the one most
-  likely to need moving: a monorepo whose link step is silent for four
-  minutes is working, not stuck.
-- `check_output::DEFAULT_TIMEOUT_SECS` (900) and `MAX_TIMEOUT_SECS` (3600) —
-  the wall-clock circuit breaker and the ceiling on the caller's
-  `timeout_seconds` argument.
-
-The per-call `timeout_seconds` tool argument covers the wall clock, so a
-caller who knows a command is slow can already ask for more. Nothing exposes
-the idle deadline at all, which is backwards: the wall clock is now a
-backstop and idle is the real policy.
-
-Wanted: a `[check_output]` section with `idle_timeout_seconds` and
-`default_timeout_seconds`, following the existing per-subsystem convention
-(`[llm] [extract] [grep] [cli] [find] [dashboard]`).
-
-The two parsers now share one reader (`config::read_toml`) and one rule:
-a missing file or section is the defaults; a key that is present and
-unusable is an error. Filter loaders swallow the error (one stderr line)
-so a typo never costs the caller the command — same as `[wrap]`.
-`[check_output]` can ride that without picking a semantics by accident.
-
-**Rejected: a dedicated `[timeouts]` section.** Timeouts are not a group
-anyone tunes together — they are properties of subsystems. Hoisting them
-would separate `[llm] idle_timeout_seconds` from the `stream` and `endpoint`
-settings that give it meaning (it only applies to a streaming call), which is
-cohesion by datatype over cohesion by subject. It would also imply the two
-hook budgets belong there, and they emphatically do not: a hook blocks a
-human staring at a terminal, so its ceiling is patience, not model health.
-Deriving those from config is the shadowing bug described above, not the fix
-for it.
+`[check_output]` now has `idle_timeout_seconds` and
+`default_timeout_seconds`. `wrap` still uses the compiled 900 / 3600 /
+`verify::IDLE_TIMEOUT` (120s). Same keys belong on `[wrap]` when that
+section is next touched (docs/wrap-watch.md §3.4). The 3600s ceiling
+stays compiled in — it is the MCP dispatch backstop, not a user knob.
 
 # `handle_stream` can park a thread on a client that stops reading
 

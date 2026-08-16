@@ -172,7 +172,7 @@ pub enum Command {
         /// Working directory for the command (default: the project root).
         #[arg(long)]
         cwd: Option<String>,
-        /// Timeout in seconds (default 60, max 600).
+        /// Wall-clock ceiling in seconds (default 900, max 3600).
         #[arg(long)]
         timeout_seconds: Option<u64>,
         /// Project root (default: $PWD).

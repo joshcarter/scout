@@ -184,6 +184,18 @@ model = "qwen/qwen3.6-35b-a3b"
 # ignored on the write path all the same — a mistyped tunable must never be
 # why a command's result is lost.
 
+# `check_output` — run a build/test and classify its output. The wall
+# clock is a circuit breaker; idle is the real "wedged" check. A
+# monorepo whose link step is silent for four minutes wants the idle
+# deadline moved, not the wall clock. Zero is rejected (it would kill
+# a healthy build on the first poll). A mistyped value is reported and
+# the shipped defaults are used, so a typo never costs the command.
+[check_output]
+# How long the command may print nothing while still alive.
+# idle_timeout_seconds = 120
+# Wall-clock ceiling when the caller omits timeout_seconds.
+# default_timeout_seconds = 900
+
 [wrap]
 # Output at or under *both* of these is returned whole and unfiltered: no
 # model call, nothing spooled, nothing dropped. That is what makes guessing

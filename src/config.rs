@@ -10,10 +10,11 @@
 // `[llm]` is the exception — it has required keys, so a missing section is
 // also an error.
 //
-// `[llm]`, `[spool]`, `[wrap]` load in this file. `[extract]`, `[grep]`,
-// `[cli]`, `[find]`, `[dashboard]` load in `filter_config.rs`, through the
-// same reader and the same integer helpers.
+// `[llm]`, `[spool]`, `[wrap]`, `[check_output]` load in this file.
+// `[extract]`, `[grep]`, `[cli]`, `[find]`, `[dashboard]` load in
+// `filter_config.rs`, through the same reader and the same integer helpers.
 
+use crate::check_output::CheckOutputConfig;
 use crate::client::Config;
 use crate::spool::SpoolConfig;
 use crate::wrap::WrapConfig;
@@ -282,6 +283,38 @@ pub fn load_wrap_config(path: &Path) -> Result<WrapConfig, String> {
     })
 }
 
+/// Parse a `CheckOutputConfig` from the `[check_output]` section of `path`.
+///
+/// Same rule as `[wrap]`: an absent file or section is the defaults; a key
+/// that is present and unusable is an error. `check_output::run` swallows
+/// the error and takes the defaults, so a typo never costs the caller the
+/// command. Zero is rejected — a zero idle deadline would kill a healthy
+/// build on the first poll, and a zero wall clock is not a timeout.
+pub fn load_check_output_config(path: &Path) -> Result<CheckOutputConfig, String> {
+    let Some(root) = read_toml(path)? else {
+        return Ok(CheckOutputConfig::default());
+    };
+    let Some(section) = root.get("check_output") else {
+        return Ok(CheckOutputConfig::default());
+    };
+
+    let defaults = CheckOutputConfig::default();
+    Ok(CheckOutputConfig {
+        idle_timeout_seconds: positive(
+            section,
+            "check_output",
+            "idle_timeout_seconds",
+            defaults.idle_timeout_seconds,
+        )?,
+        default_timeout_seconds: positive(
+            section,
+            "check_output",
+            "default_timeout_seconds",
+            defaults.default_timeout_seconds,
+        )?,
+    })
+}
+
 /// The parsed config file, or `None` when there is no file at all.
 ///
 /// Absent is not the same as unreadable, and only one of them is normal.
@@ -530,6 +563,69 @@ mod tests {
         assert_eq!(
             load_wrap_config(&write_config(&dir, DEFAULT_CONFIG)).unwrap(),
             WrapConfig::default()
+        );
+    }
+
+    // ── [check_output] ──────────────────────────────────────────────────
+
+    #[test]
+    fn check_output_timeouts_default_when_the_file_or_the_section_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_check_output_config(&dir.path().join("nope.toml")).unwrap(),
+            CheckOutputConfig::default()
+        );
+        let path = write_config(&dir, "[llm]\nendpoint = \"http://h/v1\"\nmodel = \"m\"\n");
+        assert_eq!(load_check_output_config(&path).unwrap(), CheckOutputConfig::default());
+        assert_eq!(CheckOutputConfig::default().idle_timeout_seconds, 120);
+        assert_eq!(CheckOutputConfig::default().default_timeout_seconds, 900);
+    }
+
+    #[test]
+    fn check_output_timeouts_parse_and_a_single_key_leaves_the_other_at_its_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load_check_output_config(&write_config(
+            &dir,
+            "[check_output]\nidle_timeout_seconds = 240\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.idle_timeout_seconds, 240);
+        assert_eq!(cfg.default_timeout_seconds, 900);
+
+        let cfg = load_check_output_config(&write_config(
+            &dir,
+            "[check_output]\ndefault_timeout_seconds = 1800\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.idle_timeout_seconds, 120);
+        assert_eq!(cfg.default_timeout_seconds, 1800);
+    }
+
+    #[test]
+    fn a_present_but_unusable_check_output_timeout_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [
+            "idle_timeout_seconds = 0",
+            "idle_timeout_seconds = -1",
+            "default_timeout_seconds = \"15m\"",
+            "default_timeout_seconds = 1.5",
+        ] {
+            let err =
+                load_check_output_config(&write_config(&dir, &format!("[check_output]\n{bad}\n")))
+                    .expect_err("an unusable timeout must be reported");
+            assert!(err.contains("[check_output]"), "{bad} -> {err}");
+        }
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_check_output_timeouts() {
+        assert!(DEFAULT_CONFIG.contains("[check_output]"));
+        assert!(DEFAULT_CONFIG.contains("# idle_timeout_seconds = 120"));
+        assert!(DEFAULT_CONFIG.contains("# default_timeout_seconds = 900"));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_check_output_config(&write_config(&dir, DEFAULT_CONFIG)).unwrap(),
+            CheckOutputConfig::default()
         );
     }
 

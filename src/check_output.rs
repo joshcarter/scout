@@ -29,28 +29,34 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::config;
 use crate::select::{call_preset, non_empty_arg, parse_selector_json, Ctx, ToolError, ToolResult};
 use crate::verify;
 
 /// Raw tool to name whenever this filter cannot deliver.
 const FALLBACK: &str = "running the command yourself with the Bash tool";
 
-/// Default wall-clock deadline for the command.
+/// The `[check_output]` tunables.
 ///
-/// Deliberately far above `verify::IDLE_TIMEOUT`, and that ordering is the
-/// whole point: the wall clock is a circuit breaker, not the thing that
-/// decides whether a command is stuck.  A build that keeps printing is
-/// working, however long it takes, and it runs to completion; one that goes
-/// quiet for `IDLE_TIMEOUT` is wedged and dies in two minutes regardless of
-/// how much of this budget is left.
-///
-/// It was 60s, below the idle deadline, which made the idle check
-/// unreachable — the wall clock always fired first and every long build was
-/// killed for being long rather than for being stuck.  If you lower this
-/// under `IDLE_TIMEOUT` you turn the liveness check back off.
-const DEFAULT_TIMEOUT_SECS: u64 = 900;
+/// Parsed by `config::load_check_output_config`. The defaults are what a
+/// caller with no config file gets, and they keep the wall clock far above
+/// the idle deadline: a build that keeps printing is working; one that
+/// goes quiet for `idle_timeout_seconds` is wedged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckOutputConfig {
+    /// How long the command may print nothing before it is treated as stuck.
+    pub idle_timeout_seconds: u64,
+    /// Wall-clock ceiling when the caller omits `timeout_seconds`.
+    pub default_timeout_seconds: u64,
+}
 
-/// Hard cap on the timeout — an unbounded wait would freeze the MCP loop.
+impl Default for CheckOutputConfig {
+    fn default() -> Self {
+        CheckOutputConfig { idle_timeout_seconds: 120, default_timeout_seconds: 900 }
+    }
+}
+
+/// Hard cap on the wall clock — an unbounded wait would freeze the MCP loop.
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
 /// Run `command` and return the local model's classification of its output.
@@ -67,16 +73,21 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         return Err(fail(&format!("cwd {} is not a directory", cwd.display())));
     }
 
+    // A `[check_output]` scout cannot parse is reported by no one and costs
+    // nothing: a mistyped tunable must not be why a command's result is lost.
+    let cfg = config::load_check_output_config(&config::config_path()).unwrap_or_default();
+
     let timeout_secs = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+        .unwrap_or(cfg.default_timeout_seconds)
         .clamp(1, MAX_TIMEOUT_SECS);
 
-    let capture = verify::run_command_capture(
+    let capture = verify::capture_with_deadlines(
         &command,
         &cwd,
         Duration::from_secs(timeout_secs),
+        Duration::from_secs(cfg.idle_timeout_seconds),
         verify::MAX_OUTPUT_BYTES,
     );
 
@@ -92,7 +103,15 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     // A killed command short-circuits: no model, no round-trip, and a row that
     // says what actually happened rather than `ok`.
     if let Some(kind) = capture.timed_out {
-        return Ok(timeout_verdict(ctx, &command, language, &capture, kind, timeout_secs));
+        return Ok(timeout_verdict(
+            ctx,
+            &command,
+            language,
+            &capture,
+            kind,
+            timeout_secs,
+            cfg.idle_timeout_seconds,
+        ));
     }
 
     let mut call_args = args.clone();
@@ -119,6 +138,7 @@ fn timeout_verdict(
     capture: &verify::Capture,
     kind: verify::TimeoutKind,
     wall_secs: u64,
+    idle_secs: u64,
 ) -> Value {
     let ran = capture.elapsed.as_secs_f64();
     let (what, next) = match kind {
@@ -127,9 +147,8 @@ fn timeout_verdict(
         // means "it stopped working, a longer timeout will not help".
         verify::TimeoutKind::Idle => (
             format!(
-                "scout killed the command: it printed nothing for {}s (after running {ran:.0}s), \
-                 so it is wedged rather than slow",
-                verify::IDLE_TIMEOUT.as_secs()
+                "scout killed the command: it printed nothing for {idle_secs}s (after running {ran:.0}s), \
+                 so it is wedged rather than slow"
             ),
             "a silent process is usually blocked, not busy — look for a held lock, a prompt \
              waiting on stdin, or a stalled network fetch. Raising timeout_seconds will not help."
@@ -336,6 +355,7 @@ mod tests {
             &capture,
             verify::TimeoutKind::Idle,
             600,
+            120,
         );
 
         assert_eq!(p["timed_out"], "idle");
@@ -348,6 +368,33 @@ mod tests {
             next.contains("will not help"),
             "silence means stuck; a bigger timeout is the wrong advice: {next}"
         );
+        assert!(summary.contains("120s"), "the configured idle must be named: {summary}");
+    }
+
+    #[test]
+    fn the_idle_verdict_names_the_configured_deadline_not_the_compiled_one() {
+        let ctx = offline_ctx(".");
+        let capture = verify::Capture {
+            exit_ok: false,
+            exit_code: None,
+            output: String::new(),
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: Some(verify::TimeoutKind::Idle),
+            elapsed: Duration::from_secs(300),
+        };
+        let p = timeout_verdict(
+            &ctx,
+            "cargo build",
+            None,
+            &capture,
+            verify::TimeoutKind::Idle,
+            900,
+            240,
+        );
+        let summary = p["summary"].as_str().unwrap();
+        assert!(summary.contains("240s"), "summary: {summary}");
+        assert!(!summary.contains("120s"), "the compiled default must not leak: {summary}");
     }
 
     #[test]

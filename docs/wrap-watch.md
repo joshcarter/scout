@@ -181,10 +181,11 @@ adoption depends on the cloud model knowing recovery exists. Draft:
 Reuse `verify.rs` wholesale: `run_command_capture` /
 `capture_with_deadlines`, the process-group kill, `BoundedBuffer`, the
 idle deadline, and `check_output`'s wall-clock arg convention
-(`timeout_seconds`, same default/ceiling until the `[check_output]`
-config work in TODO.md lands — at which point `[wrap]` grows the same
-keys). A timed-out command is answered without a model call, the same
-way `check_output::timeout_verdict` does it.
+(`timeout_seconds`, same shipped 900/3600 as `[check_output]`).
+`[check_output]` now has `idle_timeout_seconds` and
+`default_timeout_seconds`; `[wrap]` still uses the compiled defaults
+and should grow the same keys. A timed-out command is answered without
+a model call, the same way `check_output::timeout_verdict` does it.
 
 The model is shown at most `[wrap] model_input_bytes` (default 16 KB,
 matching `check_output`) via the existing head+tail elision

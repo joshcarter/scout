@@ -37,11 +37,11 @@ const FALLBACK: &str = "running the command yourself with the Bash tool";
 
 /// Default wall-clock deadline for the command, and the hard cap on it.
 ///
-/// `check_output`'s numbers, and its convention: the wall clock is a circuit
-/// breaker, not the stuck-command check — a command that goes quiet for
-/// `verify::IDLE_TIMEOUT` is killed as wedged long before either of these
-/// matters.  Shared until the `[check_output]` config work in TODO.md lands, at
-/// which point `[wrap]` grows the same keys (docs/wrap-watch.md §3.4).
+/// `check_output`'s shipped numbers, and its convention: the wall clock is
+/// a circuit breaker, not the stuck-command check — a command that goes
+/// quiet for `verify::IDLE_TIMEOUT` is killed as wedged long before either
+/// of these matters.  `[check_output]` now has its own config keys;
+/// `[wrap]` still uses these compiled defaults (docs/wrap-watch.md §3.4).
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
