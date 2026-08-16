@@ -158,21 +158,18 @@ identifying fields too (more bytes on every event, for data that cannot have
 changed), or have the merge treat an absent field as "unchanged" rather than
 as "empty" — which is what the rest of the reconciliation already does.
 
-# Hook timeouts: killed calls are still invisible
+# Hook timeouts: killed calls are still missing from `calls.jsonl`
 
-The knobs exist in both places: env (`SCOUT_SHELL_SAFETY_TIMEOUT`,
-`SCOUT_PREFER_LOCAL_TIMEOUT`) and config.toml (`[shell_safety].timeout_seconds`,
-`[prefer_local].timeout_seconds`). Env wins. Defaults stay 5 and 6. The
-file keys ride the same python reader `[shell_safety].deny` already used;
-the Rust config parser does not see them — these hooks never go through it.
+The knobs exist (env + config.toml). The hook audit logs now record a
+killed subprocess as `timeout` (exit 124 from `timeout(1)`), not
+`parse-failure` / `classify-failure`, so the hook-side count is no longer
+blind.
 
-The remaining gap is that a killed call writes no log line, so `calls.jsonl`
-cannot show how often the timeout fires. The distribution is
-survivorship-biased and truncated exactly at the cutoff: 783 completed
-shell_safety calls, max 4977ms, *zero* above 5000ms. The audit log's
-`parse-failure` entries are the only trace. Whatever the timeout becomes, a
-killed run should be countable — the dashboard's `abandoned` rows now
-surface it live, but nothing durable records it.
+`calls.jsonl` still has no row: `scout` has no SIGTERM handler, so the
+hook's `timeout` wrapper kills the process between `emit_start` and the
+`emit_end`/`log()` pair. The dashboard's `abandoned` rows surface it live;
+nothing durable on the call log does. A handler that writes the parked
+ledger row on SIGTERM is the remaining piece.
 
 Worth designing rather than tuning: the timeout is also the worst-case stall
 before the user sees a permission prompt, which is presumably why it is as

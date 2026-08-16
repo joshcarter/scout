@@ -434,6 +434,11 @@ if [ -z "${SCOUT_SHELL_SAFETY_TIMEOUT:-}" ]; then
   [ -n "$_cfg_timeout" ] && LLM_TIMEOUT_SECS="$_cfg_timeout"
 fi
 
+# 124 is GNU timeout / gtimeout's "I killed the child" status. Anything
+# else is a scout failure the parse path below already handles. Captured
+# before `||` so a killed run is logged as `timeout`, not `parse-failure`
+# — the latter is what made the distribution uncountable.
+LLM_RC=0
 LLM_OUTPUT=$(_timeout "$SCOUT_BIN" run \
   --preset shell_safety \
   --arg "command=$COMMAND" \
@@ -441,7 +446,7 @@ LLM_OUTPUT=$(_timeout "$SCOUT_BIN" run \
   --arg "known_vars=$KNOWN_VARS_ARG" \
   --arg "dir_listing=$DIR_LISTING_ARG" \
   --arg "git_status=$GIT_STATUS_ARG" \
-  2>/dev/null) || LLM_OUTPUT=""
+  2>/dev/null) || LLM_RC=$?
 
 VERDICT=$(printf '%s' "$LLM_OUTPUT" | jq -r '.verdict // empty' 2>/dev/null) || VERDICT=""
 REASON=$(printf '%s' "$LLM_OUTPUT" | jq -r '.reason // ""' 2>/dev/null) || REASON=""
@@ -481,8 +486,14 @@ case "$VERDICT" in
     exit 0  # emit nothing → normal prompt
     ;;
   *)
-    # Empty, malformed JSON, or unexpected value → fail-to-ask
-    _log "parse-failure" reason "${LLM_OUTPUT:0:120}"
+    # Empty, malformed JSON, or unexpected value → fail-to-ask.
+    # A killed subprocess is a timeout, not a bad reply: `timeout(1)`
+    # exits 124 and scout never wrote a call-log line.
+    if [ "$LLM_RC" -eq 124 ]; then
+      _log "timeout" reason "killed after ${LLM_TIMEOUT_SECS}s"
+    else
+      _log "parse-failure" reason "${LLM_OUTPUT:0:120}"
+    fi
     exit 0
     ;;
 esac

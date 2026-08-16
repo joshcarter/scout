@@ -85,7 +85,7 @@ mkdir -p "$MISSING_DATA"
 # tests/test-suggest-scout.sh and tests/test-prefer-local-llm.sh.
 CLEAN_PATH_DIR="$TMPDIR_TEST/cleanpath"
 mkdir -p "$CLEAN_PATH_DIR"
-for tool in env bash sh jq grep sed awk tr sort date cat head timeout basename dirname python3; do
+for tool in env bash sh jq grep sed awk tr sort date cat head timeout sleep basename dirname python3; do
   tool_path="$(command -v "$tool" 2>/dev/null)" || continue
   ln -sf "$tool_path" "$CLEAN_PATH_DIR/$tool"
 done
@@ -268,6 +268,8 @@ if [ "$elapsed" -lt 4 ]; then
 else
   fail "timeout override: SCOUT_SHELL_SAFETY_TIMEOUT=1 is honoured" "took ${elapsed}s, expected well under 4 (default 5s would also pass a looser bound)"
 fi
+assert_eq "$(jq -r '.decision' "$TMPDIR_TEST/.claude/scout-shell-safety.jsonl" 2>/dev/null | tail -1)" \
+  "timeout" "timeout override: log decision=timeout, not parse-failure"
 
 # config.toml is honoured when the env var is unset. HOME is the sandbox, so
 # write the file where the hook already looks.

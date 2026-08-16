@@ -219,15 +219,22 @@ fi
 
 # The command goes in on stdin: it can contain quotes, newlines and heredoc
 # bodies, and stdin sidesteps every quoting hazard argv would introduce.
-CLASSIFY=$(printf '%s' "$COMMAND" | _timeout "$SCOUT_BIN" classify-command 2>/dev/null) || CLASSIFY=""
+CLASSIFY_RC=0
+CLASSIFY=$(printf '%s' "$COMMAND" | _timeout "$SCOUT_BIN" classify-command 2>/dev/null) || CLASSIFY_RC=$?
 INTERCEPT=$(printf '%s' "$CLASSIFY" | jq -r 'if (.intercept | type) == "boolean" then .intercept else empty end' 2>/dev/null) || INTERCEPT=""
 ESCAPED=$(printf '%s' "$CLASSIFY" | jq -r 'if (.escape | type) == "boolean" then .escape else empty end' 2>/dev/null) || ESCAPED=""
 
 # Non-zero exit, empty output, or anything that isn't the expected JSON — which
 # includes an older installed binary that has no classify-command subcommand.
 # We cannot tell whether this command should be intercepted, so fail open.
+# 124 is GNU timeout / gtimeout's "I killed the child" status — a hang, not
+# version skew, and it has to be countable as such.
 if [ -z "$INTERCEPT" ] || [ -z "$ESCAPED" ]; then
-  _log true false "classify-failure"
+  if [ "$CLASSIFY_RC" -eq 124 ]; then
+    _log true false "timeout"
+  else
+    _log true false "classify-failure"
+  fi
   exit 0
 fi
 
@@ -248,8 +255,14 @@ fi
 # A deny with no working redirect target is worse than no hook at all: it
 # blocks every build/test command with no sanctioned way to run them. The
 # binary is already known to exist; confirm its endpoint answers too.
-if ! _timeout "$SCOUT_BIN" run --ping >/dev/null 2>&1; then
-  _log true false "endpoint-unreachable"
+PING_RC=0
+_timeout "$SCOUT_BIN" run --ping >/dev/null 2>&1 || PING_RC=$?
+if [ "$PING_RC" -ne 0 ]; then
+  if [ "$PING_RC" -eq 124 ]; then
+    _log true false "timeout"
+  else
+    _log true false "endpoint-unreachable"
+  fi
   exit 0
 fi
 
