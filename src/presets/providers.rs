@@ -15,10 +15,6 @@
 // 2. Add the name to the `matches!` block in `provider_known()`.
 // 3. Add the dispatch arm in `run_provider()`.
 
-// See `render.rs` for why this writes into the buffer instead of pushing a
-// freshly-formatted `String`, and why the infallible `Result` is discarded.
-use std::fmt::Write as _;
-
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
@@ -234,6 +230,7 @@ fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::sync::OnceLock;
 
     static EMPTY_NAMED: OnceLock<HashMap<String, serde_json::Value>> = OnceLock::new();
