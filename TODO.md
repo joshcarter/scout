@@ -13,12 +13,6 @@ better than invoking `scout`?
 
 See `docs/distribution.md`.
 
-# Rewrite README.md
-
-Have Fable do a full review and rewrite, then redo at least the start
-by hand. Include examples of CLI and Claude Code use. Include note
-that only LM Studio has been tested.
-
 # Grok Build compatibility
 
 See `docs/grok-hooks.md`.
