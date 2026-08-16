@@ -266,16 +266,6 @@ process-group behaviour for both.
 This duplication is an artifact of how the work was split across agents, not a
 considered decision — `verify.rs` was read-only for the one that needed it.
 
-# `resolve_project` is written three times
-
-`cli.rs`, `run_cmd.rs` and `mcp_server.rs` each have their own copy of "resolve
-the project root, defaulting to `$PWD`". They agree today. Nothing makes them
-keep agreeing, and the project root decides where `extract`/`grep`/`find`
-resolve relative paths, so a divergence would be quiet and confusing rather
-than loud.
-
-Now that `src/lib.rs` exists there is an obvious home for one copy.
-
 # `handle_stream` can park a thread on a client that stops reading
 
 `dashboard.rs`'s SSE handler writes with a blocking `write_all`. A browser tab

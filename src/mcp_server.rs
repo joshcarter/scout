@@ -138,7 +138,8 @@ impl Scout {
             client: client.as_ref(),
             client_error,
             presets: &self.presets,
-            project: project_root(),
+            // The directory Claude Code launched the server in.
+            project: crate::resolve_project(None),
             // This is the one entry point Claude reaches on its own, which is
             // exactly what `via` is for (docs/dashboard.md §3).
             via: crate::stats::VIA_MCP,
@@ -166,12 +167,6 @@ impl Scout {
         }
         result
     }
-}
-
-/// The MCP server's notion of "the project": the directory Claude Code
-/// launched it in.
-fn project_root() -> String {
-    std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
 }
 
 /// Coerce a JSON Schema `Value` into the object map rmcp wants, falling back
@@ -440,7 +435,9 @@ mod tests {
         // list — the exact shape of the original bug.
         let info = server().get_info();
         assert_eq!(info.protocol_version, MAX_PROTOCOL_VERSION);
-        assert!(ServerHandler::supported_protocol_versions(&server()).contains(&info.protocol_version));
+        assert!(
+            ServerHandler::supported_protocol_versions(&server()).contains(&info.protocol_version)
+        );
     }
 
     #[test]

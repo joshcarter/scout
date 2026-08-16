@@ -74,3 +74,34 @@ pub mod verify;
 // capture spooled (docs/wrap-watch.md §3).  `check_output`'s sibling: same
 // capture, different job — retrieval rather than a verdict.
 pub mod wrap;
+
+/// `--project`, or `$PWD`.
+///
+/// Shared by the CLI, `scout run`, and the MCP server so a missing project
+/// argument always means the same thing. The project root is where
+/// `extract`/`grep`/`find` resolve relative paths; three copies of this
+/// fallback would be free to drift independently, and a divergence would be
+/// quiet rather than loud.
+pub fn resolve_project(project: Option<String>) -> String {
+    project.unwrap_or_else(|| {
+        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
+    })
+}
+
+#[cfg(test)]
+mod resolve_project_tests {
+    use super::resolve_project;
+
+    #[test]
+    fn explicit_path_wins() {
+        assert_eq!(resolve_project(Some("/tmp/somewhere".into())), "/tmp/somewhere");
+    }
+
+    #[test]
+    fn missing_path_is_cwd_or_dot() {
+        let got = resolve_project(None);
+        let expected =
+            std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
+        assert_eq!(got, expected);
+    }
+}

@@ -148,9 +148,7 @@ pub fn run_subcommand(raw_args: &[String]) -> ! {
     let args_value = serde_json::Value::Object(args_json);
 
     // Project root defaults to $PWD.
-    let project = args.project.unwrap_or_else(|| {
-        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
-    });
+    let project = crate::resolve_project(args.project);
 
     // A context provider that failed (no staged diff, a `git` timeout, an
     // unreadable prompt file) is a reason to stop, not a string to paste into

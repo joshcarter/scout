@@ -13,6 +13,7 @@
 //! its callers, and moving it into a library does not change it.
 
 use crate::client::LlmClient;
+use crate::resolve_project;
 use crate::{
     check_output, config, dashboard, edit, extract, filter_config, find, grep, presets, render,
     select, source, spool, stats, wrap,
@@ -575,13 +576,6 @@ fn collect_globs(globs: &[String], dirs: &[String], exclude_dirs: &[String]) -> 
         .chain(dirs.iter().map(|d| format!("{}/**", trimmed(d))))
         .chain(exclude_dirs.iter().map(|d| format!("!{}/**", trimmed(d))))
         .collect()
-}
-
-/// `--project`, or `$PWD`.
-fn resolve_project(project: Option<String>) -> String {
-    project.unwrap_or_else(|| {
-        std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string())
-    })
 }
 
 /// Build the invocation context and run one filter, returning its payload.
