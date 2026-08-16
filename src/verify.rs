@@ -147,7 +147,12 @@ pub struct Capture {
     /// — `grep` exiting 1 and `diff` exiting 1 are not failures, and the
     /// `exit_ok` boolean cannot say which 1 this was.
     pub exit_code: Option<i32>,
+    /// Combined stdout+stderr, stream order, for `check_output` / `wrap`.
+    /// Providers that must not mix git's diagnostic stderr into a prompt
+    /// should read `stdout` / `stderr` instead.
     pub output: String,
+    pub stdout: String,
+    pub stderr: String,
     pub timed_out: Option<TimeoutKind>,
     pub elapsed: Duration,
 }
@@ -167,12 +172,24 @@ pub fn run_command_capture(
     capture_with_deadlines(cmd, dir, timeout, IDLE_TIMEOUT, max_output_bytes)
 }
 
-/// The real thing, with both deadlines spelled out.
+/// `sh -c` wrapper around [`capture_argv`].
 ///
 /// Separate from `run_command_capture` so tests can use an idle deadline they
-/// do not have to wait two minutes for — and so a future caller with a
-/// different notion of "wedged" (the `git()` provider's timeout, say) can pick
-/// its own without a second implementation.
+/// do not have to wait two minutes for. Callers that have a real argv — the
+/// `git()` provider, whose `base` is caller-supplied — must use `capture_argv`
+/// directly; interpolating that value into this string would be a command
+/// injection.
+pub fn capture_with_deadlines(
+    cmd: &str,
+    dir: &Path,
+    wall_clock: Duration,
+    idle: Duration,
+    max_output_bytes: usize,
+) -> Capture {
+    capture_argv("sh", &["-c", cmd], dir, wall_clock, idle, max_output_bytes)
+}
+
+/// Spawn `program` with `args` under both deadlines. No shell.
 ///
 /// Structure, and why it is not the obvious one: the `Child` stays in *this*
 /// thread.  The previous version moved it into a thread running
@@ -191,8 +208,9 @@ pub fn run_command_capture(
 // the two deadlines are a single piece of state; handing any part of it to a
 // helper means handing over the rest as well.
 #[allow(clippy::too_many_lines)]
-pub fn capture_with_deadlines(
-    cmd: &str,
+pub fn capture_argv(
+    program: &str,
+    args: &[&str],
     dir: &Path,
     wall_clock: Duration,
     idle: Duration,
@@ -200,9 +218,9 @@ pub fn capture_with_deadlines(
 ) -> Capture {
     let started = Instant::now();
 
-    let mut command = Command::new("sh");
+    let mut command = Command::new(program);
     command
-        .args(["-c", cmd])
+        .args(args)
         .current_dir(dir)
         // Never the parent's stdin: under `scout mcp` that is the JSON-RPC
         // channel, and a command that reads it would eat the protocol.  It also
@@ -240,7 +258,9 @@ pub fn capture_with_deadlines(
             return Capture {
                 exit_ok: false,
                 exit_code: None,
-                output: format!("sh: failed to spawn: {e}"),
+                output: format!("{program}: failed to spawn: {e}"),
+                stdout: String::new(),
+                stderr: String::new(),
                 timed_out: None,
                 elapsed: started.elapsed(),
             }
@@ -286,7 +306,7 @@ pub fn capture_with_deadlines(
             }
             Ok(None) => {}
             Err(e) => {
-                wait_error = Some(format!("sh: wait failed: {e}"));
+                wait_error = Some(format!("{program}: wait failed: {e}"));
                 break;
             }
         }
@@ -306,7 +326,7 @@ pub fn capture_with_deadlines(
 
     if timed_out.is_some() {
         kill_process_group(pid);
-        // The group is dead; this only reaps the zombie `sh` left behind.
+        // The group is dead; this only reaps the zombie leader left behind.
         let _ = child.wait();
     }
 
@@ -323,6 +343,8 @@ pub fn capture_with_deadlines(
             exit_ok: false,
             exit_code: None,
             output: msg,
+            stdout: String::new(),
+            stderr: String::new(),
             timed_out: None,
             elapsed: started.elapsed(),
         };
@@ -336,7 +358,7 @@ pub fn capture_with_deadlines(
     let mut output = format!("{stdout}\n{stderr}").trim().to_string();
     truncate_diagnostic(&mut output, max_output_bytes);
 
-    Capture { exit_ok, exit_code, output, timed_out, elapsed: started.elapsed() }
+    Capture { exit_ok, exit_code, output, stdout, stderr, timed_out, elapsed: started.elapsed() }
 }
 
 /// Take a buffer lock, ignoring poisoning: a panicked reader loses its own
@@ -845,6 +867,48 @@ mod tests {
         b.push("héllo ".as_bytes());
         b.push("wörld".as_bytes());
         assert_eq!(b.render(), "héllo wörld", "nothing dropped means nothing changed");
+    }
+
+    #[test]
+    fn capture_argv_does_not_go_through_a_shell() {
+        // The reason this sibling exists: a caller-supplied value must not be
+        // interpolated into `sh -c`.  If it were, the second `echo` would run.
+        let dir = make_temp();
+        let c = capture_argv(
+            "printf",
+            &["%s\n", "one; echo two"],
+            dir.path(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            MAX_OUTPUT_BYTES,
+        );
+        assert!(c.exit_ok, "output: {}", c.output);
+        assert_eq!(c.stdout.trim(), "one; echo two");
+        assert!(
+            !c.stdout.lines().any(|l| l.trim() == "two"),
+            "the argument was parsed by a shell: {:?}",
+            c.stdout
+        );
+    }
+
+    #[test]
+    fn capture_argv_names_the_program_when_spawn_fails() {
+        let dir = make_temp();
+        let c = capture_argv(
+            "definitely-not-a-real-binary-9f3c",
+            &[],
+            dir.path(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            MAX_OUTPUT_BYTES,
+        );
+        assert!(!c.exit_ok);
+        assert!(
+            c.output.contains("definitely-not-a-real-binary-9f3c"),
+            "spawn error must name the program: {}",
+            c.output
+        );
+        assert!(c.output.contains("failed to spawn"), "output: {}", c.output);
     }
 
     #[test]

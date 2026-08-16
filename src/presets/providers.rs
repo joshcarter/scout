@@ -21,13 +21,10 @@ use std::fmt::Write as _;
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::time::Duration;
 
-use crate::verify::TimeoutKind;
+use crate::verify;
 
 /// Arguments available to a provider when it executes.
 pub struct ProviderArgs<'a> {
@@ -188,16 +185,6 @@ const GIT_IDLE: Duration = Duration::from_secs(10);
 /// hundreds of megabytes.
 const GIT_MAX_BYTES: usize = 1_048_576;
 
-/// Ceiling on captured stderr.  It only ever reaches anyone as the tail of an
-/// error message, so it does not need the stdout budget.
-const GIT_STDERR_MAX_BYTES: usize = 8 * 1024;
-
-/// How often the poll loop wakes to check `try_wait()` and the two deadlines.
-const GIT_POLL: Duration = Duration::from_millis(25);
-
-/// How long to wait for the reader threads once the child itself is gone.
-const GIT_READER_DRAIN: Duration = Duration::from_secs(2);
-
 /// Reject a caller-supplied revision that argument parsing would read as a flag.
 ///
 /// `base` reaches `git diff` / `git log` in argument position, so a value like
@@ -218,228 +205,28 @@ fn checked_rev(base: &str) -> Result<&str, String> {
 }
 
 /// Run `git <args>` in `cwd` under both deadlines, capped at `GIT_MAX_BYTES`.
+///
+/// Argv, not a shell string: `base` arrives from `${args.*}`, and a user
+/// preset can wire that straight to a model-controlled MCP argument.
 fn git(cwd: &str, args: &[&str]) -> Result<String, String> {
-    run_bounded("git", cwd, args, GIT_WALL_CLOCK, GIT_IDLE, GIT_MAX_BYTES)
-}
-
-/// Spawn `program` with `args`, capture stdout capped at `max_bytes`, and give
-/// up if it runs past `wall_clock` or goes quiet for `idle`.
-///
-/// Deliberately *not* `verify::capture_with_deadlines`, which is otherwise this
-/// function and was made public to be reused.  That helper takes a command
-/// *string* and runs it through `sh -c`; the values that reach these providers
-/// (`base`, from `${args.*}`) are caller-supplied, and a user preset can wire
-/// one straight to a model-controlled MCP argument.  Reusing it would mean
-/// interpolating that value into a shell string, trading a hang for a command
-/// injection — a strictly worse bug.  An argv vector keeps the shell out of it.
-/// The principled de-duplication is an argv-taking sibling in `verify` that both
-/// callers delegate to; this is the narrow version until that exists.
-///
-/// The deadlines and the cap are parameters rather than the constants above so
-/// the tests can exercise every branch in milliseconds and kilobytes.
-fn run_bounded(
-    program: &str,
-    cwd: &str,
-    args: &[&str],
-    wall_clock: Duration,
-    idle: Duration,
-    max_bytes: usize,
-) -> Result<String, String> {
-    let started = Instant::now();
-    let mut child = Command::new(program)
-        .current_dir(cwd)
-        .args(args)
-        // Never the parent's stdin: under `scout mcp` that is the JSON-RPC
-        // channel, and a credential helper reading it would eat the protocol.
-        // It also turns "prompting for a password" into an immediate EOF, which
-        // is the honest answer for a non-interactive context provider.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{program} command failed: {e}"))?;
-
-    // Milliseconds since `started` at which a reader last saw bytes — the
-    // liveness signal the idle deadline watches.  An atomic rather than a
-    // `Mutex<Instant>`: two writers, one reader, no invariant beyond monotonic.
-    let last_output_ms = Arc::new(AtomicU64::new(0));
-    let out_buf = Arc::new(Mutex::new(Capped::new(max_bytes)));
-    let err_buf = Arc::new(Mutex::new(Capped::new(GIT_STDERR_MAX_BYTES)));
-
-    let mut readers = Vec::new();
-    if let Some(pipe) = child.stdout.take() {
-        readers.push(spawn_reader(
-            pipe,
-            Arc::clone(&out_buf),
-            Arc::clone(&last_output_ms),
-            started,
-        ));
-    }
-    if let Some(pipe) = child.stderr.take() {
-        readers.push(spawn_reader(
-            pipe,
-            Arc::clone(&err_buf),
-            Arc::clone(&last_output_ms),
-            started,
-        ));
-    }
-
-    let mut status = None;
-    let mut timed_out = None;
-    let mut wait_error = None;
-    loop {
-        match child.try_wait() {
-            Ok(Some(s)) => {
-                status = Some(s);
-                break;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                wait_error = Some(format!("{program}: wait failed: {e}"));
-                break;
-            }
-        }
-        let elapsed = started.elapsed();
-        if elapsed >= wall_clock {
-            timed_out = Some(TimeoutKind::WallClock);
-            break;
-        }
-        let quiet =
-            elapsed.saturating_sub(Duration::from_millis(last_output_ms.load(Ordering::Relaxed)));
-        if quiet >= idle {
-            timed_out = Some(TimeoutKind::Idle);
-            break;
-        }
-        thread::sleep(GIT_POLL);
-    }
-
-    if status.is_none() {
-        // Only reaches the child itself, not anything it forked — `verify`
-        // needs `setsid` because `sh -c` may never exec its argument, whereas
-        // git is the process we named.  A helper git spawned can outlive it,
-        // which is what the bounded join below is for.
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
-    // Normally instant: the pipes hit EOF the moment the last writer closes
-    // them.  When they do not, something the child forked still holds the write
-    // end (`git gc --auto` daemonizes with these very pipes inherited), so
-    // abandon the readers rather than block here.  The buffers are capped and
-    // shared, so a detached reader costs a thread, not memory, and whatever it
-    // captured before we gave up is still readable below.
-    join_within(&mut readers, GIT_READER_DRAIN);
-
-    if let Some(kind) = timed_out {
+    let c =
+        verify::capture_argv("git", args, Path::new(cwd), GIT_WALL_CLOCK, GIT_IDLE, GIT_MAX_BYTES);
+    if let Some(kind) = c.timed_out {
         return Err(format!(
-            "{program} {} timed out after {:?} ({} deadline)",
+            "git {} timed out after {:?} ({} deadline)",
             args.join(" "),
-            started.elapsed(),
+            c.elapsed,
             kind.as_str()
         ));
     }
-    if let Some(e) = wait_error {
-        return Err(e);
+    if !c.exit_ok {
+        let detail = if c.stderr.is_empty() { c.output } else { c.stderr };
+        return Err(match c.exit_code {
+            Some(code) => format!("git exit {code}: {detail}"),
+            None => format!("git failed: {detail}"),
+        });
     }
-    // Unreachable: the loop only leaves without a status by setting one of the
-    // two cases above.  Reported rather than asserted — a provider must degrade,
-    // never panic half-way through building a prompt.
-    let Some(status) = status else {
-        return Err(format!("{program}: exited without reporting a status"));
-    };
-    if !status.success() {
-        let stderr = lock(&err_buf).render("stderr");
-        return Err(format!("{program} exit {status}: {stderr}"));
-    }
-    let stdout = lock(&out_buf).render(program);
-    Ok(stdout)
-}
-
-/// One stream's capture, capped as the bytes arrive rather than after the fact.
-///
-/// Head-only, unlike `verify`'s head+tail buffer: a build log keeps its verdict
-/// on the last line, a diff or a log listing does not, and the first N bytes of
-/// a diff are the part a review would have read anyway.
-struct Capped {
-    buf: Vec<u8>,
-    cap: usize,
-    dropped: usize,
-}
-
-impl Capped {
-    fn new(cap: usize) -> Self {
-        Capped { buf: Vec::new(), cap, dropped: 0 }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        let room = self.cap.saturating_sub(self.buf.len());
-        let n = room.min(bytes.len());
-        self.buf.extend_from_slice(&bytes[..n]);
-        self.dropped += bytes.len() - n;
-    }
-
-    fn render(&self, label: &str) -> String {
-        let mut s = String::from_utf8_lossy(&self.buf).into_owned();
-        if self.dropped > 0 {
-            let _ = write!(
-                s,
-                "\n[{label}: output truncated at {} bytes, {} elided]",
-                self.cap, self.dropped
-            );
-        }
-        s
-    }
-}
-
-/// Take a buffer lock, ignoring poisoning: a panicked reader loses its own
-/// thread, and the bytes it already appended are still worth reporting.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Drain one pipe into `buf`, stamping `last_output_ms` on every read that
-/// returned bytes.  Reading continues past the cap — `Capped::push` discards
-/// the overflow — so the child never blocks writing into a pipe nobody is
-/// draining, which would turn an oversized diff into a wall-clock timeout.
-fn spawn_reader<R: Read + Send + 'static>(
-    mut pipe: R,
-    buf: Arc<Mutex<Capped>>,
-    last_output_ms: Arc<AtomicU64>,
-    started: Instant,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    last_output_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-                    lock(&buf).push(&chunk[..n]);
-                }
-                // EINTR is not a read failure: go round and read again.
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-    })
-}
-
-/// Join every handle, giving up after `deadline`; the ones that did not finish
-/// are dropped, which detaches them.
-fn join_within(handles: &mut Vec<thread::JoinHandle<()>>, deadline: Duration) {
-    let start = Instant::now();
-    loop {
-        if handles.iter().all(thread::JoinHandle::is_finished) {
-            for h in handles.drain(..) {
-                let _ = h.join();
-            }
-            return;
-        }
-        if start.elapsed() >= deadline {
-            return;
-        }
-        thread::sleep(GIT_POLL);
-    }
+    Ok(c.stdout)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -598,10 +385,6 @@ mod tests {
 
     // ── deadlines and caps ───────────────────────────────────────────────────
 
-    fn tmp() -> String {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    }
-
     /// Is `dir` inside a git worktree, with a working `git` on PATH?  Several
     /// tests below are only meaningful if so, and skipping beats failing on a
     /// machine without git.
@@ -611,74 +394,6 @@ mod tests {
             .current_dir(dir)
             .output()
             .is_ok_and(|o| o.status.success())
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_subprocess_that_would_hang_is_stopped_by_the_wall_clock() {
-        // The defect this closes: `git()` used `output()`, which reads to EOF
-        // with no deadline.  A git that blocks — a credential helper that
-        // opened /dev/tty, a smudge filter, a submodule fetch over a dead
-        // network — hung `scout run --preset quality_review` forever, because
-        // nothing above it had a deadline either.  `sleep` stands in for the
-        // block; the machinery under test is the same one `git()` now goes
-        // through.
-        let start = Instant::now();
-        let err = run_bounded(
-            "sleep",
-            &tmp(),
-            &["30"],
-            Duration::from_millis(200),
-            Duration::from_secs(30),
-            4096,
-        )
-        .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
-        assert!(err.contains("wall_clock"), "expected the wall-clock kind: {err}");
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "deadline ignored: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn silence_trips_the_idle_deadline_before_the_wall_clock() {
-        let start = Instant::now();
-        let err = run_bounded(
-            "sleep",
-            &tmp(),
-            &["30"],
-            Duration::from_secs(30),
-            Duration::from_millis(200),
-            4096,
-        )
-        .unwrap_err();
-        assert!(err.contains("idle"), "expected the idle kind: {err}");
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "deadline ignored: {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn a_subprocess_that_keeps_printing_is_never_killed_for_being_slow() {
-        // The reason the idle deadline is separate from the wall clock: this
-        // runs for ~800 ms against a 300 ms idle deadline and must survive,
-        // because it is visibly making progress the whole time.
-        let out = run_bounded(
-            "sh",
-            &tmp(),
-            &["-c", "i=0; while [ $i -lt 8 ]; do echo tick-$i; sleep 0.1; i=$((i+1)); done"],
-            Duration::from_secs(30),
-            Duration::from_millis(300),
-            4096,
-        )
-        .unwrap();
-        assert!(out.contains("tick-7"), "a chatty command was cut short: {out}");
     }
 
     #[test]
@@ -708,17 +423,17 @@ mod tests {
             .is_ok_and(|o| o.status.success());
         assert!(added, "git add failed");
 
-        let out = run_bounded(
+        let c = verify::capture_argv(
             "git",
-            &repo_path,
             &["diff", "--cached"],
+            Path::new(&repo_path),
             Duration::from_secs(30),
             Duration::from_secs(10),
             4096,
-        )
-        .unwrap();
-        assert!(out.len() < 4096 + 128, "git output not capped: {} bytes", out.len());
-        assert!(out.contains("output truncated"), "truncation marker missing: {out}");
+        );
+        assert!(c.exit_ok, "git diff --cached failed: {}", c.output);
+        assert!(c.stdout.len() < 4096 + 128, "git output not capped: {} bytes", c.stdout.len());
+        assert!(c.stdout.contains("bytes elided"), "elision marker missing: {}", c.stdout);
     }
 
     #[test]

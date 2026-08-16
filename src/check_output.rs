@@ -324,6 +324,8 @@ mod tests {
             exit_ok: false,
             exit_code: None,
             output: "Compiling serde v1.0.197\n".to_string(),
+            stdout: "Compiling serde v1.0.197\n".to_string(),
+            stderr: String::new(),
             timed_out: Some(verify::TimeoutKind::Idle),
             elapsed: Duration::from_secs(140),
         };

@@ -227,31 +227,6 @@ should go either way.
 Small related gap: `[dashboard]` is parsed by `filter_config.rs` but appears
 nowhere in `config.example.toml`.
 
-# Subprocess capture is implemented twice
-
-`verify::capture_with_deadlines` and `presets::providers::run_bounded` are the
-same ~80 lines: bounded buffer, a reader thread per pipe, a poll loop on
-`try_wait()` against a wall-clock and an idle deadline, kill on expiry.
-
-The second one exists for a real reason, not laziness. `capture_with_deadlines`
-takes a command *string* and runs it through `sh -c`, while `git()` needs argv:
-`base` arrives from `${args.*}`, and a user preset under `$XDG_CONFIG_HOME` can
-shadow an MCP-exposed preset and wire a git provider to a model-controlled
-argument. Reusing the string form would have meant interpolating that value
-into a shell line, trading a hang for a command injection.
-
-The fix is an argv-taking sibling in `verify.rs` that both delegate to —
-`capture_argv(program, args, …)` with the existing `sh -c` entry point becoming
-a thin wrapper. Then `run_bounded` disappears. Note the two are not quite
-identical today: `capture_with_deadlines` puts the child in its own process
-group via `setsid` and kills the group, because `sh -c` may never exec its
-argument; `run_bounded` does not, so a helper `git` forks (a credential helper,
-a smudge filter) can outlive a timeout. The unified version should keep the
-process-group behaviour for both.
-
-This duplication is an artifact of how the work was split across agents, not a
-considered decision — `verify.rs` was read-only for the one that needed it.
-
 # `handle_stream` can park a thread on a client that stops reading
 
 `dashboard.rs`'s SSE handler writes with a blocking `write_all`. A browser tab
