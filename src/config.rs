@@ -637,6 +637,16 @@ mod tests {
         assert!(DEFAULT_CONFIG.contains("# idle_timeout_seconds = 15"));
     }
 
+    #[test]
+    fn the_bundled_default_config_documents_hook_timeouts() {
+        // Hook-owned sections: the binary never reads these, but the
+        // example is still the only place a user learns the knobs exist.
+        assert!(DEFAULT_CONFIG.contains("[shell_safety]"));
+        assert!(DEFAULT_CONFIG.contains("[prefer_local]"));
+        assert!(DEFAULT_CONFIG.contains("# timeout_seconds = 5"));
+        assert!(DEFAULT_CONFIG.contains("# timeout_seconds = 6"));
+    }
+
     // The process environment is global and cargo runs tests on parallel
     // threads, so every test that touches SCOUT_CONFIG / XDG_CONFIG_HOME
     // must hold this lock. Recover from poisoning: a failed test must not

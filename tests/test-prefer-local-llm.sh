@@ -140,7 +140,7 @@ mkdir -p "$MISSING_DATA"
 # so the script cannot even start and the test reports 127 for the wrong reason.
 CLEAN_PATH_DIR="$TMPDIR_TEST/cleanpath"
 mkdir -p "$CLEAN_PATH_DIR"
-for tool in env bash sh jq grep date cat head timeout; do
+for tool in env bash sh jq grep date cat head timeout python3; do
   tool_path="$(command -v "$tool" 2>/dev/null)" || continue
   ln -sf "$tool_path" "$CLEAN_PATH_DIR/$tool"
 done
@@ -469,11 +469,51 @@ rc=$?
 elapsed=$(( $(date +%s) - start ))
 assert_eq "$rc" "0" "[timeout override] exits 0"
 assert_eq "$output" "" "[timeout override] no deny output (fail-open)"
-if [ "$elapsed" -lt 8 ]; then
+if [ "$elapsed" -lt 4 ]; then
   pass "[timeout override] SCOUT_PREFER_LOCAL_TIMEOUT=1 is honoured (${elapsed}s)"
 else
-  fail "[timeout override] SCOUT_PREFER_LOCAL_TIMEOUT=1 is honoured" "took ${elapsed}s, expected well under 8"
+  fail "[timeout override] SCOUT_PREFER_LOCAL_TIMEOUT=1 is honoured" "took ${elapsed}s, expected well under 4 (default 6s would also pass a looser bound)"
 fi
+
+# config.toml is honoured when the env var is unset.
+mkdir -p "$TMPDIR_TEST/.config/scout"
+cat > "$TMPDIR_TEST/.config/scout/config.toml" <<'EOF'
+[prefer_local]
+timeout_seconds = 1
+EOF
+start=$(date +%s)
+output=$(make_payload "cargo build" | \
+  env -u CLAUDE_PLUGIN_ROOT -u SCOUT_PREFER_LOCAL_TIMEOUT -u SCOUT_CONFIG -u XDG_CONFIG_HOME \
+    CLAUDE_PLUGIN_DATA="$SLOW_DATA" PATH="$CLEAN_PATH_DIR" \
+    "$HOOK" 2>/dev/null)
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+assert_eq "$rc" "0" "[timeout config] exits 0"
+assert_eq "$output" "" "[timeout config] no deny output (fail-open)"
+if [ "$elapsed" -lt 4 ]; then
+  pass "[timeout config] [prefer_local].timeout_seconds=1 is honoured (${elapsed}s)"
+else
+  fail "[timeout config] [prefer_local].timeout_seconds=1 is honoured" "took ${elapsed}s, expected well under 4 (default 6s would also pass a looser bound)"
+fi
+
+# Env wins over the file. Config says 30 — if the file won, the 30s stub
+# would run to completion.
+cat > "$TMPDIR_TEST/.config/scout/config.toml" <<'EOF'
+[prefer_local]
+timeout_seconds = 30
+EOF
+start=$(date +%s)
+output=$(make_payload "cargo build" | \
+  env -u CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA="$SLOW_DATA" \
+    SCOUT_PREFER_LOCAL_TIMEOUT=1 PATH="$CLEAN_PATH_DIR" \
+    "$HOOK" 2>/dev/null)
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 8 ]; then
+  pass "[timeout env beats config] SCOUT_PREFER_LOCAL_TIMEOUT=1 wins (${elapsed}s)"
+else
+  fail "[timeout env beats config] SCOUT_PREFER_LOCAL_TIMEOUT=1 wins" "took ${elapsed}s — config 30s leaked through"
+fi
+rm -f "$TMPDIR_TEST/.config/scout/config.toml"
 
 # ── Tests: binary resolution ─────────────────────────────────────────────────
 # The plugin ships its binary at $CLAUDE_PLUGIN_ROOT/bin/scout and nothing

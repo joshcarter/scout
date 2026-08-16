@@ -103,12 +103,45 @@ INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
-# Ceiling on the two scout subprocesses this hook spawns. Overridable for the
-# same reason shell-safety.sh's LLM timeout is: a slow host should not have to
-# edit the script. The default is one second looser than that hook's because
-# classify-command is local lexing plus a ping, not a model call, and 6s is
-# already generous for both.
+# Ceiling on the two scout subprocesses this hook spawns. Precedence:
+# $SCOUT_PREFER_LOCAL_TIMEOUT, then [prefer_local].timeout_seconds in
+# config.toml, then 6. One second looser than shell-safety's default because
+# classify-command is local lexing plus a ping, not a model call.
 SUBPROCESS_TIMEOUT_SECS="${SCOUT_PREFER_LOCAL_TIMEOUT:-6}"
+
+# Same path order as shell-safety.sh / config.rs: $SCOUT_CONFIG, then
+# $XDG_CONFIG_HOME, then ~/.config.
+_config_toml() {
+  printf '%s' "${SCOUT_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/scout/config.toml}"
+}
+
+# Load [prefer_local].timeout_seconds. Prints a single integer in 1..60, or
+# nothing — the caller keeps its default. Fail-open if python3 or tomllib is
+# missing; this hook did not previously need python3.
+_load_config_timeout() {
+  local cfg
+  cfg=$(_config_toml)
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" 2>/dev/null <<'PYEOF' || true
+import sys
+cfg_path = sys.argv[1]
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit(0)
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+    v = cfg.get("prefer_local", {}).get("timeout_seconds")
+    if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 60:
+        print(v)
+except Exception:
+    sys.exit(0)
+PYEOF
+}
 
 # Wrapper for the two scout subprocesses this hook spawns (`classify-command`
 # and `run --ping`): use timeout/gtimeout if available, otherwise run bare
@@ -174,6 +207,14 @@ fi
 if [ ! -x "$SCOUT_BIN" ]; then
   _log true false "missing-binary"
   exit 0
+fi
+
+# Overlay [prefer_local].timeout_seconds only when the env var was left
+# unset. Happens after the prefilter so a non-matching Bash call does not
+# pay for a python parse.
+if [ -z "${SCOUT_PREFER_LOCAL_TIMEOUT:-}" ]; then
+  _cfg_timeout=$(_load_config_timeout)
+  [ -n "$_cfg_timeout" ] && SUBPROCESS_TIMEOUT_SECS="$_cfg_timeout"
 fi
 
 # The command goes in on stdin: it can contain quotes, newlines and heredoc

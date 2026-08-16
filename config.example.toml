@@ -203,3 +203,15 @@ model = "qwen/qwen3.6-35b-a3b"
 # hooks/shell-safety.sh, not by the binary.
 # [shell_safety]
 # deny = ["rm -rf /", "dd if=.* of=/dev/"]
+#
+# Worst-case stall before the permission prompt, in seconds. Clamped to
+# 1..60 — this hook blocks a human, so the ceiling is patience, not
+# model health. $SCOUT_SHELL_SAFETY_TIMEOUT overrides this when set.
+# timeout_seconds = 5
+
+# Ceiling on the two scout subprocesses the prefer-local-llm hook
+# spawns (`classify-command` and `run --ping`). Read by
+# hooks/prefer-local-llm.sh, not by the binary. Same 1..60 clamp;
+# $SCOUT_PREFER_LOCAL_TIMEOUT overrides this when set.
+# [prefer_local]
+# timeout_seconds = 6

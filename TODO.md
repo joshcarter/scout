@@ -160,9 +160,11 @@ as "empty" — which is what the rest of the reconciliation already does.
 
 # Hook timeouts: killed calls are still invisible
 
-The env knobs exist (`SCOUT_SHELL_SAFETY_TIMEOUT`, default 5;
-`SCOUT_PREFER_LOCAL_TIMEOUT`, default 6). A config-file version could still
-ride the reader `shell-safety.sh` already uses for `[shell_safety].deny`.
+The knobs exist in both places: env (`SCOUT_SHELL_SAFETY_TIMEOUT`,
+`SCOUT_PREFER_LOCAL_TIMEOUT`) and config.toml (`[shell_safety].timeout_seconds`,
+`[prefer_local].timeout_seconds`). Env wins. Defaults stay 5 and 6. The
+file keys ride the same python reader `[shell_safety].deny` already used;
+the Rust config parser does not see them — these hooks never go through it.
 
 The remaining gap is that a killed call writes no log line, so `calls.jsonl`
 cannot show how often the timeout fires. The distribution is
@@ -273,8 +275,8 @@ disappear-without-a-word failure mode as the `CLAUDE_PLUGIN_ROOT` bug. It
 should say so once rather than vanish.
 
 Worth doing at the same time: the hooks depend on `jq`, `sed`, `awk` and
-`python3` (the last only for `[shell_safety] deny`), and nothing declares that
-anywhere a user would read.
+`python3` (the last for `[shell_safety] deny` and both hooks' config.toml
+timeout keys), and nothing declares that anywhere a user would read.
 
 # The hook audit logs are still created at the umask
 

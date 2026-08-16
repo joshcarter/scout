@@ -40,10 +40,10 @@ set -euo pipefail
 # Fail-open if HOME is unset (unusual CI environments, test harnesses).
 [ -z "${HOME:-}" ] && exit 0
 AUDIT_LOG="${HOME}/.claude/scout-shell-safety.jsonl"
-# Worst-case stall before the user sees a permission prompt. Overridable so a
-# host whose local model is slower than the 5s default can raise it without a
-# script edit; the default stays tight because this hook sits on the interactive
-# path. See TODO.md ("Hook timeouts are hardcoded literals").
+# Worst-case stall before the user sees a permission prompt. Precedence:
+# $SCOUT_SHELL_SAFETY_TIMEOUT, then [shell_safety].timeout_seconds in
+# config.toml, then 5. The default stays tight because this hook sits on the
+# interactive path; raise it in config (or env) if the local model is slower.
 LLM_TIMEOUT_SECS="${SCOUT_SHELL_SAFETY_TIMEOUT:-5}"
 
 # ── Resolve the scout binary ─────────────────────────────────────────────────
@@ -134,11 +134,18 @@ _unwrap_json() {
   ' 2>/dev/null || true
 }
 
+# Shared path for the two [shell_safety] readers below. $SCOUT_CONFIG wins,
+# then $XDG_CONFIG_HOME, then ~/.config — same order config.rs uses.
+_config_toml() {
+  printf '%s' "${SCOUT_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/scout/config.toml}"
+}
+
 # Load [shell_safety].deny list from config.toml; prints one entry per line.
 # Returns nothing (not an error) when config is absent or unparsable — the
 # baked-in floor remains the only gate; config can only extend, never shrink.
 _load_config_deny() {
-  local cfg="${SCOUT_CONFIG:-${XDG_CONFIG_HOME:-${HOME}/.config}/scout/config.toml}"
+  local cfg
+  cfg=$(_config_toml)
   [ -f "$cfg" ] || return 0
   python3 - "$cfg" 2>/dev/null <<'PYEOF' || true
 import sys
@@ -156,6 +163,34 @@ try:
     for item in cfg.get("shell_safety", {}).get("deny", []):
         if isinstance(item, str) and item.strip():
             print(item)
+except Exception:
+    sys.exit(0)
+PYEOF
+}
+
+# Load [shell_safety].timeout_seconds. Prints a single integer in 1..60, or
+# nothing — the caller keeps its default. Bool is rejected because it is an
+# int subclass in Python (`true` must not become 1s).
+_load_config_timeout() {
+  local cfg
+  cfg=$(_config_toml)
+  [ -f "$cfg" ] || return 0
+  python3 - "$cfg" 2>/dev/null <<'PYEOF' || true
+import sys
+cfg_path = sys.argv[1]
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        sys.exit(0)
+try:
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+    v = cfg.get("shell_safety", {}).get("timeout_seconds")
+    if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 60:
+        print(v)
 except Exception:
     sys.exit(0)
 PYEOF
@@ -391,6 +426,13 @@ fi
 # _timeout is a shell function and an assignment prefix on one does not
 # reliably scope to it.
 export SCOUT_VIA=hook
+
+# Overlay [shell_safety].timeout_seconds only when the env var was left
+# unset — env wins, and we skip the python read on every fast-path exit.
+if [ -z "${SCOUT_SHELL_SAFETY_TIMEOUT:-}" ]; then
+  _cfg_timeout=$(_load_config_timeout)
+  [ -n "$_cfg_timeout" ] && LLM_TIMEOUT_SECS="$_cfg_timeout"
+fi
 
 LLM_OUTPUT=$(_timeout "$SCOUT_BIN" run \
   --preset shell_safety \
