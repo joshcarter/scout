@@ -240,4 +240,33 @@ fi
 assert_eq "$(jq -r '.decision' "$TMPDIR_TEST/.claude/scout-shell-safety.jsonl" 2>/dev/null | tail -1)" \
   "missing-binary" "missing binary: log decision=missing-binary"
 
+# ── Timeout knob: SCOUT_SHELL_SAFETY_TIMEOUT is honoured ─────────────────────
+# A stub that sleeps past the default 5s, with the env var set to 1s, must
+# fail-open in about a second rather than wait the stub out. Without the
+# ${VAR:-5} expansion this would sit until the stub exited.
+SLOW_DATA="$TMPDIR_TEST/scout-data-slow"
+mkdir -p "$SLOW_DATA/bin"
+cat > "$SLOW_DATA/bin/scout" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+exit 0
+EOF
+chmod +x "$SLOW_DATA/bin/scout"
+start=$(date +%s)
+output=$(jq -n --arg c "grep \$HOME /tmp/f" '{tool_name:"Bash", tool_input:{command:$c, cwd:"/tmp"}}' \
+  | env -u CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA="$SLOW_DATA" \
+    SCOUT_SHELL_SAFETY_TIMEOUT=1 PATH="$CLEAN_PATH_DIR" \
+    bash "$HOOK" 2>/dev/null)
+elapsed=$(( $(date +%s) - start ))
+if is_allow "$output"; then
+  fail "timeout override: never a false auto-allow" "got an allow after a killed LLM call"
+else
+  pass "timeout override: never a false auto-allow"
+fi
+if [ "$elapsed" -lt 8 ]; then
+  pass "timeout override: SCOUT_SHELL_SAFETY_TIMEOUT=1 is honoured (${elapsed}s)"
+else
+  fail "timeout override: SCOUT_SHELL_SAFETY_TIMEOUT=1 is honoured" "took ${elapsed}s, expected well under 8"
+fi
+
 print_results

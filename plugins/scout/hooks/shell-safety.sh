@@ -40,7 +40,11 @@ set -euo pipefail
 # Fail-open if HOME is unset (unusual CI environments, test harnesses).
 [ -z "${HOME:-}" ] && exit 0
 AUDIT_LOG="${HOME}/.claude/scout-shell-safety.jsonl"
-LLM_TIMEOUT_SECS=5
+# Worst-case stall before the user sees a permission prompt. Overridable so a
+# host whose local model is slower than the 5s default can raise it without a
+# script edit; the default stays tight because this hook sits on the interactive
+# path. See TODO.md ("Hook timeouts are hardcoded literals").
+LLM_TIMEOUT_SECS="${SCOUT_SHELL_SAFETY_TIMEOUT:-5}"
 
 # ── Resolve the scout binary ─────────────────────────────────────────────────
 # Payload first, then the legacy data dir, then PATH. See the fuller comment on

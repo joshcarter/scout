@@ -103,7 +103,12 @@ INTERCEPT_LOG="${HOME}/.claude/scout-intercepts.jsonl"
 SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/scout-scout}/bin/scout"
 [ -x "$SCOUT_BIN" ] || SCOUT_BIN="$(command -v scout 2>/dev/null || true)"
-SUBPROCESS_TIMEOUT_SECS=6
+# Ceiling on the two scout subprocesses this hook spawns. Overridable for the
+# same reason shell-safety.sh's LLM timeout is: a slow host should not have to
+# edit the script. The default is one second looser than that hook's because
+# classify-command is local lexing plus a ping, not a model call, and 6s is
+# already generous for both.
+SUBPROCESS_TIMEOUT_SECS="${SCOUT_PREFER_LOCAL_TIMEOUT:-6}"
 
 # Wrapper for the two scout subprocesses this hook spawns (`classify-command`
 # and `run --ping`): use timeout/gtimeout if available, otherwise run bare

@@ -158,35 +158,19 @@ identifying fields too (more bytes on every event, for data that cannot have
 changed), or have the merge treat an absent field as "unchanged" rather than
 as "empty" — which is what the rest of the reconciliation already does.
 
-# Hook timeouts are hardcoded literals, and 5s is now the wrong number
+# Hook timeouts: killed calls are still invisible
 
-`shell-safety.sh` sets `LLM_TIMEOUT_SECS=5` and `prefer-local-llm.sh` sets
-`SUBPROCESS_TIMEOUT_SECS=6`, both as bare literals — not `${VAR:-5}` — so
-neither is overridable by env or config. The only other timeout layer is
-`[llm] timeout_seconds`, a single global (default 120) that applies to every
-preset alike. Nothing anywhere is per-operation.
+The env knobs exist (`SCOUT_SHELL_SAFETY_TIMEOUT`, default 5;
+`SCOUT_PREFER_LOCAL_TIMEOUT`, default 6). A config-file version could still
+ride the reader `shell-safety.sh` already uses for `[shell_safety].deny`.
 
-The 5s ceiling was comfortable when written: shell_safety ran at ~44 tok/s
-with p90 around 1.9s. After LM Studio started splitting the model across two
-GPUs by accident, throughput fell to ~17.7 tok/s at identical token counts
-(825 → 832 in, 57 → 58 out across 596 calls) and p90 rose to ~4.8s — inside
-the noise band of the cutoff. Six calls were killed mid-flight in a single
-afternoon.
-
-Two things worth fixing, and they are separable:
-
-- **The measurement is blind.** A killed call writes no log line, so
-  `calls.jsonl` cannot show how often the timeout fires. The distribution is
-  survivorship-biased and truncated exactly at the cutoff: 783 completed
-  shell_safety calls, max 4977ms, *zero* above 5000ms. The audit log's
-  `parse-failure` entries are the only trace. Whatever the timeout becomes, a
-  killed run should be countable — the dashboard's `abandoned` rows now
-  surface it live, but nothing durable records it.
-
-- **The knob does not exist.** Minimum viable is
-  `LLM_TIMEOUT_SECS="${SCOUT_SHELL_SAFETY_TIMEOUT:-5}"`. A config-file version
-  could ride the reader `shell-safety.sh` already uses for
-  `[shell_safety].deny`, which shells out to python to parse `config.toml`.
+The remaining gap is that a killed call writes no log line, so `calls.jsonl`
+cannot show how often the timeout fires. The distribution is
+survivorship-biased and truncated exactly at the cutoff: 783 completed
+shell_safety calls, max 4977ms, *zero* above 5000ms. The audit log's
+`parse-failure` entries are the only trace. Whatever the timeout becomes, a
+killed run should be countable — the dashboard's `abandoned` rows now
+surface it live, but nothing durable records it.
 
 Worth designing rather than tuning: the timeout is also the worst-case stall
 before the user sees a permission prompt, which is presumably why it is as

@@ -448,6 +448,33 @@ assert_eq "$rc" "0" "[missing binary] exits 0"
 assert_eq "$output" "" "[missing binary] no deny output (fail-open)"
 assert_eq "$(last_log_reason)" "missing-binary" "[missing binary] log reason=missing-binary"
 
+# A stub that sleeps past the default 6s, with the env var set to 1s, must
+# fail-open in about a second rather than wait the stub out. Without the
+# ${VAR:-6} expansion this would sit until the stub exited. classify-command
+# is the first timed subprocess, so a hang there is enough.
+SLOW_DATA="$TMPDIR_TEST/scout-data-slow"
+mkdir -p "$SLOW_DATA/bin"
+cat > "$SLOW_DATA/bin/scout" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+exit 0
+EOF
+chmod +x "$SLOW_DATA/bin/scout"
+start=$(date +%s)
+output=$(make_payload "cargo build" | \
+  env -u CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA="$SLOW_DATA" \
+    SCOUT_PREFER_LOCAL_TIMEOUT=1 PATH="$CLEAN_PATH_DIR" \
+    "$HOOK" 2>/dev/null)
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+assert_eq "$rc" "0" "[timeout override] exits 0"
+assert_eq "$output" "" "[timeout override] no deny output (fail-open)"
+if [ "$elapsed" -lt 8 ]; then
+  pass "[timeout override] SCOUT_PREFER_LOCAL_TIMEOUT=1 is honoured (${elapsed}s)"
+else
+  fail "[timeout override] SCOUT_PREFER_LOCAL_TIMEOUT=1 is honoured" "took ${elapsed}s, expected well under 8"
+fi
+
 # ── Tests: binary resolution ─────────────────────────────────────────────────
 # The plugin ships its binary at $CLAUDE_PLUGIN_ROOT/bin/scout and nothing
 # populates the data dir, so ROOT is the only path that resolves on a
