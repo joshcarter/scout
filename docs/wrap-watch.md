@@ -227,6 +227,14 @@ No idle timeout: a quiet dev server is normal, not wedged. No default
 wall clock: a watch lives until stopped. `[watch] max_watches` (default
 4) bounds concurrency.
 
+**Not this: jobs that finish.** A batch of long-but-terminating jobs —
+notebook executions, a fanned-out test matrix — looks like a watch and
+is not one: the question is "done yet, and did it pass", the cost driver
+is turn count rather than scrollback volume, and a free poll still costs
+a full turn. That is [`wait.md`](wait.md), a separate tool sharing this
+section's process-ownership discipline and §2's spool. See `wait.md` §2
+for the boundary, argued against measurements.
+
 ### §4.2 Tools
 
 - `watch(command, cwd?)` → `{watch_id, raw_path, pid}` — start.
