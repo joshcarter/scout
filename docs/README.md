@@ -8,8 +8,8 @@ re-litigated. Source comments cite these by file and section number.
 | Doc | Covers |
 |---|---|
 | [search-cli.md](search-cli.md) | `scout grep` / `find` / `edit` — terminal output contract, exit codes, search filters, the intent-only search pipeline, editor dispatch |
-| [wrap-watch.md](wrap-watch.md) | Spec (not yet implemented): `wrap` and `watch` — run-and-condense for arbitrary verbose commands, delta-summarized long-running processes, and the raw spool that makes filtered output recoverable |
-| [wait.md](wait.md) | Spec (not yet implemented): `wait` — blocking batch drain for long jobs that finish, measured against a notebook sweep that spent ~5.4M input tokens learning "not done yet"; why it is not `watch` |
+| [wrap-watch.md](wrap-watch.md) | `wrap` and the raw spool are implemented; `watch` is still spec — run-and-condense for arbitrary verbose commands, delta-summarized long-running processes, and the spool that makes filtered output recoverable |
+| [wait.md](wait.md) | `wait` — blocking batch drain for long jobs that finish; wrap deferred. Measured against a notebook sweep that spent ~5.4M input tokens learning "not done yet"; why it is not `watch` |
 | [dashboard.md](dashboard.md) | `scout dashboard` and the telemetry under it — the call record, the durable-log-plus-live-channel split, token streaming |
 | [command-matching.md](command-matching.md) | Why the build/test redirect hook lexes shell commands instead of matching a regex |
 | [plugin-packaging.md](plugin-packaging.md) | How Claude Code and Grok Build each load a plugin, measured; why the payload is shaped the way it is |

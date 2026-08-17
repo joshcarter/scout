@@ -19,9 +19,10 @@
 // anything scout reports. These tests pin the built-in schemas: non-empty
 // properties, and the required args each handler actually reads.
 //
-// Nothing here calls a tool. `initialize` and `tools/list` are pure protocol —
-// no local LLM, no network, no subprocess of scout's own — which is what lets
-// this run in CI with nothing installed.
+// Most tests stay on `initialize` and `tools/list` — pure protocol, no local
+// LLM. The wait-family test is the exception: `wrap(detach)` + `wait` must
+// round-trip over the real transport, because that is the path that used to
+// not exist.
 
 mod support;
 
@@ -230,11 +231,12 @@ fn tools_list_advertises_the_expected_tool_set() {
         .collect();
 
     // Order is part of the contract only incidentally; membership is not. These
-    // five are what `MCP_PRESETS` plus the built-in `ping` produce, and a tool
-    // silently dropping off this list is the failure this test exists to catch.
+    // eight are what `MCP_PRESETS` plus the built-in `ping` and the wait
+    // family produce, and a tool silently dropping off this list is the
+    // failure this test exists to catch.
     assert_eq!(
         names,
-        vec!["ping", "check_output", "wrap", "extract", "grep"],
+        vec!["ping", "check_output", "wrap", "extract", "grep", "wait", "jobs", "cancel"],
         "advertised tools changed"
     );
 }
@@ -294,6 +296,7 @@ fn each_tools_required_args_match_what_its_handler_reads() {
         ("wrap", vec!["command"]),
         ("extract", vec!["file", "question"]),
         ("grep", vec!["pattern", "intent"]),
+        ("cancel", vec!["job_id"]),
     ] {
         let schema = find(tool)["inputSchema"].clone();
         let got: Vec<&str> = schema["required"]
@@ -371,6 +374,56 @@ description = "A user's own wording for the grep tool, changing nothing about it
         schema["properties"].as_object().is_some_and(|p| p.contains_key("pattern")),
         "grep advertised without a pattern property: {schema}"
     );
+}
+
+#[test]
+fn wrap_detach_then_wait_returns_the_job_over_stdio() {
+    // The first tools/call in this suite: detach must return immediately,
+    // wait must block until the child exits, and the payload must be wrap's
+    // (a short echo is a pass-through). No local model is involved.
+    let sandbox = Sandbox::new();
+    let mut server = McpServer::spawn(&sandbox);
+    handshake(&mut server);
+
+    let started = call_tool(
+        &mut server,
+        10,
+        "wrap",
+        &json!({"command": "echo hi; echo bye", "detach": true}),
+    );
+    let job_id = started["job_id"].as_str().expect("job_id").to_string();
+    assert!(job_id.starts_with('j'), "{started}");
+    assert!(started.get("raw_path").is_some(), "{started}");
+
+    let waited = call_tool(
+        &mut server,
+        11,
+        "wait",
+        &json!({"job_ids": [job_id], "until": "all", "timeout_s": 5}),
+    );
+    assert_eq!(waited["timed_out"], false, "{waited}");
+    assert_eq!(waited["done"].as_array().unwrap().len(), 1, "{waited}");
+    assert_eq!(waited["done"][0]["exit_code"], 0, "{waited}");
+    assert_eq!(waited["done"][0]["filtered"], false, "{waited}");
+    assert!(waited["done"][0]["output"].as_str().unwrap().contains("hi"), "{waited}");
+}
+
+/// Call a tool and parse the JSON text content. Panics on a protocol or
+/// tool-level error — the wait-family path under test is not fail-open in
+/// the "unknown tool" sense; a failure here is a broken contract.
+fn call_tool(server: &mut McpServer, id: u64, name: &str, args: &Value) -> Value {
+    let result = server.request(id, "tools/call", &json!({"name": name, "arguments": args}));
+    assert!(
+        result.get("isError").and_then(Value::as_bool) != Some(true),
+        "{name} returned isError: {result}"
+    );
+    let text = result["content"]
+        .as_array()
+        .and_then(|c| c.first())
+        .and_then(|b| b["text"].as_str())
+        .unwrap_or_else(|| panic!("{name} had no text content: {result}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("{name} content was not JSON: {e}: {text}"))
 }
 
 #[test]

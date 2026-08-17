@@ -68,7 +68,9 @@ description = """Run a command whose output would be too long to read, and get a
 summary, notable lines verbatim, exit code, and counts of what was dropped. \
 The complete raw output is saved to `raw_path` — if the summary does not answer your question, \
 Read that file (with offset/limit) or ask `extract` about it rather than re-running the command. \
-Short output is returned verbatim and unfiltered."""
+Short output is returned verbatim and unfiltered. \
+A job that will run for minutes and then finish: wrap(command, detach: true) then wait(until: \"all\"). \
+Do not sleep or write an until/pgrep loop."""
 
 [preset.input_schema]
 type     = "object"
@@ -89,3 +91,7 @@ description = "Optional working directory for the command. Defaults to the proje
 [preset.input_schema.properties.timeout_seconds]
 type        = "integer"
 description = "Optional wall-clock ceiling in seconds. Defaults to 900, max 3600. This is a circuit breaker, not the stuck-command check: a command that stops producing output for 120s is killed as wedged well before this, so raising it helps a slow command and does nothing for a hung one."
+
+[preset.input_schema.properties.detach]
+type        = "boolean"
+description = "If true, start the command and return immediately with {job_id, label, raw_path, started_at}. Drain with wait(until: \"all\"). Use this for any job that will run for minutes and then finish. The job has no idle timeout — a quiet process is normal."

@@ -230,27 +230,7 @@ pub fn capture_argv(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Put the child in a session (and so a process group) of its own, so
-        // the timeout path can signal the whole tree with one `kill(-pgid)`.
-        // The child loses its controlling terminal, which changes nothing here:
-        // its stdout was already a pipe, so anything that probes for a TTY
-        // already saw "no".
-        //
-        // SAFETY: between fork and exec only async-signal-safe work is legal.
-        // `setsid` is exactly that — one syscall, no allocation, no locks, no
-        // state shared with the parent.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    apply_session(&mut command);
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -411,6 +391,36 @@ fn join_within(handles: &mut Vec<thread::JoinHandle<()>>, deadline: Duration) ->
     }
 }
 
+/// Put the child in a session (and so a process group) of its own, so
+/// [`kill_process_group`] can signal the whole tree with one `kill(-pgid)`.
+///
+/// The child loses its controlling terminal, which changes nothing for
+/// scout's runners: stdout is already a pipe, so anything that probes for
+/// a TTY already saw "no". Shared with `jobs` — wrap-deferred children
+/// need the same group discipline as a captured build.
+///
+/// SAFETY of the unix path: between fork and exec only async-signal-safe
+/// work is legal. `setsid` is exactly that — one syscall, no allocation,
+/// no locks, no state shared with the parent.
+pub(crate) fn apply_session(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
 /// Kill the child *and everything it forked*.
 ///
 /// The child called `setsid`, so its pid is also its process-group id and one
@@ -418,8 +428,11 @@ fn join_within(handles: &mut Vec<thread::JoinHandle<()>>, deadline: Duration) ->
 /// this used to shell out to `/bin/kill -9` to do — is only correct when `sh`
 /// exec'd its argument, which it does for `sleep 30` and does not for `cd x &&
 /// cargo test`.  That is the orphan bug: `sh` died, `cargo` did not.
+///
+/// Shared with `jobs`: a cancelled or shut-down detached wrap has to reap
+/// the same way a timed-out `check_output` does.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     // SAFETY: a plain syscall with a pid we own; an already-dead group is an
     // ignored ESRCH, not undefined behaviour.
     unsafe {
@@ -430,9 +443,12 @@ fn kill_process_group(pid: u32) {
 /// Windows has no process groups in the POSIX sense; `/T` is the tree flag and
 /// carries the same intent as the negative pid above.
 #[cfg(windows)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F", "/T"]).status();
 }
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn kill_process_group(_pid: u32) {}
 
 /// One stream's capture, capped as the bytes arrive.
 ///

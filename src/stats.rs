@@ -223,6 +223,13 @@ pub fn input_summary(preset: &str, args: &Value) -> Value {
             put_str(&mut m, "command", "command");
             put_str(&mut m, "question", "question");
         }
+        "wait" => {
+            put_str(&mut m, "until", "until");
+            if let Some(ids) = args.get("job_ids").and_then(Value::as_array) {
+                m.insert("jobs".to_string(), Value::from(ids.len() as u64));
+            }
+        }
+        "cancel" => put_str(&mut m, "job_id", "job_id"),
         "extract" => {
             put_str(&mut m, "file", "file");
             put_str(&mut m, "question", "question");

@@ -1,9 +1,10 @@
 # `wait` — blocking on jobs that finish
 
-Status: **spec — not yet implemented.** Written from a measured session
-(§1) rather than from a guess about what the model does, because the
-first version of this idea was filed as part of `watch` and the
-measurement is what separated them.
+Status: **implemented** (`wrap(..., detach: true)`, `wait`, `jobs`,
+`cancel`, `[wait]`). Written from a measured session (§1) rather than
+from a guess about what the model does, because the first version of
+this idea was filed as part of `watch` and the measurement is what
+separated them. `watch` is still spec (`docs/wrap-watch.md` §4).
 
 ## §1 What waiting actually costs
 
@@ -157,12 +158,16 @@ elapses. Three rules make that safe:
 2. **`timeout_s` is capped** by `[wait] max_block_seconds`, because a
    blocked MCP call is bounded by the *harness's* tool timeout and
    overrunning it turns a clean wait into a spurious error. Default
-   300 s, which is conservative.
+   1500 s — under Claude Code's 30-minute stdio idle abort, so a silent
+   wait still returns `{timed_out: true}` instead of a harness error.
+   Do not emit MCP progress to stretch that window: a notification the
+   harness treats as a model wake would be the cost this tool exists
+   to remove.
 3. **A blocked call is an unsteerable session.** While `wait` is
-   blocking, the user cannot redirect the model. This is the real cost
-   of the approach and the reason the default cap is modest: it should
-   be raised deliberately, by someone who knows the sweep is
-   unattended, not inherited from a default.
+   blocking, the user cannot redirect the model. Claude Code
+   auto-backgrounds a main-conversation MCP call after two minutes,
+   which softens this; subagents and headless do not. Raising the cap
+   past the shipped default is still a deliberate choice.
 
 Turn arithmetic for a 20-notebook sweep, 20 min each, 4 concurrent
 (~100 min wall clock):
@@ -172,13 +177,16 @@ Turn arithmetic for a 20-notebook sweep, 20 min each, 4 concurrent
 | today's `sleep`/`until` improvisation | ~32 | ~5.4M |
 | `wait(until:"any")`, 300 s cap | ~20 | ~3.4M |
 | `wait(until:"all")`, 300 s cap | ~20 | ~3.4M |
+| `wait(until:"all")`, shipped 1500 s cap | **~5** | **~0.8M** |
 | `wait(until:"all")`, cap raised to 1800 s | **~4** | **~0.7M** |
 
 The cap, not the tool, is what buys the last order of magnitude — so
 the doc that ships with this must say so, and `[wait] max_block_seconds`
-must be raisable in `config.toml` alongside whatever the harness needs
-(`MCP_TOOL_TIMEOUT` in Claude Code's `settings.json`; verify the actual
-default before publishing a recommended value — see §8).
+must be raisable in `config.toml` alongside whatever the harness needs.
+Claude Code: `MCP_TOOL_TIMEOUT` (env, default ~28 hours) and
+`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (stdio idle default 30 minutes; this
+machine has aborted a silent tool at 1800 s). Grok Build:
+`tool_timeout_sec` (default 6000). See §8.
 
 ### §3.4 The payload is a verdict, not a log
 
@@ -204,7 +212,7 @@ job's result — and here it must also never cost the caller the
 
     [wait]
     max_jobs = 16              # not watch's 4 — a sweep runs twenty
-    max_block_seconds = 300
+    max_block_seconds = 1500
     idle_timeout_seconds = 0   # none: a quiet notebook is normal
     wall_timeout_seconds = 0   # none: the caller sets the deadline
 
@@ -336,16 +344,31 @@ plumbing is not shared semantics.
 ## §8 Open questions
 
 - **What is Claude Code's actual MCP tool-call timeout, and is it
-  raisable per project?** §3.3's whole payoff depends on the answer.
-  Measure it; do not trust a remembered default.
-- **Does a blocked MCP call remain interruptible?** If Ctrl-C during a
-  `wait` leaves an orphaned notebook process, §3.1's `setsid` discipline
-  needs a signal-handling story before the cap can safely be raised.
+  raisable per project?** Measured 2026-08-17. `MCP_TOOL_TIMEOUT` is an
+  env var (not `settings.json`), default ~28 hours; per-server
+  `.mcp.json` `timeout` is milliseconds. The **binding** bound for a
+  silent `wait` is stdio idle: `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`,
+  default 30 minutes — this machine aborted a silent `check_output` at
+  1800 s. The shipped cap is 1500 s so a silent wait still returns
+  before that abort. Raising the cap to 1800 races it; raise only with
+  `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0`. Grok's default
+  `tool_timeout_sec` is 6000. Claude also auto-backgrounds a main-
+  conversation MCP call after 2 minutes (`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS`),
+  which softens §3.3's "unsteerable session" on current Claude; subagents
+  and headless do not auto-background. Progress notifications are not
+  used as a keepalive: whether a harness treats them as a model wake
+  is unmeasured, and a wake every 15 s would undo §1.2.
+- **Does a blocked MCP call remain interruptible?** `wait` is an async
+  poll, not `spawn_blocking`. Dropping the MCP call ends the wait and
+  leaves jobs running. Session end (stdin EOF) calls `JobRegistry::shutdown`
+  and SIGKILLs every group — that is the setsid story, and it shipped
+  with the feature. Ctrl-C of the harness is session end.
 - **Should `wait` return partial output for pending jobs?** `tail_line`
   is specced as a hedge against "is it wedged or just slow." It may be
   either insufficient (the model asks anyway, costing a turn) or
   unnecessary (elapsed time answers it). Cheap to add later, so ship
-  without and see.
+  without and see. v1 ships `elapsed_s` only.
 - **Does the model reach for `until:"all"` unprompted?** If it defaults
   to `"any"` out of caution, the turn savings in §3.3 do not
   materialize and the guidance in §7.4 has to be more directive.
+  Guidance shipped directive; measure `calls.jsonl` `until` after a week.

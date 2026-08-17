@@ -1,8 +1,9 @@
 // MCP stdio server (rmcp 3.1).
 //
-// Five tools: `ping` (wiring check), plus the four that do the work —
-// `check_output`, `wrap`, `extract`, `grep`.  Short names on purpose: Claude Code
-// prefixes them with the server namespace on its own, so what the model sees is
+// Tools: `ping` (wiring check), the four filters (`check_output`, `wrap`,
+// `extract`, `grep`), and the wait family (`wait`, `jobs`, `cancel`).
+// Short names on purpose: Claude Code prefixes them with the server
+// namespace on its own, so what the model sees is
 // `mcp__plugin_<plugin>_<server>__check_output`.  Nothing on this side should
 // hardcode that qualified form (see CLAUDE.md) — it is derived from names this code
 // never reads, and the model resolves it via `ToolSearch` anyway.
@@ -34,8 +35,10 @@ use crate::client::LlmClient;
 // CLI-only — lives in `presets` rather than here: the preset overlay needs the
 // same list to decide whose `input_schema` is load-bearing (see
 // `presets::inherit_mcp_schema`), and two copies of it would drift.
+use crate::jobs::JobRegistry;
 use crate::presets::{Preset, MCP_PRESETS};
 use crate::select::{Ctx, ToolError, ToolResult};
+use crate::wait::{self, Until};
 
 // The newest protocol era this server actually speaks.
 //
@@ -69,7 +72,8 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 
 const INSTRUCTIONS: &str = "scout offloads small problems to a local LLM so they never consume \
 cloud-model context. Prefer its tools for classifying build/test output and targeted file/search \
-questions.";
+questions. A job that will run for minutes and then finish is wrap(..., detach: true) \
+followed by wait(until: \"all\") — do not sleep or poll.";
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PingParams {
@@ -81,11 +85,17 @@ pub struct PingParams {
 #[derive(Clone)]
 struct Scout {
     presets: Arc<Vec<Preset>>,
+    jobs: Arc<JobRegistry>,
 }
 
 impl Scout {
     fn new() -> Self {
-        Scout { presets: Arc::new(crate::presets::load_presets()) }
+        let wait_cfg =
+            crate::config::load_wait_config(&crate::config::config_path()).unwrap_or_default();
+        Scout {
+            presets: Arc::new(crate::presets::load_presets()),
+            jobs: Arc::new(JobRegistry::new(crate::spool::cache_dir(), wait_cfg.job_config())),
+        }
     }
 
     fn ping(message: Option<&str>) -> String {
@@ -123,6 +133,78 @@ impl Scout {
                 ));
             }
         }
+
+        // wait / jobs / cancel are not preset-backed (docs/wait.md §3.2):
+        // they have no prompt to carry. Registered the way `ping` is.
+        tools.push(Tool::new(
+            Cow::Borrowed("wait"),
+            Cow::Borrowed(
+                "Block until detached wrap jobs finish, then return each one's wrap payload \
+                 (exit_code, summary, notable, raw_path). Omit job_ids to drain every job. \
+                 until is \"any\" (default, return when one finishes) or \"all\" (return when \
+                 the batch is done — use this for a homogeneous sweep). A timeout returns \
+                 {timed_out: true} with no summary; call wait again rather than polling. \
+                 Do not sleep or write an until/pgrep loop.",
+            ),
+            Arc::new(schema_object(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Jobs to wait on. Omit to drain every job in this session."
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "\"any\" (default) returns when one job finishes; \"all\" waits for the whole batch. Use \"all\" for a homogeneous sweep."
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "description": "Seconds to block, capped by [wait] max_block_seconds (default 1500). A timeout is not an error."
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional question forwarded to wrap's condenser for each finished job."
+                    }
+                },
+                "required": []
+            }))),
+        ));
+        tools.push(Tool::new(
+            Cow::Borrowed("jobs"),
+            Cow::Borrowed(
+                "Non-blocking snapshot of detached wrap jobs. Same {done, pending} shape as \
+                 wait, but does not reap finished jobs and does not block.",
+            ),
+            Arc::new(schema_object(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Jobs to list. Omit for every job in this session."
+                    }
+                },
+                "required": []
+            }))),
+        ));
+        tools.push(Tool::new(
+            Cow::Borrowed("cancel"),
+            Cow::Borrowed(
+                "Kill one detached wrap job's process group. The job stays listable until \
+                 a later wait reaps it. Does not kill other jobs.",
+            ),
+            Arc::new(schema_object(&serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id returned by wrap(..., detach: true)."
+                    }
+                },
+                "required": ["job_id"]
+            }))),
+        ));
         tools
     }
 
@@ -150,9 +232,14 @@ impl Scout {
         };
         let result = match tool {
             "check_output" => crate::check_output::run(&ctx, args),
+            "wrap" if args.get("detach").and_then(Value::as_bool) == Some(true) => {
+                wait::detach(&ctx, &self.jobs, args)
+            }
             "wrap" => crate::wrap::run(&ctx, args),
             "extract" => crate::extract::run(&ctx, args),
             "grep" => crate::grep::run(&ctx, args),
+            "jobs" => Ok(wait::jobs(&ctx, &self.jobs, args)),
+            "cancel" => wait::cancel(&self.jobs, args),
             other => Err(crate::select::ToolError::new(
                 format!("unknown tool {other:?}"),
                 "the built-in tools",
@@ -166,6 +253,85 @@ impl Scout {
             Err(e) => ctx.ledger.fail(&e.text()),
         }
         result
+    }
+
+    /// Park until the wait condition is met or the cap elapses.
+    ///
+    /// Async on purpose: a dropped/`Cancelled` MCP call must stop blocking
+    /// without killing the jobs, and `spawn_blocking` cannot be interrupted.
+    /// Condensation (the local-model call) still goes through the blocking
+    /// pool, and only for jobs that actually finished.
+    async fn call_wait(
+        &self,
+        args: Value,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let cap = crate::config::load_wait_config(&crate::config::config_path())
+            .unwrap_or_default()
+            .max_block_seconds;
+        let timeout_s = wait::parse_timeout_s(&args, cap);
+        let until = Until::parse(args.get("until").and_then(Value::as_str));
+        let ids = wait::parse_job_ids(&args);
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(timeout_s);
+        // Claude Code's stdio idle window is 30 minutes and aborts a silent
+        // tool at that mark. The shipped 1500 s cap sits under it so a
+        // quiet wait still returns {timed_out: true} instead of a harness
+        // error. Do not emit MCP progress to stretch the idle window:
+        // whether a given harness treats those notifications as a model
+        // wake is not something we have measured, and a wake every 15 s
+        // would be the cost this tool exists to remove.
+
+        let mut timed_out = false;
+        loop {
+            let views = self.jobs.snapshot(ids.as_deref());
+            if wait::condition_met(&views, until) {
+                break;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                timed_out = true;
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::select! {
+                () = context.ct.cancelled() => {
+                    // User interrupted: stop blocking, leave jobs running.
+                    timed_out = true;
+                    break;
+                }
+                () = tokio::time::sleep(remaining.min(Duration::from_millis(100))) => {}
+            }
+        }
+
+        let this = self.clone();
+        let payload = tokio::task::spawn_blocking(move || {
+            let cfg = crate::config::load_config(&crate::config::config_path());
+            let (client, client_error) = match cfg {
+                Ok(c) => (Some(crate::client::LlmClient::new(c)), None),
+                Err(e) => (None, Some(e)),
+            };
+            let ctx = Ctx {
+                client: client.as_ref(),
+                client_error,
+                presets: &this.presets,
+                project: crate::resolve_project(None),
+                via: crate::stats::VIA_MCP,
+                tool: "wait".to_string(),
+                progress: None,
+                ..Default::default()
+            };
+            let question =
+                args.get("question").and_then(Value::as_str).filter(|s| !s.trim().is_empty());
+            let payload =
+                wait::collect(&ctx, &this.jobs, ids.as_deref(), question, true, timed_out);
+            ctx.ledger.finish(&payload);
+            payload
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("scout: wait task failed: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(compact(&payload))]).into())
     }
 }
 
@@ -211,7 +377,7 @@ impl ServerHandler for Scout {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.to_string();
         let args = Value::Object(request.arguments.unwrap_or_default());
@@ -223,6 +389,10 @@ impl ServerHandler for Scout {
             );
             let pong = Self::ping(message.as_deref());
             return Ok(CallToolResult::success(vec![ContentBlock::text(pong)]).into());
+        }
+
+        if name == "wait" {
+            return self.call_wait(args, context).await;
         }
 
         let this = self.clone();
@@ -297,8 +467,14 @@ fn compact(payload: &Value) -> String {
 pub fn serve() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let service = Scout::new().serve(rmcp::transport::stdio()).await?;
-        service.waiting().await?;
+        let scout = Scout::new();
+        let jobs = scout.jobs.clone();
+        let service = scout.serve(rmcp::transport::stdio()).await?;
+        let result = service.waiting().await;
+        // stdin EOF is the only shutdown signal. Without this, setsid
+        // children survive the session as orphans (docs/wait.md §8).
+        jobs.shutdown();
+        result?;
         Ok(())
     })
 }
@@ -312,9 +488,12 @@ mod tests {
     }
 
     #[test]
-    fn advertises_ping_and_the_four_filters() {
+    fn advertises_ping_the_four_filters_and_the_wait_family() {
         let names: Vec<String> = server().tools().iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(names, vec!["ping", "check_output", "wrap", "extract", "grep"]);
+        assert_eq!(
+            names,
+            vec!["ping", "check_output", "wrap", "extract", "grep", "wait", "jobs", "cancel"]
+        );
     }
 
     #[test]
@@ -334,6 +513,7 @@ mod tests {
             ("wrap", vec!["command"]),
             ("extract", vec!["file", "question"]),
             ("grep", vec!["pattern", "intent"]),
+            ("cancel", vec!["job_id"]),
         ] {
             let t = tools.iter().find(|t| t.name == name).unwrap();
             let schema = Value::Object((*t.input_schema).clone());

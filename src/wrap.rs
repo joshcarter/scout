@@ -149,13 +149,35 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
         return Ok(timeout_payload(ctx, &log_args, &capture, kind, timeout_secs, cfg));
     }
 
-    let lines_total = capture.output.lines().count();
-    let bytes_total = capture.output.len();
-    let exit_code = capture.exit_code.map_or(Value::Null, Value::from);
+    Ok(condense(ctx, args, &command, &capture.output, capture.exit_code, None))
+}
 
-    // §3.2: short output is returned whole — no model, no spool, nothing to
-    // recover from.  This is what makes guessing wrong about "this will be
-    // verbose" cost only the exec.
+/// Condense already-captured output. Shared by sync `wrap` and by `wait`
+/// once a detached job finishes (`docs/wait.md` §3.1 — wait is wrap deferred).
+///
+/// `existing_raw` is the blob a detached job streamed into. When it is
+/// `None`, this is the sync path and a filtered result writes a new blob
+/// the usual way.
+pub(crate) fn condense(
+    ctx: &Ctx,
+    args: &Value,
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    existing_raw: Option<&std::path::Path>,
+) -> Value {
+    let cfg = config::load_wrap_config(&config::config_path()).unwrap_or_default();
+    let log_args = serde_json::json!({
+        "command": command,
+        "question": args.get("question").cloned().unwrap_or(Value::Null),
+    });
+    let lines_total = output.lines().count();
+    let bytes_total = output.len();
+    let exit_json = exit_code.map_or(Value::Null, Value::from);
+
+    // §3.2: short output is returned whole — no model, and on the sync path
+    // no spool either. A detached job already has a blob (the start payload
+    // named it), so that path keeps `raw_path` even on a pass-through.
     if lines_total as u64 <= cfg.passthrough_max_lines
         && bytes_total as u64 <= cfg.passthrough_max_bytes
     {
@@ -165,40 +187,48 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
                 .summary(format!("{lines_total} line(s) returned verbatim, unfiltered"))
                 .ms(ctx.ledger.elapsed_ms()),
         );
-        return Ok(serde_json::json!({
-            "exit_code": exit_code,
+        let mut payload = serde_json::json!({
+            "exit_code": exit_json,
             "filtered": false,
-            "output": capture.output,
-        }));
+            "output": output,
+        });
+        if let Some(path) = existing_raw {
+            payload["raw_path"] = Value::String(path.display().to_string());
+        }
+        return payload;
     }
 
-    // §2.2: only a filtered result spools, and it spools the *full* capture
-    // even though the model is about to see an elided copy.
-    let spool_cfg = config::load_spool_config(&config::config_path()).unwrap_or_default();
-    let mut rec = ctx.record("wrap", &log_args);
-    let spooled = spool::write("wrap", &rec.id, &capture.output, &spool_cfg);
-    if let Some(path) = &spooled {
-        rec = rec.raw_path(path);
-    }
-    let ground = Ground {
-        exit_code,
-        lines_total,
-        bytes_total,
-        raw_path: spooled.as_ref().map_or(Value::Null, |p| Value::String(p.display().to_string())),
-        spool_note: spooled.is_none().then_some("spool-unavailable"),
+    let (raw_path, spool_note, rec) = if let Some(path) = existing_raw {
+        let rec = ctx.record("wrap", &log_args).raw_path(path);
+        (Value::String(path.display().to_string()), None, rec)
+    } else {
+        // §2.2: only a filtered result spools, and it spools the *full*
+        // capture even though the model is about to see an elided copy.
+        let spool_cfg = config::load_spool_config(&config::config_path()).unwrap_or_default();
+        let mut rec = ctx.record("wrap", &log_args);
+        let spooled = spool::write("wrap", &rec.id, output, &spool_cfg);
+        if let Some(path) = &spooled {
+            rec = rec.raw_path(path);
+        }
+        (
+            spooled.as_ref().map_or(Value::Null, |p| Value::String(p.display().to_string())),
+            spooled.is_none().then_some("spool-unavailable"),
+            rec,
+        )
     };
+    let ground = Ground { exit_code: exit_json, lines_total, bytes_total, raw_path, spool_note };
 
-    let mut model_input = capture.output.clone();
+    let mut model_input = output.to_string();
     verify::truncate_diagnostic(&mut model_input, cfg.elision_limit());
 
     let mut call_args = args.clone();
-    call_args["command"] = Value::String(command.clone());
+    call_args["command"] = Value::String(command.to_string());
     call_args["output"] = Value::String(model_input);
 
     let (rec, reply) = call_preset_recorded(ctx, "wrap", &call_args, rec);
     if let Some(payload) = reply.as_ref().ok().and_then(|text| condensed_payload(&ground, text)) {
         ctx.ledger.record(rec);
-        return Ok(payload);
+        return payload;
     }
 
     // Everything else is the fail-open path (§3.5): the model was unreachable,
@@ -215,7 +245,7 @@ pub fn run(ctx: &Ctx, args: &Value) -> ToolResult {
     };
     let rec = if rec.outcome.is_ok() { rec.outcome(outcome).summary(&reason) } else { rec };
     ctx.ledger.record(rec);
-    Ok(degraded_payload(&ground, &reason, &capture.output, cfg))
+    degraded_payload(&ground, &reason, output, cfg)
 }
 
 /// The payload for a command scout killed, written by scout rather than by the

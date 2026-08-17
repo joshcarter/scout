@@ -1,8 +1,9 @@
 # `wrap`, `watch`, and the raw spool
 
-Status: **spec — not yet implemented.** This records the design and its
-rationale before the first line of code, because the shape was argued out
-in conversation and the reasoning would otherwise evaporate.
+Status: **`wrap` and the raw spool are implemented.** `watch` (§4) is
+still spec. This records the design and its rationale, because the shape
+was argued out in conversation and the reasoning would otherwise
+evaporate. Finishing jobs are [`wait.md`](wait.md), which is implemented.
 
 ## §1 Why these two, and why now
 

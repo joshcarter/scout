@@ -209,7 +209,7 @@ fn wrap_toml_parses_with_no_context_and_takes_a_command() {
         .collect();
     assert_eq!(required, vec!["command"], "only the command is required");
     let props = schema["properties"].as_object().expect("properties object");
-    for optional in ["question", "cwd", "timeout_seconds"] {
+    for optional in ["question", "cwd", "timeout_seconds", "detach"] {
         assert!(props.contains_key(optional), "{optional} must be advertised: {schema}");
     }
 }
@@ -224,6 +224,7 @@ fn wrap_advertises_the_escalation_path_adoption_depends_on() {
     assert!(d.contains("raw_path"), "the escalation path must be named: {d}");
     assert!(d.contains("re-running the command"), "and why not to re-run instead: {d}");
     assert!(d.contains("verbatim"), "and that short output is not filtered at all: {d}");
+    assert!(d.contains("detach"), "long jobs that finish must point at wait: {d}");
 }
 
 #[test]

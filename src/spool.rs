@@ -18,7 +18,9 @@
 // drive the `_in` forms against a tempdir, so nothing here needs an env var to
 // be testable and none is invented.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Retention bounds for the spool (docs/wrap-watch.md §2.3).
@@ -108,6 +110,70 @@ pub fn write_in(
     Some(path)
 }
 
+/// Create an empty blob for a job that will stream into it (docs/wait.md §3.1).
+///
+/// Unlike [`write`], this does not sweep and does not put contents on disk —
+/// the caller appends as the child prints, and [`pin`]s the path so a
+/// concurrent wrap's prune cannot delete a live log. Returns `None` when the
+/// cache is unwritable; the job still runs, just without an escalation path.
+pub fn create(tool: &str, call_id: &str) -> Option<PathBuf> {
+    create_in(&cache_dir(), tool, call_id)
+}
+
+/// [`create`], against an explicit base directory.
+pub fn create_in(base: &Path, tool: &str, call_id: &str) -> Option<PathBuf> {
+    let now = SystemTime::now();
+    let dir = raw_dir(base).join(day_dir(now));
+    ensure_private_dir(base).ok()?;
+    ensure_private_dir(&raw_dir(base)).ok()?;
+    ensure_private_dir(&dir).ok()?;
+
+    let path = dir.join(blob_name(now, tool, call_id));
+    write_private(&path, "").ok()?;
+    Some(path)
+}
+
+/// Append bytes to a blob opened by [`create`]. Fail-open: a full disk or a
+/// vanished file returns `false` and the job keeps running.
+pub fn append(path: &Path, bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    append_private(path, bytes).is_ok()
+}
+
+// ── Pin set ──────────────────────────────────────────────────────────────────
+//
+// Blobs backing a live job (or, later, a live watch) must survive GC. The
+// registry that owns those jobs is in another module; the pin set lives here
+// so every sweep — wrap's write path, `scout gc`, a job's own create — sees
+// the same set without a circular dependency. docs/wrap-watch.md §2.3.
+
+static PINS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn pins() -> &'static Mutex<HashSet<PathBuf>> {
+    PINS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Keep `path` out of the next sweep. Idempotent. The matching [`unpin`]
+/// belongs to whoever called this — typically the job leaving the registry.
+pub fn pin(path: &Path) {
+    if let Ok(mut set) = pins().lock() {
+        set.insert(path.to_path_buf());
+    }
+}
+
+/// Release a pin taken by [`pin`]. A path that was never pinned is a no-op.
+pub fn unpin(path: &Path) {
+    if let Ok(mut set) = pins().lock() {
+        set.remove(path);
+    }
+}
+
+fn is_pinned(path: &Path) -> bool {
+    pins().lock().is_ok_and(|set| set.contains(path))
+}
+
 /// Delete blobs past `max_age_days`, then oldest-first until the spool is
 /// under `max_total_bytes` (docs/wrap-watch.md §2.3).
 pub fn sweep(cfg: &SpoolConfig) -> Swept {
@@ -119,10 +185,11 @@ pub fn sweep(cfg: &SpoolConfig) -> Swept {
 /// Best-effort throughout: an unreadable entry is skipped rather than aborting
 /// the sweep, and a missing spool is a sweep that found nothing to do.
 pub fn sweep_in(base: &Path, cfg: &SpoolConfig) -> Swept {
-    // docs/wrap-watch.md §2.3: blobs backing a live watch are pinned. The
-    // pin check slots in here, filtering `blobs` before either pass, once
-    // `watch` lands and there is a registry to ask.
+    // docs/wrap-watch.md §2.3: blobs backing a live job (or watch) are
+    // pinned. The set is process-wide so a wrap write's prune cannot
+    // delete a detached job's log.
     let mut blobs = collect_blobs(&raw_dir(base));
+    blobs.retain(|b| !is_pinned(&b.path));
     blobs.sort_by_key(|b| b.modified);
 
     let mut swept = Swept::default();
@@ -350,6 +417,22 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::write(path, contents)
+}
+
+/// Append `bytes` to an existing blob, creating nothing.
+#[cfg(unix)]
+fn append_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().append(true).mode(0o600).open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn append_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(bytes)
 }
 
 #[cfg(test)]
@@ -581,5 +664,33 @@ mod tests {
                 None => std::env::remove_var(key),
             }
         }
+    }
+
+    #[test]
+    fn create_makes_an_empty_blob_and_append_extends_it() {
+        let dir = TempDir::new().unwrap();
+        let path = create_in(dir.path(), "wrap", "live-1").expect("writable base");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(append(&path, b"hello\n"));
+        assert!(append(&path, b"world\n"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
+    }
+
+    #[test]
+    fn a_pinned_blob_survives_a_purge() {
+        let dir = TempDir::new().unwrap();
+        let live = create_in(dir.path(), "wrap", "live").unwrap();
+        let stale = write_in(dir.path(), "wrap", "stale", "gone", &SpoolConfig::default()).unwrap();
+        pin(&live);
+
+        let swept = purge_in(dir.path());
+        assert!(live.exists(), "a live job's log must survive GC");
+        assert!(!stale.exists(), "an unpinned blob is still reclaimable");
+        assert_eq!(swept.files_deleted, 1, "only the unpinned blob was removed");
+
+        unpin(&live);
+        let swept = purge_in(dir.path());
+        assert!(!live.exists(), "unpinning returns the blob to ordinary GC");
+        assert_eq!(swept.files_deleted, 1);
     }
 }

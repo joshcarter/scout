@@ -50,6 +50,10 @@ pub mod extract;
 pub mod filter_config;
 pub mod find;
 pub mod grep;
+// Server-owned detached wrap jobs (docs/wait.md). The MCP server is the
+// one long-lived process, so it owns the children, the live spool, and
+// the Drop-kill. `watch` will share this later; it is not a watch.
+pub mod jobs;
 // The live feed is an implementation detail of the dashboard: an abstract
 // unix-socket protocol between a running scout and whatever is watching it.
 // Nothing outside the crate has business speaking it.
@@ -70,6 +74,9 @@ pub mod source;
 pub mod spool;
 pub mod stats;
 pub mod verify;
+// Blocking drain of detached wrap jobs (docs/wait.md). `wait` is wrap
+// deferred: same payload, later delivery. `jobs` / `cancel` sit next to it.
+pub mod wait;
 // Run any verbose command and return its output condensed, with the full
 // capture spooled (docs/wrap-watch.md §3).  `check_output`'s sibling: same
 // capture, different job — retrieval rather than a verdict.

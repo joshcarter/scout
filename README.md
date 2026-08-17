@@ -8,19 +8,22 @@ files and search results without dumping them into the big model's
 context.
 
 **Status: working, pre-1.0.** The MCP server exposes `check_output`,
-`wrap`, `extract` and `grep` (plus `ping` for wiring checks); the
-PreToolUse hooks that steer Claude Code toward them are in place; the
-CLI covers `grep` / `find` / `edit` / `extract` / `check` / `wrap` /
-`task`; and `scout dashboard` serves a local web view of everything the
-local model has been asked. Design records for each of those live in
-[`docs/`](docs/).
+`wrap`, `wait` / `jobs` / `cancel`, `extract` and `grep` (plus `ping`
+for wiring checks); the PreToolUse hooks that steer Claude Code toward
+them are in place; the CLI covers `grep` / `find` / `edit` / `extract` /
+`check` / `wrap` / `task`; and `scout dashboard` serves a local web view
+of everything the local model has been asked. Design records for each
+of those live in [`docs/`](docs/).
 
 `wrap` is the general form of `check_output`: run any verbose command —
 `git log`, `docker logs`, `curl` — and get a condensed result instead of
 the scrollback. Where `check_output` renders a verdict on a build,
 `wrap` retrieves; the full raw output is kept on disk at the `raw_path`
 it returns, so a summary that missed something is one read away from the
-truth rather than a re-run.
+truth rather than a re-run. A job that will run for minutes and then
+finish is `wrap(..., detach: true)` followed by `wait(until: "all")` —
+one turn per completion, not one turn per `sleep`. See
+[`docs/wait.md`](docs/wait.md).
 
 ## Shape
 

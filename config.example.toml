@@ -216,6 +216,19 @@ model = "qwen/qwen3.6-35b-a3b"
 # idle_timeout_seconds = 120
 # default_timeout_seconds = 900
 
+# `wait` — block on detached wrap jobs until they finish. A quiet job is
+# normal (idle 0) and the caller sets the deadline (wall 0). The shipped
+# 1500 s cap sits under Claude Code's 30-minute stdio idle abort so a
+# silent wait still returns {timed_out: true} instead of a harness error.
+# Raising this to 1800 races that abort; raise it only with
+# CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=0 (or Grok's tool_timeout_sec).
+# Zero is rejected for max_jobs / max_block_seconds.
+[wait]
+# max_jobs = 16
+# max_block_seconds = 1500
+# idle_timeout_seconds = 0
+# wall_timeout_seconds = 0
+
 # Extra deny patterns for the shell-safety hook. These extend the
 # baked-in deny floor and can never shrink it. Read by
 # hooks/shell-safety.sh, not by the binary.

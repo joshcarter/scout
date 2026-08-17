@@ -10,13 +10,14 @@
 // `[llm]` is the exception — it has required keys, so a missing section is
 // also an error.
 //
-// `[llm]`, `[spool]`, `[wrap]`, `[check_output]` load in this file.
+// `[llm]`, `[spool]`, `[wrap]`, `[wait]`, `[check_output]` load in this file.
 // `[extract]`, `[grep]`, `[cli]`, `[find]`, `[dashboard]` load in
 // `filter_config.rs`, through the same reader and the same integer helpers.
 
 use crate::check_output::CheckOutputConfig;
 use crate::client::Config;
 use crate::spool::SpoolConfig;
+use crate::wait::WaitConfig;
 use crate::wrap::WrapConfig;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -291,6 +292,46 @@ pub fn load_wrap_config(path: &Path) -> Result<WrapConfig, String> {
             "wrap",
             "default_timeout_seconds",
             defaults.default_timeout_seconds,
+        )?,
+    })
+}
+
+/// Parse a `WaitConfig` from the `[wait]` section of `path`.
+///
+/// Same rule as `[wrap]`: absent file or section is the defaults; a key
+/// that is present and unusable is a typo. `idle_timeout_seconds` and
+/// `wall_timeout_seconds` use [`bound`] so zero is legal (docs/wait.md
+/// §3.6 — a quiet job is normal; the caller sets the deadline).
+/// `max_block_seconds` and `max_jobs` use [`positive`]: a zero cap would
+/// make every `wait` a `jobs()`, and a zero job slot is a locked door.
+pub fn load_wait_config(path: &Path) -> Result<WaitConfig, String> {
+    let Some(root) = read_toml(path)? else {
+        return Ok(WaitConfig::default());
+    };
+    let Some(section) = root.get("wait") else {
+        return Ok(WaitConfig::default());
+    };
+
+    let defaults = WaitConfig::default();
+    Ok(WaitConfig {
+        max_jobs: positive(section, "wait", "max_jobs", defaults.max_jobs)?,
+        max_block_seconds: positive(
+            section,
+            "wait",
+            "max_block_seconds",
+            defaults.max_block_seconds,
+        )?,
+        idle_timeout_seconds: bound(
+            section,
+            "wait",
+            "idle_timeout_seconds",
+            defaults.idle_timeout_seconds,
+        )?,
+        wall_timeout_seconds: bound(
+            section,
+            "wait",
+            "wall_timeout_seconds",
+            defaults.wall_timeout_seconds,
         )?,
     })
 }
@@ -574,6 +615,44 @@ mod tests {
                 .expect_err("an unusable bound must be reported");
             assert!(err.contains("[wrap]"), "{bad} -> {err}");
         }
+    }
+
+    #[test]
+    fn wait_bounds_default_when_the_file_or_the_section_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_wait_config(&dir.path().join("nope.toml")).unwrap(), WaitConfig::default());
+        assert_eq!(WaitConfig::default().max_jobs, 16, "docs/wait.md §3.6");
+        assert_eq!(WaitConfig::default().max_block_seconds, 1500);
+        assert_eq!(WaitConfig::default().idle_timeout_seconds, 0);
+        assert_eq!(WaitConfig::default().wall_timeout_seconds, 0);
+    }
+
+    #[test]
+    fn wait_idle_and_wall_accept_zero_and_max_block_rejects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load_wait_config(&write_config(
+            &dir,
+            "[wait]\nidle_timeout_seconds = 0\nwall_timeout_seconds = 0\nmax_block_seconds = 3600\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.idle_timeout_seconds, 0);
+        assert_eq!(cfg.wall_timeout_seconds, 0);
+        assert_eq!(cfg.max_block_seconds, 3600);
+
+        let err = load_wait_config(&write_config(&dir, "[wait]\nmax_block_seconds = 0\n"))
+            .expect_err("a zero cap would make every wait a jobs()");
+        assert!(err.contains("[wait]"), "{err}");
+    }
+
+    #[test]
+    fn the_bundled_default_config_documents_the_wait_bounds() {
+        assert!(DEFAULT_CONFIG.contains("# max_jobs = 16"));
+        assert!(DEFAULT_CONFIG.contains("# max_block_seconds = 1500"));
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_wait_config(&write_config(&dir, DEFAULT_CONFIG)).unwrap(),
+            WaitConfig::default()
+        );
     }
 
     #[test]

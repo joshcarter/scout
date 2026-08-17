@@ -15,6 +15,7 @@ cheap version of a task would cost thousands of tokens of scrollback.
 |---|---|---|
 | Running a build or test command | `check_output(command)` → `{ok, summary, first_error, suggested_next_step}` | `scout check "<cmd>"` |
 | Running any other command whose output is too long to read | `wrap(command, question?)` → `{exit_code, summary, answer, notable, lines_dropped, raw_path}` | `scout wrap "<cmd>" ["<question>"]` |
+| A job that will run for minutes and then finish | `wrap(command, detach: true)` then `wait(until: "all")` → `{done: [wrap payloads], pending, timed_out}` | — |
 | One specific question about a large file | `extract(file, question)` | `scout extract <file> "<question>"` |
 | A pattern that will match far more than you want | `grep(pattern, intent)` | `scout grep <pattern> "<intent>"` |
 | Anything else you'd rather not spend context on | — | `scout task "<prompt>"` |
@@ -31,8 +32,27 @@ faithful generic condensation.
 
 These are MCP tools. The names above are unqualified; the full names carry a
 plugin-derived prefix. If a scout tool is not already in your loaded toolset,
-look it up by its unqualified name (`check_output`, `wrap`, `extract`, `grep`)
-to resolve the full name and load its schema.
+look it up by its unqualified name (`check_output`, `wrap`, `wait`, `jobs`,
+`cancel`, `extract`, `grep`) to resolve the full name and load its schema.
+
+## Long jobs that finish
+
+A command that will run for minutes and then **end** — a notebook, a fat test
+matrix, a long script — is `wrap(command, detach: true)`, then
+`wait(until: "all")`. That is one turn per *completion* (or per batch), not
+one turn per interval.
+
+- Launch the batch in one turn (up to 16 live jobs), then **one**
+  `wait(until: "all")`. `until: "any"` is for fail-fast, not for a
+  homogeneous sweep.
+- Do not `sleep`. Do not `until [ -s file ]`. Do not `pgrep` loops. Those
+  cost a full conversation-sized turn to learn "not done yet."
+- `{timed_out: true}` is bookkeeping, not an error. Call `wait` again.
+- Stopping a wait leaves the jobs running. `cancel(job_id)` kills one group.
+- If you launched with the harness's own background command, use the
+  harness wait. If you launched with `wrap(detach)`, drain with scout
+  `wait` — that is where the wrap verdict is.
+- Unbounded streams (dev servers, `--watch` runners) are not this tool.
 
 ## What filtering costs you, and how to get it back
 
