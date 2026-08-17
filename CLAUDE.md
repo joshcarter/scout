@@ -67,10 +67,12 @@ run them directly. All three matter when touching hooks:
   hatch, redirect text).
 - `bash tests/test-shell-safety.sh` — command classification.
 - `bash tests/test-suggest-scout.sh` — advisory extract/grep nudge hook
-  (trigger thresholds, throttle, fail-open).
+  (trigger conditions per tool, fail-open).
 
-All three are fully green (37 + 202 + 42 — shell-safety lost seven cases when
-the substitution fast-path was deleted). They were not, for a long time, and
+All three are fully green (210 + 44 + 60, in the order listed above). This line
+previously read "37 + 202 + 42", which had prefer-local-llm's and
+shell-safety's counts swapped; if you are diffing against it, the suites did
+not shrink. They were not always green, and
 the reason is worth keeping: each suite's `[missing binary]` case expected a
 `missing-binary` log reason and got `endpoint-unreachable` or `parse-failure`
 instead. This note used to call that a test-isolation gap, "not a hook bug."

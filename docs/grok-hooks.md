@@ -115,8 +115,11 @@ The question after §2 is whether Grok needs its own
 Almost all of `prefer-local-llm.sh` and `shell-safety.sh` is
 classify-command, the deny floor, the LLM call, JSON unwrapping, and
 logging. None of that cares which harness spawned the process.
-`suggest-scout.sh` is the same: throttle and size checks are shared;
-only the parse and emit are not.
+`suggest-scout.sh` is the same: the size and breadth checks are shared;
+only the parse and emit are not. Note that Grok has no analogue of
+Claude's native `Grep`/`Glob` tools — it searches by shelling out — so
+those two branches are Claude-only by construction, and the `Bash`
+branch is the one that carries Grok.
 
 What is Claude-shaped is about fifteen lines per script, in three
 places. Dual-shape those. Leave the middle alone.

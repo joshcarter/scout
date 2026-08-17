@@ -31,10 +31,20 @@
 #           with no output cap (-l, -c, -m, --files-with-matches, | head,
 #           | wc). A capped or single-file search is already narrow, which is
 #           exactly when a plain grep is the right tool.
+#   Grep  — the native tool, same rule expressed in its schema: output_mode
+#           "content" (the only mode that emits match text) with no head_limit
+#           and no single-file path. The default mode returns paths only and is
+#           already narrow, so it stays silent.
+#   Glob  — only a genuinely unbounded pattern, i.e. one whose basename is a
+#           bare wildcard (`**/*`, `src/*`). `**/*.rs` constrains the result set
+#           by extension and is usually exactly what was wanted.
 #
-#   On top of that, a per-kind throttle (SCOUT_SUGGEST_THROTTLE_SECS, default
-#   600) keeps a burst of large reads from producing a burst of identical
-#   nudges. Set it to 0 to disable — the shell suite does.
+# THERE IS NO THROTTLE. There was one — a per-kind 600s stamp — and it was
+# removed deliberately: it is the wrong lever. The trigger conditions above are
+# what keep this quiet, and they are evaluated per call against the actual cost
+# of the actual call. A time window instead suppresses the *second* expensive
+# search in a burst, which is the one most likely to be the one that floods
+# context. Narrow triggers, no clock.
 #
 # Deliberately NOT checked: whether the local-LLM endpoint responds. That ping
 # is an HTTP round-trip, and this hook runs on every Read in the session;
@@ -57,14 +67,14 @@
 
 set -euo pipefail
 
-# Fail-open on missing HOME (unusual CI environments, test harnesses).
+# Fail-open on missing HOME (unusual CI environments, test harnesses). The
+# binary-resolution fallback below expands $HOME under `set -u`, so this guard
+# has to stay even though the throttle that first motivated it is gone.
 [ -z "${HOME:-}" ] && exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 
 READ_MIN_BYTES="${SCOUT_SUGGEST_MIN_BYTES:-51200}"
-THROTTLE_SECS="${SCOUT_SUGGEST_THROTTLE_SECS:-600}"
-STAMP_DIR="${SCOUT_SUGGEST_STAMP_DIR:-$HOME/.claude/scout-suggest}"
 
 # ── Resolve the scout binary ─────────────────────────────────────────────────
 # Payload first, then the legacy data dir, then PATH. See the fuller comment on
@@ -79,35 +89,18 @@ SCOUT_BIN="${CLAUDE_PLUGIN_ROOT:+${CLAUDE_PLUGIN_ROOT}/bin/scout}"
 # .jsonl, .csv) are deliberately absent — they are among its best targets.
 BINARY_RE='\.(png|jpe?g|gif|webp|ico|pdf|zip|gz|bz2|xz|zst|tar|tgz|wasm|bin|so|dylib|dll|exe|o|a|rlib|class|jar|woff2?|ttf|otf|mp[34]|mov|avi|sqlite3?|db)$'
 
-# ── Throttle ──────────────────────────────────────────────────────────────────
-# One stamp per nudge kind. Returns 0 (fire) or 1 (suppress). Any failure to
-# read or write the stamp fires the nudge — the throttle is a politeness
-# optimization, never a correctness gate.
-_should_fire() {
-  local kind="$1" stamp now last
-  [ "$THROTTLE_SECS" -le 0 ] 2>/dev/null && return 0
-
-  stamp="$STAMP_DIR/$kind"
-  now=$(date +%s 2>/dev/null) || return 0
-  mkdir -p "$STAMP_DIR" 2>/dev/null || return 0
-
-  if [ -f "$stamp" ]; then
-    last=$(cat "$stamp" 2>/dev/null) || return 0
-    case "$last" in
-      ''|*[!0-9]*) last=0 ;;
-    esac
-    [ $((now - last)) -lt "$THROTTLE_SECS" ] && return 1
-  fi
-
-  printf '%s' "$now" > "$stamp" 2>/dev/null || true
-  return 0
-}
-
 _emit() {
   jq -n --arg ctx "$1" \
     '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$ctx}}'
   exit 0
 }
+
+# Shared by the Bash and Grep branches — same situation, two spellings of it.
+GREP_NUDGE="This is a broad, uncapped search. If the raw match set will be much larger than what you actually want, scout's grep(pattern, intent) runs the search locally and returns only the hits matching your stated intent — the rest never enters this conversation.
+
+  grep(pattern=\"<pattern>\", intent=\"<what you are looking for>\")
+
+Unqualified MCP name; run ToolSearch for \"grep\" if it is not in your loaded toolset. A plain search is still right when you expect few hits, or want every one of them."
 
 # ── Parse PreToolUse payload ──────────────────────────────────────────────────
 INPUT=$(cat)
@@ -126,8 +119,6 @@ case "$TOOL_NAME" in
       ''|*[!0-9]*) exit 0 ;;
     esac
     [ "$SIZE" -ge "$READ_MIN_BYTES" ] || exit 0
-
-    _should_fire read || exit 0
 
     KB=$((SIZE / 1024))
     _emit "This file is ~${KB}KB. If you need one specific thing from it rather than the whole text, scout's extract(file, question) answers the question against a local model and returns just the answer — the file never enters this conversation.
@@ -155,13 +146,53 @@ Unqualified MCP name; run ToolSearch for \"extract\" if it is not in your loaded
     printf '%s' "$COMMAND" \
       | grep -qE '(\|[[:space:]]*(head|tail|wc)|[[:space:]]-[[:alnum:]]*[lcm]([[:space:]]|$)|--count|--files-with-matches|--max-count)' 2>/dev/null && exit 0
 
-    _should_fire grep || exit 0
+    _emit "$GREP_NUDGE"
+    ;;
 
-    _emit "This is a broad, uncapped search. If the raw match set will be much larger than what you actually want, scout's grep(pattern, intent) runs the search locally and returns only the hits matching your stated intent — the rest never enters this conversation.
+  Grep)
+    # The native tool is where Claude Code actually searches — it almost never
+    # shells out to grep, so the Bash branch above is close to dead weight on
+    # this host and load-bearing only on one that has no first-class search
+    # tool. Same rule, restated against this schema.
 
-  grep(pattern=\"<pattern>\", intent=\"<what you are looking for>\")
+    # output_mode defaults to files_with_matches: paths only, already narrow.
+    # "content" is the one mode that streams match text into the transcript.
+    MODE=$(printf '%s' "$INPUT" | jq -r '.tool_input.output_mode // "files_with_matches"' 2>/dev/null) || exit 0
+    [ "$MODE" = "content" ] || exit 0
 
-Unqualified MCP name; run ToolSearch for \"grep\" if it is not in your loaded toolset. A plain search is still right when you expect few hits, or want every one of them."
+    # head_limit is this schema's spelling of `| head` — an explicit cap.
+    HEAD_LIMIT=$(printf '%s' "$INPUT" | jq -r '.tool_input.head_limit // empty' 2>/dev/null) || exit 0
+    [ -n "$HEAD_LIMIT" ] && exit 0
+
+    # A path naming one regular file is the `grep TODO src/main.rs` case: the
+    # search is already bounded by the file, so stay quiet. A directory path
+    # bounds nothing in particular — Grep recurses.
+    GREP_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.path // empty' 2>/dev/null) || exit 0
+    [ -n "$GREP_PATH" ] && [ -f "$GREP_PATH" ] && exit 0
+
+    _emit "$GREP_NUDGE"
+    ;;
+
+  Glob)
+    PATTERN=$(printf '%s' "$INPUT" | jq -r '.tool_input.pattern // empty' 2>/dev/null) || exit 0
+    [ -n "$PATTERN" ] || exit 0
+
+    # Glob returns paths, not content, so it is a far weaker case than Grep and
+    # the bar is correspondingly higher: fire only when the basename is a bare
+    # wildcard and the pattern therefore constrains nothing. `**/*.rs` and
+    # `**/test_*.py` have already bounded their own result sets by extension or
+    # stem, and enumerating a tree is often exactly the point.
+    case "${PATTERN##*/}" in
+      '*'|'**'|'*.*') ;;
+      *) exit 0 ;;
+    esac
+
+    _emit "This glob constrains nothing but the directory — it will return every file beneath it. If you want files by content or by role rather than the whole listing, scout can narrow it locally without the full list entering this conversation:
+
+  grep(pattern=\"<pattern>\", intent=\"<what you are looking for>\")   — content hits, intent-filtered
+  wrap(command=\"<find …>\", question=\"<what you want to know>\")     — runs the listing, answers the question
+
+Unqualified MCP names; run ToolSearch for \"grep\" or \"wrap\" if they are not in your loaded toolset. A plain glob is still right when you want the full file list, or are getting oriented in an unfamiliar tree."
     ;;
 esac
 

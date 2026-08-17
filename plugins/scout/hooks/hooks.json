@@ -1,5 +1,5 @@
 {
-  "description": "scout: PreToolUse hooks that screen and redirect shell commands to the local LLM, plus SessionStart guidance injection. The matcher is a union of Claude's Bash and Grok's run_terminal_command; on Grok Build 1.0.3 plugin hooks never execute at all (docs/plugin-packaging.md §2.5), so the Grok half is forward-looking, not load-bearing. suggest-scout.sh additionally matches Read, and is the only hook here that emits no permissionDecision at all — it exists because SessionStart guidance for extract/grep arrives too early to compete with a just-in-time nudge from another plugin.",
+  "description": "scout: PreToolUse hooks that screen and redirect shell commands to the local LLM, plus SessionStart guidance injection. The matcher is a union of Claude's Bash and Grok's run_terminal_command; on Grok Build 1.0.3 plugin hooks never execute at all (docs/plugin-packaging.md §2.5), so the Grok half is forward-looking, not load-bearing. suggest-scout.sh additionally matches Read, Grep and Glob, and is the only hook here that emits no permissionDecision at all — it exists because SessionStart guidance for extract/grep arrives too early to compete with a just-in-time nudge from another plugin. Grep and Glob are where Claude Code actually searches; it rarely shells out, so a Bash-only matcher left the search nudge firing on Grok and effectively never here.",
   "hooks": {
     "SessionStart": [
       {
@@ -31,7 +31,7 @@
         ]
       },
       {
-        "matcher": "Bash|Read|run_terminal_command",
+        "matcher": "Bash|Glob|Grep|Read|run_terminal_command",
         "hooks": [
           {
             "type": "command",

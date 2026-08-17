@@ -9,8 +9,14 @@
 #     extensions and on files that do not exist
 #   - Bash: fires on a broad uncapped recursive search, stays silent on a
 #     capped one (-l, -c, -m, | head) and on a narrow single-file grep
-#   - The throttle suppresses a second nudge of the same kind inside the
-#     window, and the two kinds throttle independently
+#   - Grep: fires on output_mode=content with no head_limit, stays silent in
+#     the default paths-only mode, when head_limit caps it, and when path
+#     names a single file
+#   - Glob: fires only on a bare-wildcard basename, silent when the pattern
+#     constrains by extension or stem
+#   - There is NO throttle: a repeat of the same nudge fires again immediately.
+#     A time window would suppress the second expensive call in a burst, which
+#     is precisely the one worth nudging.
 #   - Fail-open and silent: malformed stdin, unknown tool, missing binary
 #   - Emitted JSON is well-formed and names the unqualified tool only —
 #     never a fully-qualified mcp__plugin_* literal (CLAUDE.md)
@@ -47,7 +53,8 @@ fi
 # ── Isolated environment ─────────────────────────────────────────────────────
 # Unlike prefer-local-llm.sh, this hook never shells out to scout — it only
 # stats the binary — so a stub is sufficient and correct here, no real build
-# needed. $HOME is redirected so the throttle stamps land in the sandbox.
+# needed. $HOME is redirected so the missing-HOME case below is the only run
+# without one.
 
 TMPROOT="$(mktemp -d)"
 trap 'rm -rf "$TMPROOT"' EXIT
@@ -67,10 +74,6 @@ export CLAUDE_PLUGIN_DATA="$TMPROOT/stub"
 # payload binary in for the stub above. Clear it here; the tests that mean to
 # exercise that path set it explicitly on the command line.
 unset CLAUDE_PLUGIN_ROOT
-
-# Throttle off by default; the throttle tests re-enable it explicitly.
-export SCOUT_SUGGEST_THROTTLE_SECS=0
-export SCOUT_SUGGEST_STAMP_DIR="$TMPROOT/stamps"
 
 # A curated PATH holding every tool the hook needs and nothing else — in
 # particular, no `scout`. Emptying PATH outright does not work: the shebang is
@@ -118,6 +121,18 @@ run_bash() {
   jq -n --arg c "$1" '{tool_name:"Bash",tool_input:{command:$c}}' | "$HOOK" 2>/dev/null
 }
 
+# run_grep JSON_OBJECT — emit a Grep PreToolUse payload from a literal
+# tool_input object, so each case states exactly the fields it means to set and
+# omission is expressible (an absent output_mode is not the same as "content").
+run_grep() {
+  jq -n --argjson i "$1" '{tool_name:"Grep",tool_input:$i}' | "$HOOK" 2>/dev/null
+}
+
+# run_glob PATTERN — emit a Glob PreToolUse payload, return the hook's stdout.
+run_glob() {
+  jq -n --arg p "$1" '{tool_name:"Glob",tool_input:{pattern:$p}}' | "$HOOK" 2>/dev/null
+}
+
 # assert_fires OUTPUT LABEL — non-empty, valid JSON, carries additionalContext.
 assert_fires() {
   local out="$1" label="$2"
@@ -141,8 +156,6 @@ assert_silent() {
   fi
 }
 
-reset_stamps() { rm -rf "$SCOUT_SUGGEST_STAMP_DIR"; }
-
 # ── Invariant 1: never emits a permission decision ───────────────────────────
 
 echo "Invariant: advisory only, never a permission decision"
@@ -151,6 +164,8 @@ ALL_OUTPUT=""
 ALL_OUTPUT="$ALL_OUTPUT$(run_read "$BIG")"
 ALL_OUTPUT="$ALL_OUTPUT$(run_bash 'grep -r TODO .')"
 ALL_OUTPUT="$ALL_OUTPUT$(run_bash 'rg pattern')"
+ALL_OUTPUT="$ALL_OUTPUT$(run_grep '{"pattern":"TODO","output_mode":"content"}')"
+ALL_OUTPUT="$ALL_OUTPUT$(run_glob '**/*')"
 
 if printf '%s' "$ALL_OUTPUT" | grep -q 'permissionDecision'; then
   fail "no permissionDecision in any emitted output" "found one: $ALL_OUTPUT"
@@ -169,19 +184,14 @@ fi
 echo ""
 echo "Read: size threshold and file-type filtering"
 
-reset_stamps
 assert_fires "$(run_read "$BIG")" "large text file fires"
 
-reset_stamps
 assert_silent "$(run_read "$SMALL")" "small file is silent"
 
-reset_stamps
 assert_silent "$(run_read "$BIG_BINARY")" "large binary-extension file is silent"
 
-reset_stamps
 assert_silent "$(run_read "$FIXTURES/does-not-exist.txt")" "nonexistent file is silent"
 
-reset_stamps
 out=$(run_read "$BIG")
 if printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q 'extract'; then
   pass "Read nudge names extract"
@@ -190,10 +200,8 @@ else
 fi
 
 # Threshold is configurable and respected in both directions.
-reset_stamps
 assert_silent "$(SCOUT_SUGGEST_MIN_BYTES=99999999 run_read "$BIG")" "raised threshold silences a large file"
 
-reset_stamps
 assert_fires "$(SCOUT_SUGGEST_MIN_BYTES=1 run_read "$SMALL")" "lowered threshold fires on a small file"
 
 # ── Bash ─────────────────────────────────────────────────────────────────────
@@ -208,7 +216,6 @@ for cmd in \
   'rg pattern' \
   'cd /tmp && grep -r needle .'
 do
-  reset_stamps
   assert_fires "$(run_bash "$cmd")" "broad uncapped search fires: $cmd"
 done
 
@@ -223,11 +230,9 @@ for cmd in \
   'ls -la' \
   'cargo build'
 do
-  reset_stamps
   assert_silent "$(run_bash "$cmd")" "no nudge: $cmd"
 done
 
-reset_stamps
 out=$(run_bash 'grep -r TODO .')
 if printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q 'intent'; then
   pass "grep nudge names the intent parameter"
@@ -235,45 +240,88 @@ else
   fail "grep nudge names the intent parameter" "got: $out"
 fi
 
-# ── Throttle ─────────────────────────────────────────────────────────────────
+# ── Grep ─────────────────────────────────────────────────────────────────────
+# The native search tool: this is where Claude Code actually searches, so these
+# cases matter more than the Bash ones above.
 
 echo ""
-echo "Throttle"
+echo "Grep: output mode and caps"
 
-reset_stamps
-first=$(SCOUT_SUGGEST_THROTTLE_SECS=600 run_read "$BIG")
-second=$(SCOUT_SUGGEST_THROTTLE_SECS=600 run_read "$BIG")
-assert_fires "$first" "first Read nudge fires under throttle"
-assert_silent "$second" "second Read nudge suppressed inside window"
+assert_fires "$(run_grep '{"pattern":"TODO","output_mode":"content"}')" \
+  "content mode with no cap fires"
+assert_fires "$(run_grep '{"pattern":"TODO","output_mode":"content","path":"src"}')" \
+  "content mode over a directory fires"
+assert_fires "$(run_grep '{"pattern":"TODO","output_mode":"content","-n":true,"-C":3}')" \
+  "content mode with context flags fires"
 
-reset_stamps
-r=$(SCOUT_SUGGEST_THROTTLE_SECS=600 run_read "$BIG")
-g=$(SCOUT_SUGGEST_THROTTLE_SECS=600 run_bash 'grep -r TODO .')
-assert_fires "$r" "Read kind fires"
-assert_fires "$g" "grep kind fires independently of Read kind"
+# Default mode returns paths only — already narrow, and the common case.
+assert_silent "$(run_grep '{"pattern":"TODO"}')" \
+  "default (paths-only) mode is silent"
+assert_silent "$(run_grep '{"pattern":"TODO","output_mode":"files_with_matches"}')" \
+  "explicit files_with_matches is silent"
+assert_silent "$(run_grep '{"pattern":"TODO","output_mode":"count"}')" \
+  "count mode is silent"
+assert_silent "$(run_grep '{"pattern":"TODO","output_mode":"content","head_limit":50}')" \
+  "head_limit caps the output and silences the nudge"
 
-reset_stamps
-a=$(SCOUT_SUGGEST_THROTTLE_SECS=0 run_read "$BIG")
-b=$(SCOUT_SUGGEST_THROTTLE_SECS=0 run_read "$BIG")
-assert_fires "$a" "throttle=0 fires once"
-assert_fires "$b" "throttle=0 fires again immediately"
+# A path naming one regular file is the single-file grep case. Uses a real
+# fixture: the hook stats the path, so a made-up name would pass for a
+# directory and fire.
+assert_silent "$(run_grep "$(jq -n --arg p "$SMALL" '{pattern:"key",output_mode:"content",path:$p}')")" \
+  "path naming a single file is silent"
+assert_fires "$(run_grep "$(jq -n --arg p "$FIXTURES" '{pattern:"line",output_mode:"content",path:$p}')")" \
+  "path naming a directory still fires"
+
+out=$(run_grep '{"pattern":"TODO","output_mode":"content"}')
+if printf '%s' "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q 'intent'; then
+  pass "Grep nudge names the intent parameter"
+else
+  fail "Grep nudge names the intent parameter" "got: $out"
+fi
+
+# ── Glob ─────────────────────────────────────────────────────────────────────
+
+echo ""
+echo "Glob: bare-wildcard basename only"
+
+for pat in '**/*' '*' 'src/*' '**/*.*' 'a/b/c/**'; do
+  assert_fires "$(run_glob "$pat")" "unbounded glob fires: $pat"
+done
+
+for pat in '**/*.rs' 'src/*.toml' '**/test_*.py' '**/Cargo.lock' 'src/main.rs'; do
+  assert_silent "$(run_glob "$pat")" "constrained glob is silent: $pat"
+done
+
+assert_silent "$(jq -n '{tool_name:"Glob",tool_input:{}}' | "$HOOK" 2>/dev/null)" \
+  "Glob with no pattern is silent"
+
+# ── No throttle ──────────────────────────────────────────────────────────────
+# There was a 600s per-kind stamp here. It is gone on purpose: the trigger
+# conditions are the anti-nag mechanism, and a clock suppresses the second
+# expensive call in a burst — the one most worth nudging. If a throttle ever
+# comes back, these three fail, which is the point.
+
+echo ""
+echo "No throttle: repeats fire"
+
+assert_fires "$(run_read "$BIG")" "first Read nudge fires"
+assert_fires "$(run_read "$BIG")" "immediate repeat Read nudge fires"
+assert_fires "$(run_grep '{"pattern":"TODO","output_mode":"content"}')" \
+  "immediate repeat Grep nudge fires"
 
 # ── Fail-open ────────────────────────────────────────────────────────────────
 
 echo ""
 echo "Fail-open"
 
-reset_stamps
 out=$(printf 'not json at all' | "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "malformed stdin is silent"
 assert_eq "$rc" "0" "malformed stdin exits 0"
 
-reset_stamps
 out=$(jq -n '{tool_name:"Write",tool_input:{file_path:"/tmp/x"}}' | "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "unhandled tool is silent"
 assert_eq "$rc" "0" "unhandled tool exits 0"
 
-reset_stamps
 out=$(jq -n '{tool_name:"Read"}' | "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "Read with no file_path is silent"
 assert_eq "$rc" "0" "Read with no file_path exits 0"
@@ -288,7 +336,6 @@ READ_PAYLOAD=$(jq -n --arg f "$BIG" '{tool_name:"Read",tool_input:{file_path:$f}
 # here because the hook falls back to `command -v scout` when the plugin-data
 # path misses — pointing CLAUDE_PLUGIN_DATA at nothing is not sufficient on its
 # own if a real scout happens to be installed on the tester's PATH.
-reset_stamps
 out=$(printf '%s' "$READ_PAYLOAD" | \
   env CLAUDE_PLUGIN_DATA="$TMPROOT/nonexistent" PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "missing scout binary is silent"
@@ -298,14 +345,12 @@ assert_eq "$rc" "0" "missing scout binary exits 0"
 # where the plugin actually ships it. Same curated PATH and same dead
 # CLAUDE_PLUGIN_DATA as the case above, so the only thing that can satisfy the
 # hook is $CLAUDE_PLUGIN_ROOT/bin/scout. $TMPROOT/stub already has that layout.
-reset_stamps
 out=$(printf '%s' "$READ_PAYLOAD" | \
   env CLAUDE_PLUGIN_ROOT="$TMPROOT/stub" CLAUDE_PLUGIN_DATA="$TMPROOT/nonexistent" \
   PATH="$CLEAN_PATH_DIR" "$HOOK" 2>/dev/null); rc=$?
 assert_fires "$out" "binary found via CLAUDE_PLUGIN_ROOT alone"
 assert_eq "$rc" "0" "CLAUDE_PLUGIN_ROOT resolution exits 0"
 
-reset_stamps
 out=$(printf '%s' "$READ_PAYLOAD" | env -u HOME "$HOOK" 2>/dev/null); rc=$?
 assert_silent "$out" "missing HOME is silent"
 assert_eq "$rc" "0" "missing HOME exits 0"
