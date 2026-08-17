@@ -247,19 +247,30 @@ them are the difference between "annoying" and "fine" this week:
    hook still earns its place") running as designed, and it wants a full
    week, so this is a note rather than a recommendation to turn it off.
    But the latency being felt right now is partly instrumentation.
-2. **A wait-shape fast-path in `shell-safety.sh`.** A command whose
+2. ~~**A wait-shape fast-path in `shell-safety.sh`.**~~ **Shelved
+   2026-08-17, deliberately.** The idea was sound — a command whose
    entire body is `sleep` / `until` / `while` over `[ -s file ]`,
    `pgrep`, or `test`, plus `echo` / `cat` / `ls`, is structurally safe
-   and should never reach step 3. It sits next to the existing
-   trusted-plugin-script fast-path, costs ~20 lines, kills the flapping
-   in §1.3, and stays useful even after `wait` ships (the model will
-   still improvise occasionally).
-3. **A project rule in `vail_ec_sim/CLAUDE.md`:** start notebook runs
-   with `run_in_background` and wait for the completion notification;
-   never hand-roll a `sleep` loop. The session is *already* writing into
-   the harness task directory (`…/tasks/<id>.output`) and then polling
-   it by hand with `sleep 200; cat` — that is a usage problem, and
-   fixing it is free.
+   and should never reach step 3 — but it is ~20 lines of new surface on
+   a hook that is *itself* under a keep-or-delete experiment (§5.1, and
+   `TODO.md`). Extending a feature while measuring whether to remove it
+   contaminates the measurement and risks writing code that ships only
+   to be deleted. Revisit only if shell-safety survives its trial; and
+   note that §5.3 removes most of the flapping in §1.3 at the source, by
+   stopping the improvised wait commands from being issued at all.
+3. **A project rule in `vail_ec_sim/CLAUDE.md`** — **done 2026-08-17.**
+   Start notebook runs with `run_in_background` and wait for the
+   completion notification; never hand-roll a `sleep` loop. The session
+   was *already* writing into the harness task directory
+   (`…/tasks/<id>.output`) and then polling it by hand with
+   `sleep 200; cat` — a usage problem, fixed for free. The file did not
+   previously exist, so the rule is now that repo's whole `CLAUDE.md`:
+   launch detached, launch the batch in one turn, then *end the turn*;
+   the banned idioms listed verbatim from §1.3; and render the verdict
+   through `check_output`/`extract` rather than reading the log, which
+   is §4's domain logic stated where the model will actually meet it.
+   This is the §6.2 exception — redirecting to a tool the harness
+   already provides, not exhorting.
 
 ## §6 Rejected
 
@@ -306,8 +317,11 @@ plumbing is not shared semantics.
 
 ## §7 Rollout order
 
-1. §5.2 (wait-shape fast-path) and §5.3 (project rule) — today, no
-   dependency on anything below.
+1. ~~§5.2 (wait-shape fast-path)~~ shelved, see §5.2. §5.3 (project
+   rule) — **done 2026-08-17**, no dependency on anything below. It is
+   also the cheapest available measurement of §8's last question: if the
+   rule alone collapses the wait-turn count on the next re-baseline,
+   `wait`'s blocking half has less to prove than §3.3 assumes.
 2. `wrap` + the raw spool (`docs/wrap-watch.md` §2, §3). `wait` is
    `wrap` deferred, so it cannot precede it.
 3. `wait`: detached `wrap`, the four tools, `[wait]` config. Reuse the
